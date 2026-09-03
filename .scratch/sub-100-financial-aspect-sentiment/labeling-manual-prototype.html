@@ -1,0 +1,717 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Labeling manual prototype</title>
+  <style>
+    :root {
+      --ink: #17202a;
+      --muted: #566573;
+      --paper: #f7f4ed;
+      --card: #ffffff;
+      --line: #d9d3c7;
+      --accent: #176b5b;
+      --accent-soft: #e1f0eb;
+      --warn: #8a4b08;
+      --warn-soft: #fff1db;
+      --bad: #9f2d2d;
+      --bad-soft: #fde8e8;
+      --shadow: 0 8px 24px rgba(23, 32, 42, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.5;
+    }
+    button, textarea { font: inherit; }
+    button { cursor: pointer; }
+    .page { max-width: 1180px; margin: 0 auto; padding: 28px 20px 60px; }
+    .eyebrow { color: var(--accent); font-size: 0.78rem; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase; }
+    h1 { max-width: 800px; margin: 6px 0 8px; font-size: clamp(2rem, 5vw, 4rem); line-height: 1.02; letter-spacing: -0.04em; }
+    h2 { margin: 0 0 14px; font-size: 1.35rem; }
+    h3 { margin: 0 0 8px; font-size: 1.05rem; }
+    p { margin: 0 0 12px; }
+    .intro { max-width: 860px; color: var(--muted); font-size: 1.05rem; }
+    .question { margin-top: 20px; padding: 16px 18px; border-left: 5px solid var(--accent); background: var(--accent-soft); }
+    .question strong { display: block; margin-bottom: 4px; }
+
+    .state {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+      margin: 24px 0;
+    }
+    .metric { min-height: 88px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); box-shadow: var(--shadow); }
+    .metric span { display: block; color: var(--muted); font-size: 0.78rem; }
+    .metric strong { display: block; margin-top: 5px; font-size: 1.15rem; }
+
+    .layout { display: grid; grid-template-columns: minmax(0, 1.8fr) minmax(300px, 1fr); gap: 18px; align-items: start; }
+    .panel { padding: 20px; border: 1px solid var(--line); border-radius: 16px; background: var(--card); box-shadow: var(--shadow); }
+    .manual { position: sticky; top: 16px; max-height: calc(100vh - 32px); overflow: auto; }
+    details { border-top: 1px solid var(--line); }
+    details:first-of-type { border-top: 0; }
+    summary { padding: 12px 0; color: var(--accent); font-weight: 750; cursor: pointer; }
+    details div { padding: 0 0 14px; }
+    ul, ol { margin: 8px 0 10px; padding-left: 22px; }
+    li + li { margin-top: 6px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+    th, td { padding: 7px 6px; border-bottom: 1px solid var(--line); text-align: left; }
+    th { color: var(--muted); font-size: 0.74rem; text-transform: uppercase; }
+    .ok { color: var(--accent); font-weight: 750; }
+    .no { color: var(--bad); font-weight: 750; }
+
+    .case-top { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; }
+    .case-count { color: var(--muted); white-space: nowrap; }
+    .tags { display: flex; flex-wrap: wrap; gap: 7px; margin: 12px 0; }
+    .tag { padding: 4px 8px; border-radius: 999px; background: #edf0f2; color: #34495e; font-size: 0.76rem; font-weight: 700; }
+    .passage { margin: 14px 0; padding: 18px; border-left: 4px solid #85929e; background: #f7f8f9; font-family: Georgia, serif; font-size: 1.08rem; }
+    .input-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .field { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: #fbfaf7; }
+    .field span { display: block; color: var(--muted); font-size: 0.74rem; text-transform: uppercase; }
+    .field strong { display: block; margin-top: 3px; }
+    .prompt { margin-top: 16px; font-weight: 750; }
+    .choices { display: flex; flex-wrap: wrap; gap: 8px; margin: 9px 0 14px; }
+    .choice, .small-button, .case-button, .tab-button {
+      padding: 9px 12px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      color: var(--ink);
+      background: var(--card);
+    }
+    .choice:hover, .small-button:hover, .case-button:hover, .tab-button:hover { border-color: var(--accent); }
+    .choice.selected, .case-button.selected, .tab-button.selected { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); font-weight: 750; }
+    .choice.invalid { border-style: dashed; }
+    .note-label { display: block; margin-top: 12px; font-weight: 750; }
+    textarea { width: 100%; min-height: 86px; margin-top: 7px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; resize: vertical; }
+    textarea:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .primary { border-color: var(--accent); color: white; background: var(--accent); }
+    .answer { margin-top: 14px; padding: 14px; border-radius: 10px; background: var(--accent-soft); }
+    .answer.disagree { background: var(--warn-soft); }
+    .answer h3 { color: var(--accent); }
+    .answer.disagree h3 { color: var(--warn); }
+    .hidden { display: none !important; }
+
+    .section { margin-top: 22px; }
+    .free-play { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .case-button { text-align: left; }
+    .case-button small { display: block; margin-top: 3px; color: var(--muted); }
+    .tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    .walkthrough { padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: #fbfaf7; }
+    .steps { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .step-done { opacity: 0.55; text-decoration: line-through; }
+    .footer-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+    .status-line { min-height: 24px; margin-top: 8px; color: var(--accent); font-weight: 700; }
+
+    @media (max-width: 860px) {
+      .layout { grid-template-columns: 1fr; }
+      .manual { position: static; max-height: none; }
+      .state { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 540px) {
+      .state, .input-grid, .free-play { grid-template-columns: 1fr; }
+      .page { padding: 20px 12px 40px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <div class="eyebrow">Throwaway logic prototype · ontology version 1</div>
+    <h1>Can one annotator use this labeling manual consistently?</h1>
+    <p class="intro">Read the short manual. Label each difficult case. Then show the draft answer. A disagreement is useful. It shows where the rule or the ontology needs a change.</p>
+    <div class="question">
+      <strong>Question under test</strong>
+      Does this draft manual give clear and repeatable labels for target family, aspect applicability, evidence sufficiency, mixed evidence, negation, time, reported speech, sarcasm, and cross-target effects?
+    </div>
+
+    <section class="state" aria-label="Current review state">
+      <div class="metric"><span>Current case</span><strong id="state-current">—</strong></div>
+      <div class="metric"><span>Cases reviewed</span><strong id="state-reviewed">0 of 10</strong></div>
+      <div class="metric"><span>Matches</span><strong id="state-matches">0</strong></div>
+      <div class="metric"><span>Disagreements</span><strong id="state-disagreements">0</strong></div>
+      <div class="metric"><span>Notes</span><strong id="state-notes">0</strong></div>
+    </section>
+
+    <div class="layout">
+      <section>
+        <article class="panel" id="case-panel">
+          <div class="case-top">
+            <div>
+              <div class="eyebrow" id="case-source"></div>
+              <h2 id="case-title"></h2>
+            </div>
+            <span class="case-count" id="case-count"></span>
+          </div>
+          <div class="tags" id="case-tags"></div>
+          <div class="passage" id="case-passage"></div>
+          <div class="input-grid">
+            <div class="field"><span>Supplied target</span><strong id="case-target"></strong></div>
+            <div class="field"><span>Supplied aspect</span><strong id="case-aspect"></strong></div>
+          </div>
+
+          <div class="prompt">Choose one label.</div>
+          <div class="choices" id="label-choices"></div>
+          <div class="prompt">How clear is the manual for this case?</div>
+          <div class="choices" id="confidence-choices"></div>
+
+          <label class="note-label" for="case-note">Your reaction or rule change</label>
+          <textarea id="case-note" placeholder="Write what felt wrong or unclear."></textarea>
+
+          <div class="actions">
+            <button class="small-button primary" id="reveal-button">Show the draft answer</button>
+            <button class="small-button" id="next-button">Go to the next case</button>
+          </div>
+          <div id="draft-answer" class="answer hidden"></div>
+        </article>
+
+        <section class="panel section">
+          <h2>Free play</h2>
+          <p>Open the cases in any order. Your choices stay in memory until you close or reload this file.</p>
+          <div class="free-play" id="case-list"></div>
+        </section>
+
+        <section class="panel section">
+          <h2>Guided walkthroughs</h2>
+          <div class="tabs" id="walkthrough-tabs"></div>
+          <div class="walkthrough" id="walkthrough-panel"></div>
+        </section>
+
+        <section class="panel section">
+          <h2>Return your review</h2>
+          <p>Download the review or copy its summary. Send the file or the summary to the agent. The draft manual will then change before it is frozen.</p>
+          <div class="footer-actions">
+            <button class="small-button primary" id="download-button">Download review JSON</button>
+            <button class="small-button" id="copy-button">Copy review summary</button>
+            <button class="small-button" id="reset-button">Clear all choices</button>
+          </div>
+          <div class="status-line" id="status-line" aria-live="polite"></div>
+        </section>
+      </section>
+
+      <aside class="panel manual">
+        <div class="eyebrow">Draft manual</div>
+        <h2>Use this order</h2>
+        <ol>
+          <li>Check the target family.</li>
+          <li>Check the aspect.</li>
+          <li>Find evidence for this target and this aspect.</li>
+          <li>Resolve negation, source, and time.</li>
+          <li>Apply the family label set.</li>
+        </ol>
+
+        <details open>
+          <summary>1. Target and aspect checks</summary>
+          <div>
+            <p>Reject the input as <strong>invalid</strong> when the target is outside the two target families or when the aspect does not apply to the target family.</p>
+            <table>
+              <thead><tr><th>Aspect</th><th>Company</th><th>Macro</th></tr></thead>
+              <tbody>
+                <tr><td>Financial performance</td><td class="ok">Yes</td><td class="no">No</td></tr>
+                <tr><td>Demand and commercial traction</td><td class="ok">Yes</td><td class="no">No</td></tr>
+                <tr><td>Operations, supply, and capacity</td><td class="ok">Yes</td><td class="no">No</td></tr>
+                <tr><td>Financial position and funding</td><td class="ok">Yes</td><td class="no">No</td></tr>
+                <tr><td>Capital allocation</td><td class="ok">Yes</td><td class="no">No</td></tr>
+                <tr><td>Management and governance</td><td class="ok">Yes</td><td class="no">No</td></tr>
+                <tr><td>Legal and regulatory position</td><td class="ok">Yes</td><td class="no">No</td></tr>
+                <tr><td>Risk and resilience</td><td class="ok">Yes</td><td class="ok">Yes</td></tr>
+                <tr><td>Outlook and expectations</td><td class="ok">Yes</td><td class="ok">Yes</td></tr>
+                <tr><td>Current condition</td><td class="no">No</td><td class="ok">Yes</td></tr>
+                <tr><td>Trend and momentum</td><td class="no">No</td><td class="ok">Yes</td></tr>
+                <tr><td>Drivers and pressures</td><td class="no">No</td><td class="ok">Yes</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+
+        <details>
+          <summary>2. Evidence and aspect boundary</summary>
+          <div>
+            <ul>
+              <li>Use only the supplied passage.</li>
+              <li>Use evidence about the supplied target.</li>
+              <li>Use the most specific aspect that the claim supports.</li>
+              <li>For a company, the specific subject aspect takes priority over the general outlook aspect.</li>
+              <li>Future time alone does not make a claim an outlook claim.</li>
+              <li>Do not copy one claim to a wider aspect.</li>
+              <li>Risk needs an explicit exposure, uncertainty, weakness, or ability to absorb a shock.</li>
+            </ul>
+            <p>Use <strong>insufficient evidence</strong> when the pair is valid but the passage does not support it.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>3. Company labels</summary>
+          <div>
+            <ul>
+              <li><strong>Positive:</strong> The evidence is favorable for the company and the supplied aspect.</li>
+              <li><strong>Negative:</strong> The evidence is unfavorable for the company and the supplied aspect.</li>
+              <li><strong>Neutral:</strong> The passage states stability, no material effect, or an explicit net result with no favorable or unfavorable direction.</li>
+              <li><strong>Insufficient evidence:</strong> The evidence is absent, unclear, or about another aspect.</li>
+            </ul>
+          </div>
+        </details>
+
+        <details>
+          <summary>4. Macro-indicator labels</summary>
+          <div>
+            <ul>
+              <li><strong>Increase:</strong> The indicator or pressure on it moves up.</li>
+              <li><strong>Decrease:</strong> The indicator or pressure on it moves down.</li>
+              <li><strong>Unchanged:</strong> The passage states stability or no material movement.</li>
+              <li><strong>Insufficient evidence:</strong> The direction is absent or unclear.</li>
+            </ul>
+            <p>Use the movement of the stated measure. Distinguish a level from its rate of change. Do not use whether the movement is good or bad. Do not change the label because the result differs from a forecast.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>5. Mixed evidence</summary>
+          <div>
+            <ol>
+              <li>Use an explicit overall result when the passage gives one.</li>
+              <li>Use the relevant aggregate when subparts move in different directions.</li>
+              <li>Use <strong>neutral</strong> or <strong>unchanged</strong> only when the passage supports no net change or no material effect.</li>
+              <li>Use <strong>insufficient evidence</strong> when material claims conflict and the passage gives no resolution or basis to combine them.</li>
+            </ol>
+          </div>
+        </details>
+
+        <details>
+          <summary>6. Negation and time</summary>
+          <div>
+            <ul>
+              <li>Resolve what the negative word changes. “Did not fall” does not always mean “rose.”</li>
+              <li>Match the evidence to its stated time.</li>
+              <li>Do not use a past result as an outlook label.</li>
+              <li>Future time can support a specific company aspect when that subject is the focus.</li>
+            </ul>
+          </div>
+        </details>
+
+        <details>
+          <summary>7. Source, sarcasm, and other targets</summary>
+          <div>
+            <ul>
+              <li>A clearly attributed claim is evidence. Keep the speaker and any denial clear.</li>
+              <li>Do not give a claim more weight only because of the speaker's role.</li>
+              <li>If the passage rejects a reported claim, do not treat the claim as fact.</li>
+              <li>Use sarcasm only when words and context make the intended meaning clear. Otherwise, use insufficient evidence.</li>
+              <li>Do not transfer a result from one target to another target.</li>
+              <li>Use a cross-target effect only when the passage states the effect on the supplied target.</li>
+            </ul>
+          </div>
+        </details>
+      </aside>
+    </div>
+  </main>
+
+  <script>
+    // Portable review logic. It has no DOM access.
+    const ReviewModel = (() => {
+      const initialState = (caseIds) => ({
+        currentCaseId: caseIds[0],
+        reviews: Object.fromEntries(caseIds.map((id) => [id, {
+          label: null,
+          confidence: null,
+          note: "",
+          revealed: false
+        }])),
+        activeWalkthrough: "all-sources",
+        walkthroughStep: 0
+      });
+
+      function reduce(state, action) {
+        const current = state.reviews[state.currentCaseId];
+        switch (action.type) {
+          case "SELECT_CASE":
+            return { ...state, currentCaseId: action.caseId };
+          case "CHOOSE_LABEL":
+            return {
+              ...state,
+              reviews: { ...state.reviews, [state.currentCaseId]: { ...current, label: action.label } }
+            };
+          case "SET_CONFIDENCE":
+            return {
+              ...state,
+              reviews: { ...state.reviews, [state.currentCaseId]: { ...current, confidence: action.confidence } }
+            };
+          case "SET_NOTE":
+            return {
+              ...state,
+              reviews: { ...state.reviews, [state.currentCaseId]: { ...current, note: action.note } }
+            };
+          case "REVEAL":
+            return {
+              ...state,
+              reviews: { ...state.reviews, [state.currentCaseId]: { ...current, revealed: true } }
+            };
+          case "START_WALKTHROUGH":
+            return { ...state, activeWalkthrough: action.id, walkthroughStep: 0, currentCaseId: action.firstCaseId };
+          case "WALKTHROUGH_CASE":
+            return { ...state, currentCaseId: action.caseId, walkthroughStep: action.step };
+          case "RESET":
+            return initialState(Object.keys(state.reviews));
+          default:
+            return state;
+        }
+      }
+
+      function summary(state, cases) {
+        const rows = cases.map((item) => ({ ...state.reviews[item.id], item }));
+        const reviewed = rows.filter((row) => row.label !== null);
+        return {
+          reviewed: reviewed.length,
+          matches: reviewed.filter((row) => row.label === row.item.draftLabel).length,
+          disagreements: reviewed.filter((row) => row.label !== row.item.draftLabel).length,
+          notes: rows.filter((row) => row.note.trim()).length
+        };
+      }
+
+      return { initialState, reduce, summary };
+    })();
+
+    const cases = [
+      {
+        id: "news-company",
+        source: "Financial news",
+        family: "Company",
+        title: "Two results pull in opposite directions",
+        tags: ["mixed evidence", "same aspect"],
+        target: "Northstar Foods plc",
+        aspect: "Financial performance",
+        passage: "Northstar Foods said quarterly revenue rose 8%. Its operating margin fell by two percentage points because input costs increased. The report gave no overall profit figure or assessment.",
+        labels: ["positive", "neutral", "negative", "insufficient evidence", "invalid"],
+        draftLabel: "insufficient evidence",
+        rationale: "The revenue result is favorable, but the margin result is unfavorable. Both support financial performance. The passage gives no basis to combine them into one polarity. The draft mixed-evidence rule uses insufficient evidence."
+      },
+      {
+        id: "news-macro",
+        source: "Financial news",
+        family: "Macro indicator",
+        title: "An increase is below the forecast",
+        tags: ["expectations", "objective direction"],
+        target: "Inflation and cost of living in Singapore",
+        aspect: "Trend and momentum",
+        passage: "Singapore consumer prices rose 3.2% from a year earlier, after a 3.0% rise in the prior month. Economists had forecast a 3.5% rise.",
+        labels: ["increase", "unchanged", "decrease", "insufficient evidence", "invalid"],
+        draftLabel: "increase",
+        rationale: "The inflation rate moved from 3.0% to 3.2%. This is an increase. The lower forecast error does not change the direction label."
+      },
+      {
+        id: "announcement-company",
+        source: "Company announcement",
+        family: "Company",
+        title: "A future operations claim has the wrong aspect",
+        tags: ["narrowest aspect", "time", "negation"],
+        target: "Harbor Grid Ltd",
+        aspect: "Operations, supply, and capacity",
+        passage: "Harbor Grid said the planned two-week maintenance shutdown is not expected to have a material effect on full-year output.",
+        labels: ["positive", "neutral", "negative", "insufficient evidence", "invalid"],
+        draftLabel: "neutral",
+        rationale: "The claim directly concerns operations and states no material effect on output. Operations is more specific than the general outlook aspect. Future time does not change the aspect. The no-material-effect rule gives a neutral label."
+      },
+      {
+        id: "announcement-macro",
+        source: "Company announcement",
+        family: "Macro indicator",
+        title: "A company describes pressure on a macro indicator",
+        tags: ["reported evidence", "drivers and pressures"],
+        target: "Inflation and cost of living in the United Kingdom",
+        aspect: "Drivers and pressures",
+        passage: "In its trading update, a national grocer said lower fuel and wholesale food costs continued to ease price pressure across its stores.",
+        labels: ["increase", "unchanged", "decrease", "insufficient evidence", "invalid"],
+        draftLabel: "decrease",
+        rationale: "The passage states that two drivers reduce price pressure. The draft rule maps lower pressure on inflation to decrease for this aspect."
+      },
+      {
+        id: "call-company",
+        source: "Earnings call",
+        family: "Company",
+        title: "Management and an analyst describe different demand signals",
+        tags: ["reported speech", "mixed evidence"],
+        target: "Cedar Cloud Inc",
+        aspect: "Demand and commercial traction",
+        passage: "The chief executive said, “Bookings remain robust.” An analyst then said channel checks showed more customer cancellations. Management did not answer the cancellation point.",
+        labels: ["positive", "neutral", "negative", "insufficient evidence", "invalid"],
+        draftLabel: "insufficient evidence",
+        rationale: "Both claims are clearly attributed, but they conflict. An annotator must not prefer one claim only because of the speaker's role. The passage gives no resolution or basis to combine them, so the label is insufficient evidence."
+      },
+      {
+        id: "call-macro",
+        source: "Earnings call",
+        family: "Macro indicator",
+        title: "Did not ease is not always an increase",
+        tags: ["negation", "reported speech", "time"],
+        target: "Wages and household income in the United States",
+        aspect: "Outlook and expectations",
+        passage: "The finance chief said, “We do not expect wage growth to ease this year. We still plan for about 4%, which is the rate that we saw last year.”",
+        labels: ["increase", "unchanged", "decrease", "insufficient evidence", "invalid"],
+        draftLabel: "unchanged",
+        rationale: "The stated measure is the wage-growth rate. The expected rate stays near 4%. Wage levels can rise while the growth rate stays unchanged. “Do not expect to ease” does not by itself mean increase."
+      },
+      {
+        id: "filing-company",
+        source: "Regulatory filing",
+        family: "Company",
+        title: "An inquiry has no known outcome",
+        tags: ["evidence sufficiency", "legal uncertainty"],
+        target: "Atlas Payments Corp",
+        aspect: "Legal and regulatory position",
+        passage: "Atlas Payments received a regulator request for information and is cooperating. The company cannot predict the timing or outcome. No allegation or penalty has been issued.",
+        labels: ["positive", "neutral", "negative", "insufficient evidence", "invalid"],
+        draftLabel: "insufficient evidence",
+        rationale: "The inquiry supports legal uncertainty, but it does not state a favorable or unfavorable legal position. Cooperation is not a positive outcome. No allegation is not the same as clearance."
+      },
+      {
+        id: "filing-macro",
+        source: "Regulatory filing",
+        family: "Macro indicator",
+        title: "A company cost gives direct evidence about rates",
+        tags: ["cross-target effect", "current condition"],
+        target: "Interest-rate environment in the United States",
+        aspect: "Current condition",
+        passage: "The filing states that benchmark interest rates increased during the quarter. As a result, the company paid more interest on its variable-rate debt.",
+        labels: ["increase", "unchanged", "decrease", "insufficient evidence", "invalid"],
+        draftLabel: "increase",
+        rationale: "The first sentence directly states that benchmark rates increased. The company cost is extra evidence, but it is not needed to transfer a company result to the macro target."
+      },
+      {
+        id: "social-company",
+        source: "Financial social media",
+        family: "Company",
+        title: "Sarcasm changes the literal meaning",
+        tags: ["sarcasm", "operations"],
+        target: "Pioneer Motors plc",
+        aspect: "Operations, supply, and capacity",
+        passage: "“Brilliant work, Pioneer Motors—another recall before lunch. The factory quality plan is going perfectly 🙃.”",
+        labels: ["positive", "neutral", "negative", "insufficient evidence", "invalid"],
+        draftLabel: "negative",
+        rationale: "The recall, the contrast, and the upside-down-face symbol make the negative intent clear. The passage directly criticizes company operations."
+      },
+      {
+        id: "social-macro",
+        source: "Financial social media",
+        family: "Macro indicator",
+        title: "A commodity move is used to predict inflation",
+        tags: ["cross-target effect", "outlook", "source claim"],
+        target: "Inflation and cost of living in the United States",
+        aspect: "Outlook and expectations",
+        passage: "“Oil jumped again today. US inflation will rise next month. There is no way around it.”",
+        labels: ["increase", "unchanged", "decrease", "insufficient evidence", "invalid"],
+        draftLabel: "increase",
+        rationale: "The post makes an explicit future claim about the supplied inflation target. Its certainty may be poor, but the annotation task labels stated direction. Source reliability is not part of this draft rule."
+      }
+    ];
+
+    const walkthroughs = [
+      {
+        id: "all-sources",
+        title: "All five sources",
+        description: "Check one hard case from each passage source.",
+        caseIds: ["news-company", "announcement-macro", "call-company", "filing-macro", "social-company"]
+      },
+      {
+        id: "family-switch",
+        title: "Two label families",
+        description: "Switch between company polarity and macro-indicator direction.",
+        caseIds: ["news-company", "news-macro", "call-company", "call-macro"]
+      },
+      {
+        id: "boundary-cases",
+        title: "Rule boundaries",
+        description: "Check time, negation, unclear evidence, sarcasm, and cross-target effects.",
+        caseIds: ["announcement-company", "call-macro", "filing-company", "social-company", "social-macro"]
+      }
+    ];
+
+    let state = ReviewModel.initialState(cases.map((item) => item.id));
+
+    const byId = (id) => document.getElementById(id);
+    const currentCase = () => cases.find((item) => item.id === state.currentCaseId);
+    const currentReview = () => state.reviews[state.currentCaseId];
+    const dispatch = (action) => { state = ReviewModel.reduce(state, action); render(); };
+
+    function button(label, className, onClick) {
+      const element = document.createElement("button");
+      element.type = "button";
+      element.className = className;
+      element.textContent = label;
+      element.addEventListener("click", onClick);
+      return element;
+    }
+
+    function renderState() {
+      const item = currentCase();
+      const summary = ReviewModel.summary(state, cases);
+      byId("state-current").textContent = `${cases.indexOf(item) + 1}. ${item.source}`;
+      byId("state-reviewed").textContent = `${summary.reviewed} of ${cases.length}`;
+      byId("state-matches").textContent = String(summary.matches);
+      byId("state-disagreements").textContent = String(summary.disagreements);
+      byId("state-notes").textContent = String(summary.notes);
+    }
+
+    function renderCase() {
+      const item = currentCase();
+      const review = currentReview();
+      byId("case-source").textContent = `${item.source} · ${item.family}`;
+      byId("case-title").textContent = item.title;
+      byId("case-count").textContent = `${cases.indexOf(item) + 1} of ${cases.length}`;
+      byId("case-passage").textContent = item.passage;
+      byId("case-target").textContent = item.target;
+      byId("case-aspect").textContent = item.aspect;
+      byId("case-tags").replaceChildren(...item.tags.map((tag) => {
+        const span = document.createElement("span");
+        span.className = "tag";
+        span.textContent = tag;
+        return span;
+      }));
+
+      byId("label-choices").replaceChildren(...item.labels.map((label) => button(
+        label,
+        `choice ${label === "invalid" ? "invalid" : ""} ${review.label === label ? "selected" : ""}`,
+        () => dispatch({ type: "CHOOSE_LABEL", label })
+      )));
+
+      const confidenceOptions = ["clear", "some doubt", "not clear"];
+      byId("confidence-choices").replaceChildren(...confidenceOptions.map((confidence) => button(
+        confidence,
+        `choice ${review.confidence === confidence ? "selected" : ""}`,
+        () => dispatch({ type: "SET_CONFIDENCE", confidence })
+      )));
+
+      const note = byId("case-note");
+      if (document.activeElement !== note) note.value = review.note;
+
+      const answer = byId("draft-answer");
+      answer.className = `answer ${review.revealed ? "" : "hidden"} ${review.label && review.label !== item.draftLabel ? "disagree" : ""}`;
+      answer.innerHTML = "";
+      if (review.revealed) {
+        const heading = document.createElement("h3");
+        heading.textContent = `Draft answer: ${item.draftLabel}`;
+        const reason = document.createElement("p");
+        reason.textContent = item.rationale;
+        answer.append(heading, reason);
+      }
+
+      byId("reveal-button").textContent = review.revealed ? "Draft answer is shown" : "Show the draft answer";
+      byId("reveal-button").disabled = review.revealed;
+    }
+
+    function renderFreePlay() {
+      byId("case-list").replaceChildren(...cases.map((item, index) => {
+        const review = state.reviews[item.id];
+        const detail = review.label ? `Your label: ${review.label}` : `${item.source} · ${item.family}`;
+        const element = button(
+          `${index + 1}. ${item.title}`,
+          `case-button ${item.id === state.currentCaseId ? "selected" : ""}`,
+          () => dispatch({ type: "SELECT_CASE", caseId: item.id })
+        );
+        const small = document.createElement("small");
+        small.textContent = detail;
+        element.append(small);
+        return element;
+      }));
+    }
+
+    function renderWalkthroughs() {
+      byId("walkthrough-tabs").replaceChildren(...walkthroughs.map((walkthrough) => button(
+        walkthrough.title,
+        `tab-button ${state.activeWalkthrough === walkthrough.id ? "selected" : ""}`,
+        () => dispatch({ type: "START_WALKTHROUGH", id: walkthrough.id, firstCaseId: walkthrough.caseIds[0] })
+      )));
+
+      const active = walkthroughs.find((item) => item.id === state.activeWalkthrough);
+      const panel = byId("walkthrough-panel");
+      panel.innerHTML = "";
+      const description = document.createElement("p");
+      description.textContent = active.description;
+      const steps = document.createElement("div");
+      steps.className = "steps";
+      active.caseIds.forEach((caseId, index) => {
+        const item = cases.find((candidate) => candidate.id === caseId);
+        steps.append(button(
+          `${index + 1}. ${item.source}`,
+          `small-button ${index < state.walkthroughStep ? "step-done" : ""}`,
+          () => dispatch({ type: "WALKTHROUGH_CASE", caseId, step: index + 1 })
+        ));
+      });
+      panel.append(description, steps);
+    }
+
+    function render() {
+      renderState();
+      renderCase();
+      renderFreePlay();
+      renderWalkthroughs();
+    }
+
+    byId("case-note").addEventListener("input", (event) => {
+      state = ReviewModel.reduce(state, { type: "SET_NOTE", note: event.target.value });
+      renderState();
+      renderFreePlay();
+    });
+    byId("reveal-button").addEventListener("click", () => dispatch({ type: "REVEAL" }));
+    byId("next-button").addEventListener("click", () => {
+      const index = cases.findIndex((item) => item.id === state.currentCaseId);
+      dispatch({ type: "SELECT_CASE", caseId: cases[(index + 1) % cases.length].id });
+    });
+    byId("reset-button").addEventListener("click", () => {
+      if (window.confirm("Clear all choices and notes?")) {
+        dispatch({ type: "RESET" });
+        byId("status-line").textContent = "All choices are clear.";
+      }
+    });
+    byId("download-button").addEventListener("click", () => {
+      const payload = {
+        prototype: "labeling-manual-ontology-v1",
+        createdAt: new Date().toISOString(),
+        summary: ReviewModel.summary(state, cases),
+        reviews: cases.map((item) => ({
+          caseId: item.id,
+          source: item.source,
+          family: item.family,
+          target: item.target,
+          aspect: item.aspect,
+          userLabel: state.reviews[item.id].label,
+          draftLabel: item.draftLabel,
+          confidence: state.reviews[item.id].confidence,
+          note: state.reviews[item.id].note
+        }))
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = "labeling-manual-review.json";
+      link.click();
+      URL.revokeObjectURL(link.href);
+      byId("status-line").textContent = "The review file is ready.";
+    });
+    byId("copy-button").addEventListener("click", async () => {
+      const summary = ReviewModel.summary(state, cases);
+      const lines = [
+        `Labeling manual review: ${summary.reviewed}/${cases.length} cases reviewed; ${summary.matches} matches; ${summary.disagreements} disagreements.`,
+        ...cases.filter((item) => {
+          const review = state.reviews[item.id];
+          return review.label || review.note.trim();
+        }).map((item) => {
+          const review = state.reviews[item.id];
+          return `- ${item.title}: user=${review.label || "no label"}; draft=${item.draftLabel}; clarity=${review.confidence || "not set"}; note=${review.note.trim() || "none"}`;
+        })
+      ];
+      try {
+        await navigator.clipboard.writeText(lines.join("\n"));
+        byId("status-line").textContent = "The review summary is in the clipboard.";
+      } catch (error) {
+        byId("status-line").textContent = "The browser blocked the clipboard. Download the review file instead.";
+      }
+    });
+
+    render();
+  </script>
+</body>
+</html>

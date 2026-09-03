@@ -1,0 +1,122 @@
+{
+  "prototype": "labeling-manual-ontology-v1",
+  "createdAt": "2026-09-03T03:11:40.442Z",
+  "summary": {
+    "reviewed": 10,
+    "matches": 7,
+    "disagreements": 3,
+    "notes": 3
+  },
+  "reviews": [
+    {
+      "caseId": "news-company",
+      "source": "Financial news",
+      "family": "Company",
+      "target": "Northstar Foods plc",
+      "aspect": "Financial performance",
+      "userLabel": "insufficient evidence",
+      "draftLabel": "insufficient evidence",
+      "confidence": "clear",
+      "note": ""
+    },
+    {
+      "caseId": "news-macro",
+      "source": "Financial news",
+      "family": "Macro indicator",
+      "target": "Inflation and cost of living in Singapore",
+      "aspect": "Trend and momentum",
+      "userLabel": "increase",
+      "draftLabel": "increase",
+      "confidence": "clear",
+      "note": ""
+    },
+    {
+      "caseId": "announcement-company",
+      "source": "Company announcement",
+      "family": "Company",
+      "target": "Harbor Grid Ltd",
+      "aspect": "Operations, supply, and capacity",
+      "userLabel": "neutral",
+      "draftLabel": "insufficient evidence",
+      "confidence": "clear",
+      "note": "its about future outlook on operations, so thats tricky."
+    },
+    {
+      "caseId": "announcement-macro",
+      "source": "Company announcement",
+      "family": "Macro indicator",
+      "target": "Inflation and cost of living in the United Kingdom",
+      "aspect": "Drivers and pressures",
+      "userLabel": "decrease",
+      "draftLabel": "decrease",
+      "confidence": "clear",
+      "note": ""
+    },
+    {
+      "caseId": "call-company",
+      "source": "Earnings call",
+      "family": "Company",
+      "target": "Cedar Cloud Inc",
+      "aspect": "Demand and commercial traction",
+      "userLabel": "negative",
+      "draftLabel": "insufficient evidence",
+      "confidence": "clear",
+      "note": "i tend to trust analyst's channel checks more, but get the point that both claims are clear and conflict."
+    },
+    {
+      "caseId": "call-macro",
+      "source": "Earnings call",
+      "family": "Macro indicator",
+      "target": "Wages and household income in the United States",
+      "aspect": "Outlook and expectations",
+      "userLabel": "increase",
+      "draftLabel": "unchanged",
+      "confidence": "clear",
+      "note": "if its wages and household income and the wage growth is still 4%, thats an increase in wages still?"
+    },
+    {
+      "caseId": "filing-company",
+      "source": "Regulatory filing",
+      "family": "Company",
+      "target": "Atlas Payments Corp",
+      "aspect": "Legal and regulatory position",
+      "userLabel": "insufficient evidence",
+      "draftLabel": "insufficient evidence",
+      "confidence": "clear",
+      "note": ""
+    },
+    {
+      "caseId": "filing-macro",
+      "source": "Regulatory filing",
+      "family": "Macro indicator",
+      "target": "Interest-rate environment in the United States",
+      "aspect": "Current condition",
+      "userLabel": "increase",
+      "draftLabel": "increase",
+      "confidence": "clear",
+      "note": ""
+    },
+    {
+      "caseId": "social-company",
+      "source": "Financial social media",
+      "family": "Company",
+      "target": "Pioneer Motors plc",
+      "aspect": "Operations, supply, and capacity",
+      "userLabel": "negative",
+      "draftLabel": "negative",
+      "confidence": "clear",
+      "note": ""
+    },
+    {
+      "caseId": "social-macro",
+      "source": "Financial social media",
+      "family": "Macro indicator",
+      "target": "Inflation and cost of living in the United States",
+      "aspect": "Outlook and expectations",
+      "userLabel": "increase",
+      "draftLabel": "increase",
+      "confidence": "clear",
+      "note": ""
+    }
+  ]
+}
