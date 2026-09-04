@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Staged experiment specification prototype</title>
+  <style>
+    :root {
+      --ink: #172033;
+      --muted: #667085;
+      --line: #d7dce5;
+      --paper: #ffffff;
+      --wash: #f5f7fa;
+      --accent: #335cff;
+      --accent-soft: #eef1ff;
+      --good: #1b7f4b;
+      --warn: #a35b00;
+      --bad: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--wash);
+      font: 15px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { width: min(1180px, calc(100% - 32px)); margin: 32px auto 72px; }
+    h1, h2, h3 { line-height: 1.2; margin: 0 0 12px; }
+    h1 { font-size: clamp(28px, 4vw, 44px); letter-spacing: -0.035em; }
+    h2 { font-size: 22px; }
+    h3 { font-size: 16px; }
+    p { margin: 0 0 12px; }
+    code { background: #eef0f4; border-radius: 4px; padding: 1px 5px; }
+    .eyebrow { color: var(--accent); font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+    .intro { max-width: 900px; margin: 10px 0 28px; font-size: 17px; }
+    .notice { border-left: 4px solid var(--warn); background: #fff7e8; padding: 14px 16px; margin: 0 0 24px; }
+    .grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(320px, .75fr); gap: 20px; align-items: start; }
+    .card { background: var(--paper); border: 1px solid var(--line); border-radius: 14px; padding: 20px; box-shadow: 0 4px 18px rgba(21, 31, 55, .04); }
+    .stack { display: grid; gap: 20px; }
+    .status-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+    .pill { display: inline-flex; gap: 6px; align-items: center; border-radius: 999px; padding: 5px 10px; font-weight: 700; font-size: 13px; background: #eef0f4; }
+    .pill.good { color: var(--good); background: #eaf7f0; }
+    .pill.warn { color: var(--warn); background: #fff3dc; }
+    .pill.bad { color: var(--bad); background: #fff0ee; }
+    .fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .field { border: 1px solid var(--line); border-radius: 10px; padding: 11px 12px; min-height: 72px; }
+    .field span { display: block; color: var(--muted); font-size: 12px; font-weight: 750; letter-spacing: .045em; text-transform: uppercase; }
+    .field strong { display: block; margin-top: 4px; }
+    .change { margin-top: 14px; border-radius: 10px; padding: 11px 12px; background: var(--accent-soft); color: #243bb2; }
+    .error { background: #fff0ee; color: var(--bad); }
+    .actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+    button { border: 1px solid #bfc7d6; border-radius: 9px; background: white; color: var(--ink); padding: 10px 12px; font: inherit; font-weight: 700; text-align: left; cursor: pointer; }
+    button:hover { border-color: var(--accent); background: var(--accent-soft); }
+    button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+    button.danger { color: var(--bad); }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); padding: 9px 8px; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    .tabs { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 8px; }
+    .tabs button { white-space: nowrap; }
+    .tabs button[aria-selected="true"] { background: var(--ink); border-color: var(--ink); color: white; }
+    .walkthrough { min-height: 220px; }
+    .steps { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+    .steps button.done { color: var(--good); border-color: #98d4b4; background: #f0faf4; }
+    .steps button.next { color: white; border-color: var(--accent); background: var(--accent); }
+    .finding { border-top: 1px solid var(--line); padding: 14px 0; }
+    .finding:first-of-type { border-top: 0; padding-top: 0; }
+    .finding b { color: var(--bad); }
+    .finding em { display: block; margin-top: 5px; color: var(--good); font-style: normal; }
+    .spec-list { margin: 0; padding-left: 20px; }
+    .spec-list li { margin: 7px 0; }
+    .small { color: var(--muted); font-size: 13px; }
+    @media (max-width: 850px) { .grid { grid-template-columns: 1fr; } }
+    @media (max-width: 560px) { .fields, .actions { grid-template-columns: 1fr; } main { width: min(100% - 20px, 1180px); margin-top: 18px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="eyebrow">Throwaway logic prototype</div>
+    <h1>Staged experiment specification</h1>
+    <p class="intro"><strong>Question:</strong> Does one concrete dry-run state model expose where the staged financial aspect classification experiment is ambiguous, unfair, unauditable, infeasible, or easy to game? Use the controls to test the route before any model call, spend, training, or blind evaluation occurs.</p>
+    <div class="notice"><strong>Current decision:</strong> No build is permitted. The three label-provider accounts are not confirmed. Four passage-source rights paths also fail. All “confirm” actions in this demo are hypothetical.</div>
+
+    <div class="grid">
+      <div class="stack">
+        <section class="card" aria-labelledby="state-heading">
+          <h2 id="state-heading">Current experiment state</h2>
+          <div id="status-row" class="status-row"></div>
+          <div id="fields" class="fields"></div>
+          <div id="change" class="change" aria-live="polite"></div>
+        </section>
+
+        <section class="card" aria-labelledby="actions-heading">
+          <h2 id="actions-heading">Free play</h2>
+          <p>All actions stay available. If an action is not permitted, the state does not change and the reason appears above.</p>
+          <div id="actions" class="actions"></div>
+        </section>
+
+        <section class="card walkthrough" aria-labelledby="walkthrough-heading">
+          <h2 id="walkthrough-heading">Guided walkthroughs</h2>
+          <div id="tabs" class="tabs" role="tablist"></div>
+          <div id="scenario"></div>
+        </section>
+
+        <section class="card" aria-labelledby="spec-heading">
+          <h2 id="spec-heading">Compact staged specification</h2>
+          <h3>One fixed task</h3>
+          <ul class="spec-list">
+            <li>Input: one bounded English financial passage, one supplied public company, and one supplied applicable aspect.</li>
+            <li>Output: positive, neutral, negative, or insufficient evidence. Invalid target or aspect pairs are rejected before scoring.</li>
+            <li>Stage 1 aspects: financial performance; demand and commercial traction; operations, supply, and capacity; outlook and expectations.</li>
+            <li>Apply the frozen target gate, aspect gate, narrowest-supported-aspect rule, speaker-neutral rule, no-material-effect rule, and conservative conflict rule.</li>
+          </ul>
+
+          <h3>One data plan</h3>
+          <table>
+            <thead><tr><th>Source</th><th>Accepted silver</th><th>Development</th><th>Blind</th><th>Candidate limit</th></tr></thead>
+            <tbody>
+              <tr><td>Financial news</td><td>4,000</td><td>200</td><td>400</td><td>6,668</td></tr>
+              <tr><td>Company announcements</td><td>2,000</td><td>200</td><td>400</td><td>3,333</td></tr>
+              <tr><td>Regulatory filings</td><td>2,000</td><td>200</td><td>400</td><td>3,333</td></tr>
+              <tr><td>Earnings calls</td><td>2,000</td><td>200</td><td>400</td><td>3,333</td></tr>
+              <tr><td>Financial social media</td><td>2,000</td><td>200</td><td>400</td><td>3,333</td></tr>
+            </tbody>
+          </table>
+          <p class="small">The total is 12,000 accepted silver examples, 1,000 development examples, 2,000 blind examples, and no more than 20,000 silver-label candidates.</p>
+
+          <h3>One label and training path</h3>
+          <ul class="spec-list">
+            <li>Get one raw vote from each fixed route: <code>mistral/mistral-medium-3-5</code>, <code>cf/@cf/zai-org/glm-4.7-flash</code>, and <code>groq/qwen/qwen3.6-27b</code>.</li>
+            <li>Keep the raw request, response, route identity, prompt hash, schema, confidence, provenance, and cost record. A failure is an abstention.</li>
+            <li>Use frozen class-specific source weights from human development labels. Reject an example if fewer than two valid sources agree or if the final probability is below 0.70.</li>
+            <li>Train <code>yangheng/deberta-v3-base-absa-v1.1</code> with a new four-class head. Use three seeds, soft-label cross-entropy, development macro-F1 checkpoint selection, and scalar temperature calibration.</li>
+            <li>Use ModernBERT Base only if more than 5% of accepted passages exceed 512 tokens or DeBERTa fails the exact-device smoke test.</li>
+          </ul>
+
+          <h3>One staged test path</h3>
+          <table>
+            <thead><tr><th>Stage</th><th>New training sources</th><th>Required source tests</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>Financial news</td><td>Financial news</td></tr>
+              <tr><td>2</td><td>Company announcements; regulatory filings</td><td>Both new sources; financial news regression</td></tr>
+              <tr><td>3</td><td>Earnings calls; financial social media</td><td>Both new sources; all three earlier regressions</td></tr>
+            </tbody>
+          </table>
+          <ul class="spec-list">
+            <li>Use the cumulative specialist for each stage. Seal all inputs and configurations before blind inference.</li>
+            <li>Call only <code>cx/gpt-5.6-sol-medium</code>, at medium reasoning effort, with the frozen zero-shot prompt and strict one-label schema. GPT supplies no training or development artifact.</li>
+            <li>Each source uses a separate 400-example blind set, with 25 examples in each of the 16 aspect-and-label cells. Use four-class macro-F1 and 10,000 paired event-group bootstrap samples with seed 20260905.</li>
+            <li>A source passes when the lower 95% interval for specialist minus GPT macro-F1 is at least -0.03. Superiority needs a lower limit greater than zero.</li>
+            <li>One failed or invalid new-source or regression-source test stops the stage. A pooled score cannot replace a failed source result.</li>
+          </ul>
+
+          <h3>One hard budget</h3>
+          <p>Use USD 0 for silver-label calls, USD 35 for specialist training and device checks, USD 25 for the GPT blind comparison, USD 20 for data and storage, and USD 20 for contingency. Stop before committed plus actual external spend can exceed USD 100.</p>
+        </section>
+      </div>
+
+      <aside class="stack">
+        <section class="card" aria-labelledby="findings-heading">
+          <h2 id="findings-heading">Items that need a human decision</h2>
+          <div class="finding"><b>Infeasible now:</b> Only regulatory filings have a current source-rights path. No fixed label route has an account-specific free-limit check. <em>Proposed rule: keep the no-build decision until every account and every source passes the preflight gate.</em></div>
+          <div class="finding"><b>Unfair input:</b> GPT gets the full passage, but DeBERTa can lose passage tokens after token 512. The 5% fallback gate does not protect each blind example. <em>Proposed rule: create one evidence-preserving bounded passage before both systems receive it. Reject a blind set if any required evidence is outside the specialist input.</em></div>
+          <div class="finding"><b>Ambiguous aggregation:</b> “Weighted probabilistic” does not define the estimator, smoothing, correlation treatment, or tie rule. The result is not reproducible from the stated rule. <em>Proposed rule: freeze one named equation, fit procedure, smoothing value, tie rule, and software version before silver collection.</em></div>
+          <div class="finding"><b>Easy to game:</b> Repeated prompt, threshold, candidate, seed, or checkpoint choices can use the development set until a good result appears. <em>Proposed rule: predeclare one change budget and an append-only decision log. Seal the final selection procedure before blind data exists.</em></div>
+          <div class="finding"><b>Unauditable candidate intake:</b> The source, extraction, event grouping, deduplication, ordering, and replacement rules are not fully frozen. <em>Proposed rule: seal a source-specific candidate manifest and deterministic sampling rule before labeling starts.</em></div>
+          <div class="finding"><b>Ambiguous Stage 2 and Stage 3 training:</b> Two sources enter each stage. The plan does not say if their data enters one joint checkpoint or in a fixed order. <em>Proposed rule: add both new-source datasets together, train one cumulative checkpoint, and test that same checkpoint on all required sources.</em></div>
+          <div class="finding"><b>Ambiguous GPT regression use:</b> The plan does not say if an earlier source calls GPT again at each later stage. New calls add cost and a new failure point without changing the baseline design. <em>Proposed rule: seal and reuse one valid GPT prediction file for each source. Run only the new specialist on earlier regression sets.</em></div>
+          <div class="finding"><b>Infeasible invalid-run rule:</b> One bad blind call requires a new untouched blind set, but the data plan and budget include only one blind set for each source. <em>Proposed rule: permit no automatic rerun. Return to a new planning decision for added data, cost, and invalidation controls.</em></div>
+          <div class="finding"><b>Unclear free-label schedule:</b> The latest size includes development votes, so each route can process 21,000 examples. The Groq plan can need 93 daily token grants, not the earlier 88-day estimate for only 20,000 candidates. <em>Proposed rule: use the later 21,000-example estimate and require a dated account-limit calculation.</em></div>
+          <div class="finding"><b>Easy to game budget categories:</b> A total-only spend check can hide a paid label call or an unapproved move between categories. <em>Proposed rule: enforce each frozen category limit and the USD 100 total in one append-only ledger. Require a new map decision before a category limit changes.</em></div>
+          <div class="finding"><b>Claim boundary:</b> Balanced 400-example source sets test capability. They do not estimate real source or label prevalence. <em>Proposed rule: limit every result to this balanced, company-only, four-aspect task.</em></div>
+        </section>
+      </aside>
+    </div>
+  </main>
+
+  <script>
+    /* Pure experiment state machine. It has no DOM access. */
+    const ExperimentMachine = (() => {
+      const stages = [
+        { name: "Stage 1", train: "Financial news", tests: ["Financial news"], accepted: 4000, development: 200, blind: 400 },
+        { name: "Stage 2", train: "Company announcements and regulatory filings", tests: ["Company announcements", "Regulatory filings", "Financial news regression"], accepted: 4000, development: 400, blind: 800 },
+        { name: "Stage 3", train: "Earnings calls and financial social media", tests: ["Earnings calls", "Financial social media", "Financial news regression", "Company announcements regression", "Regulatory filings regression"], accepted: 4000, development: 400, blind: 800 }
+      ];
+
+      const initial = () => ({
+        stageIndex: 0,
+        phase: "Preflight",
+        buildDecision: "No build",
+        prerequisites: "3 provider checks fail; 4 source-rights paths fail",
+        manifests: "Not sealed",
+        acceptedSilver: 0,
+        development: 0,
+        uniqueBlind: 0,
+        specialistRun: false,
+        gptRun: false,
+        sourceTestsPassed: 0,
+        spendCommitted: 0,
+        spendActual: 0,
+        stopped: true,
+        stopReason: "The provider and source-rights preflight gate fails.",
+        invalidRun: false,
+        reviewFlags: [],
+        lastChange: "Loaded the actual known state. No run is permitted."
+      });
+
+      const copy = state => ({ ...state, reviewFlags: [...state.reviewFlags] });
+      const reject = (state, reason) => ({ ...copy(state), lastChange: `Action rejected: ${reason}` });
+      const stage = state => stages[state.stageIndex];
+
+      function reduce(state, action) {
+        if (action.type === "RESET_ACTUAL") return initial();
+        const next = copy(state);
+
+        if (action.type === "CONFIRM_PREREQUISITES") {
+          if (state.phase !== "Preflight") return reject(state, "Only the initial preflight gate can accept this evidence.");
+          next.prerequisites = "All exact routes, free limits, access, and rights confirmed";
+          next.buildDecision = "Eligible for a build check";
+          next.stopped = false;
+          next.stopReason = "None";
+          next.lastChange = "Hypothetical preflight evidence now passes.";
+          return next;
+        }
+        if (action.type === "SEAL_MANIFESTS") {
+          if (state.stopped) return reject(state, state.stopReason);
+          next.manifests = "Inputs, prompts, routes, data, code, model, budget, and metrics sealed";
+          next.phase = "Ready for collection";
+          next.lastChange = "All stage inputs and selection rules were sealed before collection.";
+          return next;
+        }
+        if (action.type === "COLLECT") {
+          if (state.manifests === "Not sealed") return reject(state, "Seal the manifests first.");
+          if (state.phase !== "Ready for collection") return reject(state, "Collection is not the next permitted phase.");
+          next.acceptedSilver += stage(state).accepted;
+          next.development += stage(state).development;
+          next.uniqueBlind += stage(state).blind;
+          next.phase = "Ready for label-model fit";
+          next.lastChange = `${stage(state).name} data reached its fixed quotas without passing a candidate limit.`;
+          return next;
+        }
+        if (action.type === "FIT_LABEL_MODEL") {
+          if (state.phase !== "Ready for label-model fit") return reject(state, "Collect the current stage data first.");
+          next.phase = "Ready for specialist training";
+          next.lastChange = "The frozen weak-supervision estimator produced accepted soft labels.";
+          return next;
+        }
+        if (action.type === "TRAIN") {
+          if (state.phase !== "Ready for specialist training") return reject(state, "Fit the label model first.");
+          next.phase = "Ready to seal blind run";
+          next.lastChange = "One cumulative DeBERTa specialist was selected by the sealed development procedure.";
+          return next;
+        }
+        if (action.type === "SEAL_BLIND") {
+          if (state.phase !== "Ready to seal blind run") return reject(state, "Train and select the specialist first.");
+          next.phase = "Blind run sealed";
+          next.lastChange = "Reference labels are hidden. Both prediction outputs must be sealed before scoring.";
+          return next;
+        }
+        if (action.type === "RUN_SPECIALIST") {
+          if (state.phase !== "Blind run sealed" && state.phase !== "One blind output sealed") return reject(state, "Seal the blind run first.");
+          next.specialistRun = true;
+          next.phase = next.gptRun ? "Ready to score" : "One blind output sealed";
+          next.lastChange = "The specialist produced one valid label for every scheduled source example.";
+          return next;
+        }
+        if (action.type === "RUN_GPT") {
+          if (state.phase !== "Blind run sealed" && state.phase !== "One blind output sealed") return reject(state, "Seal the blind run first.");
+          next.gptRun = true;
+          next.phase = next.specialistRun ? "Ready to score" : "One blind output sealed";
+          next.lastChange = "The fixed GPT route produced one valid label for every new-source example. Earlier sealed GPT files are reused.";
+          return next;
+        }
+        if (action.type === "SCORE_PASS") {
+          if (state.phase !== "Ready to score") return reject(state, "Both sealed prediction files are required.");
+          next.sourceTestsPassed = stage(state).tests.length;
+          next.phase = "Stage passed";
+          next.lastChange = `All ${stage(state).tests.length} source gates passed. No pooled score replaced a source result.`;
+          return next;
+        }
+        if (action.type === "ADVANCE") {
+          if (state.phase !== "Stage passed") return reject(state, "Every current source gate must pass first.");
+          if (state.stageIndex === stages.length - 1) {
+            next.phase = "Experiment complete";
+            next.buildDecision = "Staged result available";
+            next.lastChange = "All three stages and all regression source gates passed.";
+            return next;
+          }
+          next.stageIndex += 1;
+          next.phase = "Ready for collection";
+          next.specialistRun = false;
+          next.gptRun = false;
+          next.sourceTestsPassed = 0;
+          next.lastChange = `${stages[next.stageIndex].name} is open. Add both new-source datasets to one cumulative checkpoint.`;
+          return next;
+        }
+        if (action.type === "QUOTA_FAILURE") {
+          next.stopped = true;
+          next.phase = "Stopped";
+          next.stopReason = "A free label-route limit failed. Paid overflow, retry, fallback, and substitution are prohibited.";
+          next.lastChange = next.stopReason;
+          return next;
+        }
+        if (action.type === "RIGHTS_FAILURE") {
+          next.stopped = true;
+          next.phase = "Stopped";
+          next.stopReason = "A passage source lacks permission for access, evaluation, training, or planned release.";
+          next.lastChange = next.stopReason;
+          return next;
+        }
+        if (action.type === "BLIND_FAILURE") {
+          if (!["Blind run sealed", "One blind output sealed", "Ready to score"].includes(state.phase)) return reject(state, "No blind run is active.");
+          next.stopped = true;
+          next.invalidRun = true;
+          next.phase = "Invalid; new planning decision required";
+          next.stopReason = "A blind output failed. This run has no result. The frozen data and budget do not include a replacement blind set.";
+          next.lastChange = next.stopReason;
+          return next;
+        }
+        if (action.type === "SOURCE_FAIL") {
+          if (state.phase !== "Ready to score") return reject(state, "Both sealed prediction files are required.");
+          next.stopped = true;
+          next.phase = "Stage failed";
+          next.stopReason = "At least one source lower confidence limit is below -0.03.";
+          next.lastChange = "The stage stops. A pooled result cannot offset this source failure.";
+          return next;
+        }
+        if (action.type === "COMMIT_SPEND") {
+          const amount = action.amount || 20;
+          if (state.spendCommitted + state.spendActual + amount > 100) return reject(state, "The committed and actual spend would exceed USD 100.");
+          next.spendCommitted += amount;
+          next.lastChange = `USD ${amount} was committed. The total exposure is USD ${next.spendCommitted + next.spendActual}.`;
+          return next;
+        }
+        if (action.type === "UNFAIR_INPUT") {
+          if (!next.reviewFlags.includes("Input mismatch")) next.reviewFlags.push("Input mismatch");
+          next.stopped = true;
+          next.phase = "Specification review";
+          next.stopReason = "GPT can see evidence that the specialist loses after token 512.";
+          next.lastChange = "The comparison is not fair. Define one evidence-preserving bounded passage for both systems.";
+          return next;
+        }
+        if (action.type === "TUNE_AFTER_BLIND") {
+          if (!["One blind output sealed", "Ready to score", "Stage passed"].includes(state.phase)) return reject(state, "No blind output is available to influence a choice.");
+          if (!next.reviewFlags.includes("Blind feedback")) next.reviewFlags.push("Blind feedback");
+          next.stopped = true;
+          next.phase = "Invalid due to blind feedback";
+          next.invalidRun = true;
+          next.stopReason = "A prompt, threshold, seed, checkpoint, or policy changed after blind output existed.";
+          next.lastChange = "The blind comparison is invalid. Do not report a score.";
+          return next;
+        }
+        return reject(state, "Unknown action.");
+      }
+
+      return { initial, reduce, stage, stages };
+    })();
+
+    const actionList = [
+      ["Reset to actual no-build state", "RESET_ACTUAL"],
+      ["Confirm all preflight evidence", "CONFIRM_PREREQUISITES", "primary"],
+      ["Seal all manifests", "SEAL_MANIFESTS"],
+      ["Collect fixed stage data", "COLLECT"],
+      ["Fit frozen label model", "FIT_LABEL_MODEL"],
+      ["Train cumulative specialist", "TRAIN"],
+      ["Seal blind run", "SEAL_BLIND"],
+      ["Run local specialist", "RUN_SPECIALIST"],
+      ["Run or reuse fixed GPT baseline", "RUN_GPT"],
+      ["Pass every source gate", "SCORE_PASS"],
+      ["Advance stage", "ADVANCE", "primary"],
+      ["Commit USD 20", "COMMIT_SPEND"],
+      ["Trigger free-limit failure", "QUOTA_FAILURE", "danger"],
+      ["Trigger source-rights failure", "RIGHTS_FAILURE", "danger"],
+      ["Trigger blind-call failure", "BLIND_FAILURE", "danger"],
+      ["Fail one source gate", "SOURCE_FAIL", "danger"],
+      ["Expose truncated blind evidence", "UNFAIR_INPUT", "danger"],
+      ["Tune after blind output", "TUNE_AFTER_BLIND", "danger"]
+    ];
+
+    const scenarios = [
+      {
+        name: "Actual stop",
+        description: "Show why the current experiment cannot start. Confirming some design choices does not replace missing account and rights evidence.",
+        steps: [["Try to seal manifests", "SEAL_MANIFESTS"], ["Try to collect data", "COLLECT"]]
+      },
+      {
+        name: "Valid Stage 1",
+        description: "Run the shortest valid hypothetical path. Watch the strict order from preflight evidence to separate source scoring.",
+        steps: [["Confirm preflight", "CONFIRM_PREREQUISITES"], ["Seal manifests", "SEAL_MANIFESTS"], ["Collect data", "COLLECT"], ["Fit label model", "FIT_LABEL_MODEL"], ["Train specialist", "TRAIN"], ["Seal blind run", "SEAL_BLIND"], ["Run specialist", "RUN_SPECIALIST"], ["Run GPT", "RUN_GPT"], ["Pass source gate", "SCORE_PASS"], ["Advance", "ADVANCE"]]
+      },
+      {
+        name: "Free-limit stop",
+        description: "Show that a free-limit error ends collection. It does not permit paid overflow or a replacement model.",
+        steps: [["Confirm preflight", "CONFIRM_PREREQUISITES"], ["Seal manifests", "SEAL_MANIFESTS"], ["Trigger limit failure", "QUOTA_FAILURE"], ["Try to collect", "COLLECT"]]
+      },
+      {
+        name: "Invalid blind run",
+        description: "Show the missing recovery plan. One blind failure invalidates the run, but no replacement blind set or budget is in the fixed plan.",
+        steps: [["Confirm preflight", "CONFIRM_PREREQUISITES"], ["Seal manifests", "SEAL_MANIFESTS"], ["Collect data", "COLLECT"], ["Fit label model", "FIT_LABEL_MODEL"], ["Train specialist", "TRAIN"], ["Seal blind run", "SEAL_BLIND"], ["Trigger blind failure", "BLIND_FAILURE"]]
+      },
+      {
+        name: "Unfair input",
+        description: "Show the comparison defect when GPT sees relevant evidence after the specialist 512-token limit.",
+        steps: [["Confirm preflight", "CONFIRM_PREREQUISITES"], ["Seal manifests", "SEAL_MANIFESTS"], ["Expose lost evidence", "UNFAIR_INPUT"]]
+      },
+      {
+        name: "Blind gaming",
+        description: "Show why any choice based on blind output invalidates the test, even before scores are visible.",
+        steps: [["Confirm preflight", "CONFIRM_PREREQUISITES"], ["Seal manifests", "SEAL_MANIFESTS"], ["Collect data", "COLLECT"], ["Fit label model", "FIT_LABEL_MODEL"], ["Train specialist", "TRAIN"], ["Seal blind run", "SEAL_BLIND"], ["Run specialist", "RUN_SPECIALIST"], ["Change a choice", "TUNE_AFTER_BLIND"]]
+      }
+    ];
+
+    let state = ExperimentMachine.initial();
+    let activeScenario = 0;
+    let scenarioStep = 0;
+
+    function tone(text) {
+      if (/pass|complete|eligible|confirmed|sealed/i.test(text)) return "good";
+      if (/fail|invalid|stop|no build/i.test(text)) return "bad";
+      return "warn";
+    }
+
+    function render() {
+      const currentStage = ExperimentMachine.stage(state);
+      document.getElementById("status-row").innerHTML = [state.buildDecision, state.phase, state.stopped ? "Stopped" : "Open path"]
+        .map(value => `<span class="pill ${tone(value)}">${value}</span>`).join("");
+      const fields = [
+        ["Stage", `${currentStage.name}: ${currentStage.train}`],
+        ["Required tests", currentStage.tests.join("; ")],
+        ["Preflight", state.prerequisites],
+        ["Manifests", state.manifests],
+        ["Accepted silver", `${state.acceptedSilver.toLocaleString()} of 12,000`],
+        ["Human development", `${state.development.toLocaleString()} of 1,000`],
+        ["Unique human blind", `${state.uniqueBlind.toLocaleString()} of 2,000`],
+        ["Blind outputs", `Specialist: ${state.specialistRun ? "sealed" : "not sealed"}; GPT: ${state.gptRun ? "sealed" : "not sealed"}`],
+        ["Source gates", `${state.sourceTestsPassed} of ${currentStage.tests.length} passed`],
+        ["Spend exposure", `USD ${state.spendCommitted + state.spendActual} of USD 100`],
+        ["Stop reason", state.stopReason],
+        ["Review flags", state.reviewFlags.length ? state.reviewFlags.join("; ") : "None triggered"]
+      ];
+      document.getElementById("fields").innerHTML = fields.map(([label, value]) => `<div class="field"><span>${label}</span><strong>${value}</strong></div>`).join("");
+      const change = document.getElementById("change");
+      change.textContent = state.lastChange;
+      change.className = `change ${/^Action rejected|invalid|not fair/i.test(state.lastChange) ? "error" : ""}`;
+      renderScenario();
+    }
+
+    function dispatch(type) {
+      state = ExperimentMachine.reduce(state, { type, amount: 20 });
+      render();
+    }
+
+    function startScenario(index) {
+      activeScenario = index;
+      scenarioStep = 0;
+      state = ExperimentMachine.initial();
+      renderTabs();
+      render();
+    }
+
+    function doScenarioStep(index) {
+      if (index !== scenarioStep) return;
+      dispatch(scenarios[activeScenario].steps[index][1]);
+      scenarioStep += 1;
+      renderScenario();
+    }
+
+    function renderTabs() {
+      document.getElementById("tabs").innerHTML = scenarios.map((scenario, index) => `<button role="tab" aria-selected="${index === activeScenario}" onclick="startScenario(${index})">${scenario.name}</button>`).join("");
+    }
+
+    function renderScenario() {
+      const scenario = scenarios[activeScenario];
+      document.getElementById("scenario").innerHTML = `<h3>${scenario.name}</h3><p>${scenario.description}</p><div class="steps">${scenario.steps.map(([label], index) => `<button class="${index < scenarioStep ? "done" : index === scenarioStep ? "next" : ""}" onclick="doScenarioStep(${index})">${index < scenarioStep ? "Done: " : `${index + 1}. `}${label}</button>`).join("")}</div>`;
+    }
+
+    document.getElementById("actions").innerHTML = actionList.map(([label, type, className = ""]) => `<button class="${className}" onclick="dispatch('${type}')">${label}</button>`).join("");
+    renderTabs();
+    render();
+  </script>
+</body>
+</html>
