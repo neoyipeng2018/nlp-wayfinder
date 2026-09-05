@@ -130,8 +130,8 @@
             <li>Get one raw vote from each fixed route: <code>mistral/mistral-medium-3-5</code>, <code>cf/@cf/zai-org/glm-4.7-flash</code>, and <code>groq/qwen/qwen3.6-27b</code>.</li>
             <li>Keep the raw request, response, route identity, prompt hash, schema, confidence, provenance, and cost record. A failure is an abstention.</li>
             <li>Use frozen class-specific source weights from human development labels. Reject an example if fewer than two valid sources agree or if the final probability is below 0.70.</li>
-            <li>Train <code>yangheng/deberta-v3-base-absa-v1.1</code> with a new four-class head. Use three seeds, soft-label cross-entropy, development macro-F1 checkpoint selection, and scalar temperature calibration.</li>
-            <li>Use ModernBERT Base only if more than 5% of accepted passages exceed 512 tokens or DeBERTa fails the exact-device smoke test.</li>
+            <li>Train only <code>answerdotai/ModernBERT-base@8949b909ec900327062f0ebf497f51aef5e6f0c8</code> with a new four-class head and explicit passage, target, and aspect fields. Use three seeds, soft-label cross-entropy, development macro-F1 checkpoint selection, and scalar temperature calibration.</li>
+            <li>Do not use an alternate initialization, a fallback model, or a model bake-off.</li>
           </ul>
 
           <h3>One staged test path</h3>
@@ -160,7 +160,7 @@
         <section class="card" aria-labelledby="findings-heading">
           <h2 id="findings-heading">Items that need a human decision</h2>
           <div class="finding"><b>Infeasible now:</b> Only regulatory filings have a current source-rights path. No fixed label route has an account-specific free-limit check. <em>Proposed rule: keep the no-build decision until every account and every source passes the preflight gate.</em></div>
-          <div class="finding"><b>Unfair input:</b> GPT gets the full passage, but DeBERTa can lose passage tokens after token 512. The 5% fallback gate does not protect each blind example. <em>Proposed rule: create one evidence-preserving bounded passage before both systems receive it. Reject a blind set if any required evidence is outside the specialist input.</em></div>
+          <div class="finding"><b>Input length is not frozen:</b> ModernBERT supports long inputs, but the local training length and passage-bounding rule are not yet exact. Different visible evidence would make the comparison unfair. <em>Proposed rule: create one evidence-preserving bounded passage before both systems receive it. Give both systems that exact passage.</em></div>
           <div class="finding"><b>Ambiguous aggregation:</b> “Weighted probabilistic” does not define the estimator, smoothing, correlation treatment, or tie rule. The result is not reproducible from the stated rule. <em>Proposed rule: freeze one named equation, fit procedure, smoothing value, tie rule, and software version before silver collection.</em></div>
           <div class="finding"><b>Easy to game:</b> Repeated prompt, threshold, candidate, seed, or checkpoint choices can use the development set until a good result appears. <em>Proposed rule: predeclare one change budget and an append-only decision log. Seal the final selection procedure before blind data exists.</em></div>
           <div class="finding"><b>Unauditable candidate intake:</b> The source, extraction, event grouping, deduplication, ordering, and replacement rules are not fully frozen. <em>Proposed rule: seal a source-specific candidate manifest and deterministic sampling rule before labeling starts.</em></div>
@@ -248,7 +248,7 @@
         if (action.type === "TRAIN") {
           if (state.phase !== "Ready for specialist training") return reject(state, "Fit the label model first.");
           next.phase = "Ready to seal blind run";
-          next.lastChange = "One cumulative DeBERTa specialist was selected by the sealed development procedure.";
+          next.lastChange = "One cumulative ModernBERT Base specialist was selected by the sealed development procedure.";
           return next;
         }
         if (action.type === "SEAL_BLIND") {
