@@ -107,6 +107,7 @@
           <h3>One fixed task</h3>
           <ul class="spec-list">
             <li>Input: one bounded English financial passage, one supplied public company, and one supplied applicable aspect.</li>
+            <li>Limit the complete ModernBERT input to 1,024 tokens, including the passage, company, aspect, and special tokens. Use consecutive complete sentences. Reject an example when its target and required label evidence do not fit. Give the exact same bounded passage, company, and aspect to every human and model.</li>
             <li>Output: positive, neutral, negative, or insufficient evidence. Invalid target or aspect pairs are rejected before scoring.</li>
             <li>Stage 1 aspects: financial performance; demand and commercial traction; operations, supply, and capacity; outlook and expectations.</li>
             <li>Apply the frozen target gate, aspect gate, narrowest-supported-aspect rule, speaker-neutral rule, no-material-effect rule, and conservative conflict rule.</li>
@@ -132,6 +133,7 @@
             <li>Keep the raw request, response, route identity, prompt hash, schema, confidence, provenance, and cost record. A failure is an abstention.</li>
             <li>Use frozen class-specific source weights from human development labels. Reject an example if fewer than two valid sources agree or if the final probability is below 0.70.</li>
             <li>Train only <code>answerdotai/ModernBERT-base@8949b909ec900327062f0ebf497f51aef5e6f0c8</code> with a new four-class head and explicit passage, target, and aspect fields. Use three seeds, soft-label cross-entropy, development macro-F1 checkpoint selection, and scalar temperature calibration.</li>
+            <li>Use the 8 GB M3 Mac for a 512-token compatibility check and final local inference. Use one rented NVIDIA GPU for the 1,024-token pilot and full training. Prefer a 48 GB A40; use 24 GB Ampere-or-newer as the minimum.</li>
             <li>Do not use an alternate initialization, a fallback model, or a model bake-off.</li>
           </ul>
 
@@ -153,7 +155,7 @@
           </ul>
 
           <h3>One hard budget</h3>
-          <p>Use USD 0 for silver-label calls, USD 35 for specialist training and device checks, USD 25 for the GPT blind comparison, USD 20 for data and storage, and USD 20 for contingency. Stop before committed plus actual external spend can exceed USD 100.</p>
+          <p>Use USD 0 for silver-label calls, USD 35 for specialist training and device checks, USD 25 for the GPT blind comparison, USD 20 for data and storage, and USD 20 for contingency. Within the USD 35 specialist limit, use a USD 5 GPU pilot limit, a USD 20 normal training limit, and a USD 25 absolute training limit. Stop before committed plus actual external spend can exceed USD 100.</p>
         </section>
       </div>
 
@@ -161,7 +163,7 @@
         <section class="card" aria-labelledby="findings-heading">
           <h2 id="findings-heading">Items that need a human decision</h2>
           <div class="finding"><b>Human change applied:</b> Later-stage data and model accounts do not block an earlier stage. The Hugging Face and free-vendor reviews are complete. SFD-v1 passes for regulatory filings. News and earnings calls need small checks. Company announcements and financial social media still fail. No new labeling vendor passes all checks. <em>Current rule: before each stage starts, confirm only that stage’s source rights and three fixed free label routes. Do not change a route during a stage.</em></div>
-          <div class="finding"><b>Input length is not frozen:</b> ModernBERT supports long inputs, but the local training length and passage-bounding rule are not yet exact. Different visible evidence would make the comparison unfair. <em>Proposed rule: create one evidence-preserving bounded passage before both systems receive it. Give both systems that exact passage.</em></div>
+          <div class="finding"><b>Human decision applied:</b> The complete input has a 1,024-token limit. It uses consecutive complete sentences and includes the passage, company, aspect, special tokens. Reject an example when its target and required label evidence do not fit. <em>Use the exact same input for every human and model. Train on a rented NVIDIA GPU. Use the M3 Mac for a 512-token compatibility check and final local inference.</em></div>
           <div class="finding"><b>Ambiguous aggregation:</b> “Weighted probabilistic” does not define the estimator, smoothing, correlation treatment, or tie rule. The result is not reproducible from the stated rule. <em>Proposed rule: freeze one named equation, fit procedure, smoothing value, tie rule, and software version before silver collection.</em></div>
           <div class="finding"><b>Easy to game:</b> Repeated prompt, threshold, candidate, seed, or checkpoint choices can use the development set until a good result appears. <em>Proposed rule: predeclare one change budget and an append-only decision log. Seal the final selection procedure before blind data exists.</em></div>
           <div class="finding"><b>Unauditable candidate intake:</b> The source, extraction, event grouping, deduplication, ordering, and replacement rules are not fully frozen. <em>Proposed rule: seal a source-specific candidate manifest and deterministic sampling rule before labeling starts.</em></div>
@@ -190,6 +192,8 @@
         phase: "Preflight",
         buildDecision: "No build",
         prerequisites: "Stage 1 Common Pile yield/date and three free route accounts are not confirmed",
+        inputRule: "Same complete-sentence input; 1,024 total ModernBERT tokens",
+        trainingRule: "Rented NVIDIA GPU; M3 for compatibility and local inference",
         manifests: "Not sealed",
         acceptedSilver: 0,
         development: 0,
@@ -342,8 +346,8 @@
           if (!next.reviewFlags.includes("Input mismatch")) next.reviewFlags.push("Input mismatch");
           next.stopped = true;
           next.phase = "Specification review";
-          next.stopReason = "GPT can see evidence that the specialist loses after token 512.";
-          next.lastChange = "The comparison is not fair. Define one evidence-preserving bounded passage for both systems.";
+          next.stopReason = "GPT can see evidence outside the frozen 1,024-token input.";
+          next.lastChange = "The comparison is not fair. Give every system only the same frozen bounded passage.";
           return next;
         }
         if (action.type === "TUNE_AFTER_BLIND") {
@@ -434,6 +438,8 @@
         ["Stage", `${currentStage.name}: ${currentStage.train}`],
         ["Required tests", currentStage.tests.join("; ")],
         ["Preflight", state.prerequisites],
+        ["Input rule", state.inputRule],
+        ["Training rule", state.trainingRule],
         ["Manifests", state.manifests],
         ["Accepted silver", `${state.acceptedSilver.toLocaleString()} of 12,000`],
         ["Human development", `${state.development.toLocaleString()} of 1,000`],
