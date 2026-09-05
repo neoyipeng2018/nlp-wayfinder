@@ -126,6 +126,8 @@
           </table>
           <p class="small">The total is 12,000 accepted silver examples, 1,000 development examples, 2,000 blind examples, and no more than 20,000 silver-label candidates.</p>
           <p class="small">Hugging Face result: SFD-v1 passes for regulatory filings in the non-commercial research lane. Common Pile News and the Earnings-22 plus Earnings25 path need small yield and date checks. Company announcements and full-text financial social media still have no approved dataset. A dataset card and license are not sufficient by themselves; trace each dataset to its original source.</p>
+          <p class="small">Before labeling, seal one annex for each source. It fixes the source revision or retrieval period, rights record, included document types, raw fields, extraction code, text normalization, sentence splitter, company aliases, target-and-aspect expansion, and split boundaries. Build stable candidate IDs from the source ID, document revision, passage offsets, company ID, and aspect.</p>
+          <p class="small">Group events and remove exact duplicates before splitting. Review pairs at character 5-gram Jaccard similarity 0.85 or higher, or at embedding cosine similarity 0.95 or higher, with a frozen embedding revision. Order candidates by SHA-256 of <code>nlp-wayfinder + stage + source + split + candidate_id + 20260905</code>. Inspect only in that order. Every inspected silver candidate counts against its source limit. Use only the next eligible candidate in the same source and required cell. If the ordered pool cannot meet a quota, the source fails.</p>
 
           <h3>One label and training path</h3>
           <ul class="spec-list">
@@ -167,7 +169,7 @@
           <div class="finding"><b>Human decision applied:</b> The complete input has a 1,024-token limit. It uses consecutive complete sentences and includes the passage, company, aspect, special tokens. Reject an example when its target and required label evidence do not fit. <em>Use the exact same input for every human and model. Train on a rented NVIDIA GPU. Use the M3 Mac for a 512-token compatibility check and final local inference.</em></div>
           <div class="finding"><b>Human decision applied:</b> Snorkel does not use the 200 human labels to fit each voter’s confusion matrix. Newer CROWDLAB needs a trained classifier and can make this training path circular. <em>Use Crowd-Kit 1.4.2 gold-anchored Dawid–Skene for each passage source, with fixed five-fold temperature calibration, no fitted dependency parameters, and the conservative support and 0.70 rules.</em></div>
           <div class="finding"><b>Human decision applied:</b> Repeated choices can overfit the development set. <em>Current rule: before any development result exists, confirm the complete stage manifest. Confirmation gives a zero-change budget. Record the confirmation and every attempted later change in an append-only decision log. A semantic change after confirmation stops and invalidates the run.</em></div>
-          <div class="finding"><b>Unauditable candidate intake:</b> The source, extraction, event grouping, deduplication, ordering, and replacement rules are not fully frozen. <em>Proposed rule: seal a source-specific candidate manifest and deterministic sampling rule before labeling starts.</em></div>
+          <div class="finding"><b>Human decision applied:</b> Candidate intake must not permit favorable passage selection or discretionary replacement. <em>Current rule: seal one source annex and ordered candidate manifest before labeling. Group events and remove duplicates before splitting. Use the fixed SHA-256 order and only the next eligible candidate in the same source and required cell. A quota failure stops the source.</em></div>
           <div class="finding"><b>Ambiguous Stage 2 and Stage 3 training:</b> Two sources enter each stage. The plan does not say if their data enters one joint checkpoint or in a fixed order. <em>Proposed rule: add both new-source datasets together, train one cumulative checkpoint, and test that same checkpoint on all required sources.</em></div>
           <div class="finding"><b>Ambiguous GPT regression use:</b> The plan does not say if an earlier source calls GPT again at each later stage. New calls add cost and a new failure point without changing the baseline design. <em>Proposed rule: seal and reuse one valid GPT prediction file for each source. Run only the new specialist on earlier regression sets.</em></div>
           <div class="finding"><b>Infeasible invalid-run rule:</b> One bad blind call requires a new untouched blind set, but the data plan and budget include only one blind set for each source. <em>Proposed rule: permit no automatic rerun. Return to a new planning decision for added data, cost, and invalidation controls.</em></div>
@@ -197,6 +199,7 @@
         trainingRule: "Rented NVIDIA GPU; M3 for compatibility and local inference",
         manifests: "Not sealed",
         changeBudget: "Not confirmed",
+        candidateIntake: "Source annex and ordered candidate manifest not sealed",
         acceptedSilver: 0,
         development: 0,
         uniqueBlind: 0,
@@ -233,6 +236,7 @@
           if (state.stopped) return reject(state, state.stopReason);
           next.manifests = "Current-stage inputs, prompts, routes, data, code, model, budget, and metrics sealed";
           next.changeBudget = "Zero changes after confirmation";
+          next.candidateIntake = "Source annex, event groups, duplicate decisions, exclusions, split boundaries, candidate limits, and SHA-256 order sealed";
           next.phase = "Ready for collection";
           next.lastChange = "A human confirmed the complete stage manifest before any development result existed. The change budget is now zero.";
           return next;
@@ -300,6 +304,7 @@
           next.prerequisites = `${stages[next.stageIndex].name} source rights and three free label routes are not confirmed`;
           next.manifests = "Not sealed";
           next.changeBudget = "Not confirmed";
+          next.candidateIntake = "Source annex and ordered candidate manifest not sealed";
           next.specialistRun = false;
           next.gptRun = false;
           next.sourceTestsPassed = 0;
@@ -374,6 +379,16 @@
           next.lastChange = "Record the attempted change in the append-only decision log. Do not collect, train, select, or score this run.";
           return next;
         }
+        if (action.type === "HAND_PICK_CANDIDATE") {
+          if (state.manifests === "Not sealed") return reject(state, "Seal the source annex and ordered candidate manifest first.");
+          if (!next.reviewFlags.includes("Candidate-order violation")) next.reviewFlags.push("Candidate-order violation");
+          next.stopped = true;
+          next.phase = "Invalid candidate intake";
+          next.invalidRun = true;
+          next.stopReason = "A candidate was selected or replaced outside the sealed SHA-256 order.";
+          next.lastChange = "Do not label or use this manifest. Record the violation and create a new manifest.";
+          return next;
+        }
         return reject(state, "Unknown action.");
       }
 
@@ -398,6 +413,7 @@
       ["Trigger blind-call failure", "BLIND_FAILURE", "danger"],
       ["Fail one source gate", "SOURCE_FAIL", "danger"],
       ["Expose truncated blind evidence", "UNFAIR_INPUT", "danger"],
+      ["Hand-pick a candidate", "HAND_PICK_CANDIDATE", "danger"],
       ["Change a confirmed choice", "CHANGE_AFTER_CONFIRMATION", "danger"],
       ["Tune after blind output", "TUNE_AFTER_BLIND", "danger"]
     ];
@@ -427,6 +443,11 @@
         name: "Unfair input",
         description: "Show the comparison defect when GPT sees relevant evidence outside the shared 1,024-token input.",
         steps: [["Confirm preflight", "CONFIRM_PREREQUISITES"], ["Seal manifests", "SEAL_MANIFESTS"], ["Expose lost evidence", "UNFAIR_INPUT"]]
+      },
+      {
+        name: "Fixed candidate intake",
+        description: "Show that a candidate outside the sealed order invalidates the manifest. No person can select an easier replacement.",
+        steps: [["Confirm preflight", "CONFIRM_PREREQUISITES"], ["Confirm and seal manifest", "SEAL_MANIFESTS"], ["Hand-pick a candidate", "HAND_PICK_CANDIDATE"]]
       },
       {
         name: "Confirmed means frozen",
@@ -462,6 +483,7 @@
         ["Training rule", state.trainingRule],
         ["Manifests", state.manifests],
         ["Change budget", state.changeBudget],
+        ["Candidate intake", state.candidateIntake],
         ["Accepted silver", `${state.acceptedSilver.toLocaleString()} of 12,000`],
         ["Human development", `${state.development.toLocaleString()} of 1,000`],
         ["Unique human blind", `${state.uniqueBlind.toLocaleString()} of 2,000`],
