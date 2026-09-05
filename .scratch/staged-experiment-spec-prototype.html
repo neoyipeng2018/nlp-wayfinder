@@ -79,7 +79,7 @@
     <div class="eyebrow">Throwaway logic prototype</div>
     <h1>Staged experiment specification</h1>
     <p class="intro"><strong>Question:</strong> Does one concrete dry-run state model expose where the staged financial aspect classification experiment is ambiguous, unfair, unauditable, infeasible, or easy to game? Use the controls to test the route before any model call, spend, training, or blind evaluation occurs.</p>
-    <div class="notice"><strong>Current decision:</strong> No build is permitted. The three label-provider accounts are not confirmed. Four passage-source rights paths also fail. All “confirm” actions in this demo are hypothetical.</div>
+    <div class="notice"><strong>Current decision:</strong> Stage 1 cannot start. Its financial-news rights path and its free labeling routes are not confirmed. Later-stage sources and labeling routes do not block Stage 1. All “confirm” actions in this demo are hypothetical.</div>
 
     <div class="grid">
       <div class="stack">
@@ -124,10 +124,11 @@
             </tbody>
           </table>
           <p class="small">The total is 12,000 accepted silver examples, 1,000 development examples, 2,000 blind examples, and no more than 20,000 silver-label candidates.</p>
+          <p class="small">Hugging Face datasets are candidate passage sources. A dataset card and license are not sufficient by themselves. Trace each dataset to the original text source and confirm access, training, evaluation, and release rights before its stage starts.</p>
 
           <h3>One label and training path</h3>
           <ul class="spec-list">
-            <li>Get one raw vote from each fixed route: <code>mistral/mistral-medium-3-5</code>, <code>cf/@cf/zai-org/glm-4.7-flash</code>, and <code>groq/qwen/qwen3.6-27b</code>.</li>
+            <li>Keep an approved pool of free non-GPT labeling vendors. Before each stage starts, select and freeze exactly three named routes that have confirmed account limits, training rights, and no paid overflow. The current candidates are <code>mistral/mistral-medium-3-5</code>, <code>cf/@cf/zai-org/glm-4.7-flash</code>, and <code>groq/qwen/qwen3.6-27b</code>.</li>
             <li>Keep the raw request, response, route identity, prompt hash, schema, confidence, provenance, and cost record. A failure is an abstention.</li>
             <li>Use frozen class-specific source weights from human development labels. Reject an example if fewer than two valid sources agree or if the final probability is below 0.70.</li>
             <li>Train only <code>answerdotai/ModernBERT-base@8949b909ec900327062f0ebf497f51aef5e6f0c8</code> with a new four-class head and explicit passage, target, and aspect fields. Use three seeds, soft-label cross-entropy, development macro-F1 checkpoint selection, and scalar temperature calibration.</li>
@@ -159,7 +160,7 @@
       <aside class="stack">
         <section class="card" aria-labelledby="findings-heading">
           <h2 id="findings-heading">Items that need a human decision</h2>
-          <div class="finding"><b>Infeasible now:</b> Only regulatory filings have a current source-rights path. No fixed label route has an account-specific free-limit check. <em>Proposed rule: keep the no-build decision until every account and every source passes the preflight gate.</em></div>
+          <div class="finding"><b>Human change applied:</b> Later-stage data and model accounts must not block an earlier stage. Hugging Face datasets and more free labeling vendors need research. <em>Current rule: before each stage starts, confirm only that stage’s source rights and three fixed free label routes. A failed later-stage check stops that later stage.</em></div>
           <div class="finding"><b>Input length is not frozen:</b> ModernBERT supports long inputs, but the local training length and passage-bounding rule are not yet exact. Different visible evidence would make the comparison unfair. <em>Proposed rule: create one evidence-preserving bounded passage before both systems receive it. Give both systems that exact passage.</em></div>
           <div class="finding"><b>Ambiguous aggregation:</b> “Weighted probabilistic” does not define the estimator, smoothing, correlation treatment, or tie rule. The result is not reproducible from the stated rule. <em>Proposed rule: freeze one named equation, fit procedure, smoothing value, tie rule, and software version before silver collection.</em></div>
           <div class="finding"><b>Easy to game:</b> Repeated prompt, threshold, candidate, seed, or checkpoint choices can use the development set until a good result appears. <em>Proposed rule: predeclare one change budget and an append-only decision log. Seal the final selection procedure before blind data exists.</em></div>
@@ -188,7 +189,7 @@
         stageIndex: 0,
         phase: "Preflight",
         buildDecision: "No build",
-        prerequisites: "3 provider checks fail; 4 source-rights paths fail",
+        prerequisites: "Stage 1 news rights and three free label routes are not confirmed",
         manifests: "Not sealed",
         acceptedSilver: 0,
         development: 0,
@@ -199,7 +200,7 @@
         spendCommitted: 0,
         spendActual: 0,
         stopped: true,
-        stopReason: "The provider and source-rights preflight gate fails.",
+        stopReason: "The Stage 1 source-rights and free-route preflight gate fails.",
         invalidRun: false,
         reviewFlags: [],
         lastChange: "Loaded the actual known state. No run is permitted."
@@ -214,17 +215,17 @@
         const next = copy(state);
 
         if (action.type === "CONFIRM_PREREQUISITES") {
-          if (state.phase !== "Preflight") return reject(state, "Only the initial preflight gate can accept this evidence.");
-          next.prerequisites = "All exact routes, free limits, access, and rights confirmed";
-          next.buildDecision = "Eligible for a build check";
+          if (state.phase !== "Preflight") return reject(state, "Only the current stage preflight gate can accept this evidence.");
+          next.prerequisites = `${stage(state).name} sources and three fixed free label routes confirmed`;
+          next.buildDecision = `${stage(state).name} eligible for a build check`;
           next.stopped = false;
           next.stopReason = "None";
-          next.lastChange = "Hypothetical preflight evidence now passes.";
+          next.lastChange = `Hypothetical ${stage(state).name} preflight evidence now passes. Later stages stay unchecked.`;
           return next;
         }
         if (action.type === "SEAL_MANIFESTS") {
           if (state.stopped) return reject(state, state.stopReason);
-          next.manifests = "Inputs, prompts, routes, data, code, model, budget, and metrics sealed";
+          next.manifests = "Current-stage inputs, prompts, routes, data, code, model, budget, and metrics sealed";
           next.phase = "Ready for collection";
           next.lastChange = "All stage inputs and selection rules were sealed before collection.";
           return next;
@@ -287,11 +288,16 @@
             return next;
           }
           next.stageIndex += 1;
-          next.phase = "Ready for collection";
+          next.phase = "Preflight";
+          next.buildDecision = `${stages[next.stageIndex].name} not yet eligible`;
+          next.prerequisites = `${stages[next.stageIndex].name} source rights and three free label routes are not confirmed`;
+          next.manifests = "Not sealed";
           next.specialistRun = false;
           next.gptRun = false;
           next.sourceTestsPassed = 0;
-          next.lastChange = `${stages[next.stageIndex].name} is open. Add both new-source datasets to one cumulative checkpoint.`;
+          next.stopped = true;
+          next.stopReason = `${stages[next.stageIndex].name} needs its own source-rights and free-route preflight check.`;
+          next.lastChange = `${stages[next.stageIndex].name} is next. Its later checks did not block the completed stage.`;
           return next;
         }
         if (action.type === "QUOTA_FAILURE") {
@@ -358,7 +364,7 @@
 
     const actionList = [
       ["Reset to actual no-build state", "RESET_ACTUAL"],
-      ["Confirm all preflight evidence", "CONFIRM_PREREQUISITES", "primary"],
+      ["Confirm current-stage preflight evidence", "CONFIRM_PREREQUISITES", "primary"],
       ["Seal all manifests", "SEAL_MANIFESTS"],
       ["Collect fixed stage data", "COLLECT"],
       ["Fit frozen label model", "FIT_LABEL_MODEL"],
@@ -380,12 +386,12 @@
     const scenarios = [
       {
         name: "Actual stop",
-        description: "Show why the current experiment cannot start. Confirming some design choices does not replace missing account and rights evidence.",
+        description: "Show why Stage 1 cannot start. Later-stage checks are not required yet, but Stage 1 news rights and free route evidence are still missing.",
         steps: [["Try to seal manifests", "SEAL_MANIFESTS"], ["Try to collect data", "COLLECT"]]
       },
       {
         name: "Valid Stage 1",
-        description: "Run the shortest valid hypothetical path. Watch the strict order from preflight evidence to separate source scoring.",
+        description: "Run the shortest valid hypothetical path. Watch Stage 1 pass, then see the separate Stage 2 preflight gate.",
         steps: [["Confirm preflight", "CONFIRM_PREREQUISITES"], ["Seal manifests", "SEAL_MANIFESTS"], ["Collect data", "COLLECT"], ["Fit label model", "FIT_LABEL_MODEL"], ["Train specialist", "TRAIN"], ["Seal blind run", "SEAL_BLIND"], ["Run specialist", "RUN_SPECIALIST"], ["Run GPT", "RUN_GPT"], ["Pass source gate", "SCORE_PASS"], ["Advance", "ADVANCE"]]
       },
       {
