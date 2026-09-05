@@ -79,7 +79,7 @@
     <div class="eyebrow">Throwaway logic prototype</div>
     <h1>Staged experiment specification</h1>
     <p class="intro"><strong>Question:</strong> Does one concrete dry-run state model expose where the staged financial aspect classification experiment is ambiguous, unfair, unauditable, infeasible, or easy to game? Use the controls to test the route before any model call, spend, training, or blind evaluation occurs.</p>
-    <div class="notice"><strong>Current decision:</strong> Stage 1 cannot start. Its financial-news rights path and its free labeling routes are not confirmed. Later-stage sources and labeling routes do not block Stage 1. All “confirm” actions in this demo are hypothetical.</div>
+    <div class="notice"><strong>Current decision:</strong> Stage 1 cannot start. Common Pile News needs a company-yield and date check. The three planned free labeling routes also need account checks. Later-stage failures do not block Stage 1. All “confirm” actions in this demo are hypothetical.</div>
 
     <div class="grid">
       <div class="stack">
@@ -124,11 +124,11 @@
             </tbody>
           </table>
           <p class="small">The total is 12,000 accepted silver examples, 1,000 development examples, 2,000 blind examples, and no more than 20,000 silver-label candidates.</p>
-          <p class="small">Hugging Face datasets are candidate passage sources. A dataset card and license are not sufficient by themselves. Trace each dataset to the original text source and confirm access, training, evaluation, and release rights before its stage starts.</p>
+          <p class="small">Hugging Face result: SFD-v1 passes for regulatory filings in the non-commercial research lane. Common Pile News and the Earnings-22 plus Earnings25 path need small yield and date checks. Company announcements and full-text financial social media still have no approved dataset. A dataset card and license are not sufficient by themselves; trace each dataset to its original source.</p>
 
           <h3>One label and training path</h3>
           <ul class="spec-list">
-            <li>Keep an approved pool of free non-GPT labeling vendors. Before each stage starts, select and freeze exactly three named routes that have confirmed account limits, training rights, and no paid overflow. The current candidates are <code>mistral/mistral-medium-3-5</code>, <code>cf/@cf/zai-org/glm-4.7-flash</code>, and <code>groq/qwen/qwen3.6-27b</code>.</li>
+            <li>Before each stage starts, select and freeze exactly three named free non-GPT routes that have confirmed account limits, training rights, and no paid overflow. The current three remain <code>mistral/mistral-medium-3-5</code>, <code>cf/@cf/zai-org/glm-4.7-flash</code>, and <code>groq/qwen/qwen3.6-27b</code>. No additional vendor passes all checks now. Cerebras is standby only and needs written training-use permission.</li>
             <li>Keep the raw request, response, route identity, prompt hash, schema, confidence, provenance, and cost record. A failure is an abstention.</li>
             <li>Use frozen class-specific source weights from human development labels. Reject an example if fewer than two valid sources agree or if the final probability is below 0.70.</li>
             <li>Train only <code>answerdotai/ModernBERT-base@8949b909ec900327062f0ebf497f51aef5e6f0c8</code> with a new four-class head and explicit passage, target, and aspect fields. Use three seeds, soft-label cross-entropy, development macro-F1 checkpoint selection, and scalar temperature calibration.</li>
@@ -160,7 +160,7 @@
       <aside class="stack">
         <section class="card" aria-labelledby="findings-heading">
           <h2 id="findings-heading">Items that need a human decision</h2>
-          <div class="finding"><b>Human change applied:</b> Later-stage data and model accounts must not block an earlier stage. Hugging Face datasets and more free labeling vendors need research. <em>Current rule: before each stage starts, confirm only that stage’s source rights and three fixed free label routes. A failed later-stage check stops that later stage.</em></div>
+          <div class="finding"><b>Human change applied:</b> Later-stage data and model accounts do not block an earlier stage. The Hugging Face and free-vendor reviews are complete. SFD-v1 passes for regulatory filings. News and earnings calls need small checks. Company announcements and financial social media still fail. No new labeling vendor passes all checks. <em>Current rule: before each stage starts, confirm only that stage’s source rights and three fixed free label routes. Do not change a route during a stage.</em></div>
           <div class="finding"><b>Input length is not frozen:</b> ModernBERT supports long inputs, but the local training length and passage-bounding rule are not yet exact. Different visible evidence would make the comparison unfair. <em>Proposed rule: create one evidence-preserving bounded passage before both systems receive it. Give both systems that exact passage.</em></div>
           <div class="finding"><b>Ambiguous aggregation:</b> “Weighted probabilistic” does not define the estimator, smoothing, correlation treatment, or tie rule. The result is not reproducible from the stated rule. <em>Proposed rule: freeze one named equation, fit procedure, smoothing value, tie rule, and software version before silver collection.</em></div>
           <div class="finding"><b>Easy to game:</b> Repeated prompt, threshold, candidate, seed, or checkpoint choices can use the development set until a good result appears. <em>Proposed rule: predeclare one change budget and an append-only decision log. Seal the final selection procedure before blind data exists.</em></div>
@@ -189,7 +189,7 @@
         stageIndex: 0,
         phase: "Preflight",
         buildDecision: "No build",
-        prerequisites: "Stage 1 news rights and three free label routes are not confirmed",
+        prerequisites: "Stage 1 Common Pile yield/date and three free route accounts are not confirmed",
         manifests: "Not sealed",
         acceptedSilver: 0,
         development: 0,
