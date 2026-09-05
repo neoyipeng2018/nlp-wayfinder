@@ -133,6 +133,7 @@
             <li>Keep the raw request, response, route identity, prompt hash, schema, confidence, provenance, and cost record. A failure is an abstention.</li>
             <li>Use <code>crowd-kit==1.4.2</code> with <code>DawidSkene(n_iter=100, tol=1e-8)</code>. Fit one model for each passage source, with the 200 human development labels fixed during fitting. Calibrate its four-class probabilities with one five-fold out-of-fold temperature. Reject an example if fewer than two valid routes support the top class, its probability is below 0.70, or the top probabilities tie within 1e-12.</li>
             <li>Train only <code>answerdotai/ModernBERT-base@8949b909ec900327062f0ebf497f51aef5e6f0c8</code> with a new four-class head and explicit passage, target, and aspect fields. Use three seeds, soft-label cross-entropy, development macro-F1 checkpoint selection, and scalar temperature calibration.</li>
+            <li>Before any development result exists, a human must confirm one complete stage manifest. Confirmation gives a zero-change budget. After confirmation, do not change a prompt, threshold, candidate rule, route, seed, training configuration, checkpoint rule, calibration rule, metric, tie rule, or software version. Record the confirmation and every attempted later change in an append-only decision log.</li>
             <li>Use the 8 GB M3 Mac for a 512-token compatibility check and final local inference. Use one rented NVIDIA GPU for the 1,024-token pilot and full training. Prefer a 48 GB A40; use 24 GB Ampere-or-newer as the minimum.</li>
             <li>Do not use an alternate initialization, a fallback model, or a model bake-off.</li>
           </ul>
@@ -165,7 +166,7 @@
           <div class="finding"><b>Human change applied:</b> Later-stage data and model accounts do not block an earlier stage. The Hugging Face and free-vendor reviews are complete. SFD-v1 passes for regulatory filings. News and earnings calls need small checks. Company announcements and financial social media still fail. No new labeling vendor passes all checks. <em>Current rule: before each stage starts, confirm only that stage’s source rights and three fixed free label routes. Do not change a route during a stage.</em></div>
           <div class="finding"><b>Human decision applied:</b> The complete input has a 1,024-token limit. It uses consecutive complete sentences and includes the passage, company, aspect, special tokens. Reject an example when its target and required label evidence do not fit. <em>Use the exact same input for every human and model. Train on a rented NVIDIA GPU. Use the M3 Mac for a 512-token compatibility check and final local inference.</em></div>
           <div class="finding"><b>Human decision applied:</b> Snorkel does not use the 200 human labels to fit each voter’s confusion matrix. Newer CROWDLAB needs a trained classifier and can make this training path circular. <em>Use Crowd-Kit 1.4.2 gold-anchored Dawid–Skene for each passage source, with fixed five-fold temperature calibration, no fitted dependency parameters, and the conservative support and 0.70 rules.</em></div>
-          <div class="finding"><b>Easy to game:</b> Repeated prompt, threshold, candidate, seed, or checkpoint choices can use the development set until a good result appears. <em>Proposed rule: predeclare one change budget and an append-only decision log. Seal the final selection procedure before blind data exists.</em></div>
+          <div class="finding"><b>Human decision applied:</b> Repeated choices can overfit the development set. <em>Current rule: before any development result exists, confirm the complete stage manifest. Confirmation gives a zero-change budget. Record the confirmation and every attempted later change in an append-only decision log. A semantic change after confirmation stops and invalidates the run.</em></div>
           <div class="finding"><b>Unauditable candidate intake:</b> The source, extraction, event grouping, deduplication, ordering, and replacement rules are not fully frozen. <em>Proposed rule: seal a source-specific candidate manifest and deterministic sampling rule before labeling starts.</em></div>
           <div class="finding"><b>Ambiguous Stage 2 and Stage 3 training:</b> Two sources enter each stage. The plan does not say if their data enters one joint checkpoint or in a fixed order. <em>Proposed rule: add both new-source datasets together, train one cumulative checkpoint, and test that same checkpoint on all required sources.</em></div>
           <div class="finding"><b>Ambiguous GPT regression use:</b> The plan does not say if an earlier source calls GPT again at each later stage. New calls add cost and a new failure point without changing the baseline design. <em>Proposed rule: seal and reuse one valid GPT prediction file for each source. Run only the new specialist on earlier regression sets.</em></div>
@@ -195,6 +196,7 @@
         inputRule: "Same complete-sentence input; 1,024 total ModernBERT tokens",
         trainingRule: "Rented NVIDIA GPU; M3 for compatibility and local inference",
         manifests: "Not sealed",
+        changeBudget: "Not confirmed",
         acceptedSilver: 0,
         development: 0,
         uniqueBlind: 0,
@@ -230,8 +232,9 @@
         if (action.type === "SEAL_MANIFESTS") {
           if (state.stopped) return reject(state, state.stopReason);
           next.manifests = "Current-stage inputs, prompts, routes, data, code, model, budget, and metrics sealed";
+          next.changeBudget = "Zero changes after confirmation";
           next.phase = "Ready for collection";
-          next.lastChange = "All stage inputs and selection rules were sealed before collection.";
+          next.lastChange = "A human confirmed the complete stage manifest before any development result existed. The change budget is now zero.";
           return next;
         }
         if (action.type === "COLLECT") {
@@ -296,6 +299,7 @@
           next.buildDecision = `${stages[next.stageIndex].name} not yet eligible`;
           next.prerequisites = `${stages[next.stageIndex].name} source rights and three free label routes are not confirmed`;
           next.manifests = "Not sealed";
+          next.changeBudget = "Not confirmed";
           next.specialistRun = false;
           next.gptRun = false;
           next.sourceTestsPassed = 0;
@@ -360,6 +364,16 @@
           next.lastChange = "The blind comparison is invalid. Do not report a score.";
           return next;
         }
+        if (action.type === "CHANGE_AFTER_CONFIRMATION") {
+          if (state.manifests === "Not sealed") return reject(state, "No confirmed manifest exists.");
+          if (!next.reviewFlags.includes("Post-confirmation change")) next.reviewFlags.push("Post-confirmation change");
+          next.stopped = true;
+          next.phase = "Invalid due to a post-confirmation change";
+          next.invalidRun = true;
+          next.stopReason = "A semantic choice changed after human confirmation. The zero-change budget was violated.";
+          next.lastChange = "Record the attempted change in the append-only decision log. Do not collect, train, select, or score this run.";
+          return next;
+        }
         return reject(state, "Unknown action.");
       }
 
@@ -384,6 +398,7 @@
       ["Trigger blind-call failure", "BLIND_FAILURE", "danger"],
       ["Fail one source gate", "SOURCE_FAIL", "danger"],
       ["Expose truncated blind evidence", "UNFAIR_INPUT", "danger"],
+      ["Change a confirmed choice", "CHANGE_AFTER_CONFIRMATION", "danger"],
       ["Tune after blind output", "TUNE_AFTER_BLIND", "danger"]
     ];
 
@@ -410,8 +425,13 @@
       },
       {
         name: "Unfair input",
-        description: "Show the comparison defect when GPT sees relevant evidence after the specialist 512-token limit.",
+        description: "Show the comparison defect when GPT sees relevant evidence outside the shared 1,024-token input.",
         steps: [["Confirm preflight", "CONFIRM_PREREQUISITES"], ["Seal manifests", "SEAL_MANIFESTS"], ["Expose lost evidence", "UNFAIR_INPUT"]]
+      },
+      {
+        name: "Confirmed means frozen",
+        description: "Show that human confirmation gives a zero-change budget. A later semantic change stops the run before development or blind results can influence it.",
+        steps: [["Confirm preflight", "CONFIRM_PREREQUISITES"], ["Confirm and seal manifest", "SEAL_MANIFESTS"], ["Change a confirmed choice", "CHANGE_AFTER_CONFIRMATION"]]
       },
       {
         name: "Blind gaming",
@@ -441,6 +461,7 @@
         ["Input rule", state.inputRule],
         ["Training rule", state.trainingRule],
         ["Manifests", state.manifests],
+        ["Change budget", state.changeBudget],
         ["Accepted silver", `${state.acceptedSilver.toLocaleString()} of 12,000`],
         ["Human development", `${state.development.toLocaleString()} of 1,000`],
         ["Unique human blind", `${state.uniqueBlind.toLocaleString()} of 2,000`],
