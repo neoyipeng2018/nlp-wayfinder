@@ -161,12 +161,15 @@
 
           <h3>One hard budget</h3>
           <p>Use USD 0 for silver-label calls, USD 35 for specialist training and device checks, USD 25 for the GPT blind comparison, USD 20 for data and storage, and USD 20 for contingency. These are category limits for the normal case, not a completion guarantee. The 1,024-token pilot must project all remaining training within the specialist balance. A non-blind token check must project 2,000 first GPT attempts and a declared charged-retry reserve within the GPT balance. Record every commitment and actual cost in one append-only ledger. Stop before a category limit or the USD 100 total can be exceeded. A category change needs a new planning decision.</p>
+
+          <h3>One bounded claim</h3>
+          <p>Claim only that the specialist is non-inferior to GPT on the sealed, balanced, company-only, four-aspect source tests that pass. Do not claim performance on the natural label distribution, other aspects or targets, general GPT parity, forecasting value, or trading value.</p>
         </section>
       </div>
 
       <aside class="stack">
         <section class="card" aria-labelledby="findings-heading">
-          <h2 id="findings-heading">Items that need a human decision</h2>
+          <h2 id="findings-heading">Human decisions from the review</h2>
           <div class="finding"><b>Human change applied:</b> Later-stage data and model accounts do not block an earlier stage. The Hugging Face and free-vendor reviews are complete. SFD-v1 passes for regulatory filings. News and earnings calls need small checks. Company announcements and financial social media still fail. <em>Current rule: before each stage starts, confirm only that stage’s source rights and all eligible free non-GPT routes. At least three routes must pass. Freeze the complete accepted set during the stage.</em></div>
           <div class="finding"><b>Human decision applied:</b> The complete input has a 1,024-token limit. It uses consecutive complete sentences and includes the passage, company, aspect, special tokens. Reject an example when its target and required label evidence do not fit. <em>Use the exact same input for every human and model. Train on a rented NVIDIA GPU. Use the M3 Mac for a 512-token compatibility check and final local inference.</em></div>
           <div class="finding"><b>Human decision applied:</b> Snorkel does not use the 200 human labels to fit each voter’s confusion matrix. Newer CROWDLAB needs a trained classifier and can make this training path circular. With more than three routes, support from only two routes can be a minority. <em>Use Crowd-Kit 1.4.2 gold-anchored Dawid–Skene for each passage source, with fixed five-fold temperature calibration and no fitted dependency parameters. Require more than half of the valid routes to support the top class and require calibrated probability of at least 0.70.</em></div>
@@ -177,7 +180,7 @@
           <div class="finding"><b>Human decision applied:</b> A temporary server problem is not a model answer and can use a controlled retry. <em>Current rule: permit at most three identical attempts for fixed server and transport errors. Log all attempts. A malformed model answer or three failed attempts invalidates the source test. Do not use a fallback route or replacement example.</em></div>
           <div class="finding"><b>Human decision applied:</b> Across all stages, each accepted route can process up to 20,000 silver candidates and 1,000 development examples. Groq can need about 93 daily quota grants, but it is not the only permitted route. <em>Current rule: calculate current-stage demand and remaining complete-experiment demand for every accepted route. Record the quota, token use, start date, and finish date. The slowest accepted route sets that stage’s schedule. Use no paid overflow.</em></div>
           <div class="finding"><b>Human decision applied after cost research:</b> The normal planning case is about USD 81.60, but a conservative slow-training and maximum-charged-retry case exceeds USD 135. <em>Current rule: keep the USD 0, USD 35, USD 25, USD 20, and USD 20 category limits as conditional controls. Enforce each category and the USD 100 total in one append-only ledger. Require a passing training pilot and GPT token forecast. A category change needs a new planning decision.</em></div>
-          <div class="finding"><b>Claim boundary:</b> Balanced 400-example source sets test capability. They do not estimate real source or label prevalence. <em>Proposed rule: limit every result to this balanced, company-only, four-aspect task.</em></div>
+          <div class="finding"><b>Human decision applied:</b> Balanced 400-example source sets test capability. They do not estimate real source or label prevalence. <em>Current rule: limit every result to the sealed, balanced, company-only, four-aspect source tests. Do not claim natural-distribution performance, general GPT parity, forecasting value, or trading value.</em></div>
         </section>
       </aside>
     </div>
