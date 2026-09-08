@@ -79,7 +79,7 @@
     <div class="eyebrow">Throwaway logic prototype</div>
     <h1>Staged experiment specification</h1>
     <p class="intro"><strong>Question:</strong> Does one concrete dry-run state model expose where the staged financial aspect classification experiment is ambiguous, unfair, unauditable, infeasible, or easy to game? Use the controls to test the route before any model call, spend, training, or blind evaluation occurs.</p>
-    <div class="notice"><strong>Current decision:</strong> Stage 1 cannot start. Common Pile News needs a company-yield and date check. The three planned free labeling routes also need account checks. Later-stage failures do not block Stage 1. All “confirm” actions in this demo are hypothetical.</div>
+    <div class="notice"><strong>Current decision:</strong> Stage 1 cannot start. Common Pile News needs a company-yield and date check. Every candidate free labeling route needs an account and rights check, and at least three routes must pass. Later-stage failures do not block Stage 1. All “confirm” actions in this demo are hypothetical.</div>
 
     <div class="grid">
       <div class="stack">
@@ -131,7 +131,8 @@
 
           <h3>One label and training path</h3>
           <ul class="spec-list">
-            <li>Before each stage starts, select and freeze exactly three named free non-GPT routes that have confirmed account limits, training rights, and no paid overflow. The current three remain <code>mistral/mistral-medium-3-5</code>, <code>cf/@cf/zai-org/glm-4.7-flash</code>, and <code>groq/qwen/qwen3.6-27b</code>. No additional vendor passes all checks now. Cerebras is standby only and needs written training-use permission.</li>
+            <li>Before each stage starts, inspect all candidate free non-GPT routes. Use every route that has a fixed model identity, confirmed account limits, training rights, complete audit data, and no paid overflow. At least three routes must pass. Freeze the complete route set during the stage. The current candidates are <code>mistral/mistral-medium-3-5</code>, <code>cf/@cf/zai-org/glm-4.7-flash</code>, and <code>groq/qwen/qwen3.6-27b</code>. Cerebras is a candidate only after written training-use permission.</li>
+            <li>For every accepted route, calculate the current-stage demand and its share of the complete 21,000-example ceiling. Record expected token use, account quota, start date, and expected finish date. The slowest accepted route sets that stage’s schedule. Stop if any route cannot complete its stage without paid overflow.</li>
             <li>Keep the raw request, response, route identity, prompt hash, schema, confidence, provenance, and cost record. A failure is an abstention.</li>
             <li>Use <code>crowd-kit==1.4.2</code> with <code>DawidSkene(n_iter=100, tol=1e-8)</code>. Fit one model for each passage source, with the 200 human development labels fixed during fitting. Calibrate its four-class probabilities with one five-fold out-of-fold temperature. Reject an example if fewer than two valid routes support the top class, its probability is below 0.70, or the top probabilities tie within 1e-12.</li>
             <li>Train only <code>answerdotai/ModernBERT-base@8949b909ec900327062f0ebf497f51aef5e6f0c8</code> with a new four-class head and explicit passage, target, and aspect fields. Use three seeds, soft-label cross-entropy, development macro-F1 checkpoint selection, and scalar temperature calibration.</li>
@@ -166,7 +167,7 @@
       <aside class="stack">
         <section class="card" aria-labelledby="findings-heading">
           <h2 id="findings-heading">Items that need a human decision</h2>
-          <div class="finding"><b>Human change applied:</b> Later-stage data and model accounts do not block an earlier stage. The Hugging Face and free-vendor reviews are complete. SFD-v1 passes for regulatory filings. News and earnings calls need small checks. Company announcements and financial social media still fail. No new labeling vendor passes all checks. <em>Current rule: before each stage starts, confirm only that stage’s source rights and three fixed free label routes. Do not change a route during a stage.</em></div>
+          <div class="finding"><b>Human change applied:</b> Later-stage data and model accounts do not block an earlier stage. The Hugging Face and free-vendor reviews are complete. SFD-v1 passes for regulatory filings. News and earnings calls need small checks. Company announcements and financial social media still fail. <em>Current rule: before each stage starts, confirm only that stage’s source rights and all eligible free non-GPT routes. At least three routes must pass. Freeze the complete accepted set during the stage.</em></div>
           <div class="finding"><b>Human decision applied:</b> The complete input has a 1,024-token limit. It uses consecutive complete sentences and includes the passage, company, aspect, special tokens. Reject an example when its target and required label evidence do not fit. <em>Use the exact same input for every human and model. Train on a rented NVIDIA GPU. Use the M3 Mac for a 512-token compatibility check and final local inference.</em></div>
           <div class="finding"><b>Human decision applied:</b> Snorkel does not use the 200 human labels to fit each voter’s confusion matrix. Newer CROWDLAB needs a trained classifier and can make this training path circular. <em>Use Crowd-Kit 1.4.2 gold-anchored Dawid–Skene for each passage source, with fixed five-fold temperature calibration, no fitted dependency parameters, and the conservative support and 0.70 rules.</em></div>
           <div class="finding"><b>Human decision applied:</b> Repeated choices can overfit the development set. <em>Current rule: before any development result exists, confirm the complete stage manifest. Confirmation gives a zero-change budget. Record the confirmation and every attempted later change in an append-only decision log. A semantic change after confirmation stops and invalidates the run.</em></div>
@@ -174,7 +175,7 @@
           <div class="finding"><b>Human decision applied:</b> A fixed source order can change the result and make the stage harder to audit. <em>Current rule: add both new-source datasets together, train one cumulative checkpoint, and test that same checkpoint on all required sources.</em></div>
           <div class="finding"><b>Human decision applied:</b> A new GPT call for an earlier source adds cost and a new failure point without changing the baseline design. <em>Current rule: seal and reuse one valid GPT prediction file for each source. Run only the new specialist on earlier regression sets.</em></div>
           <div class="finding"><b>Human decision applied:</b> A temporary server problem is not a model answer and can use a controlled retry. <em>Current rule: permit at most three identical attempts for fixed server and transport errors. Log all attempts. A malformed model answer or three failed attempts invalidates the source test. Do not use a fallback route or replacement example.</em></div>
-          <div class="finding"><b>Unclear free-label schedule:</b> The latest size includes development votes, so each route can process 21,000 examples. The Groq plan can need 93 daily token grants, not the earlier 88-day estimate for only 20,000 candidates. <em>Proposed rule: use the later 21,000-example estimate and require a dated account-limit calculation.</em></div>
+          <div class="finding"><b>Human decision applied:</b> Across all stages, each accepted route can process up to 20,000 silver candidates and 1,000 development examples. Groq can need about 93 daily quota grants, but it is not the only permitted route. <em>Current rule: calculate current-stage demand and remaining complete-experiment demand for every accepted route. Record the quota, token use, start date, and finish date. The slowest accepted route sets that stage’s schedule. Use no paid overflow.</em></div>
           <div class="finding"><b>Easy to game budget categories:</b> A total-only spend check can hide a paid label call or an unapproved move between categories. <em>Proposed rule: enforce each frozen category limit and the USD 100 total in one append-only ledger. Require a new map decision before a category limit changes.</em></div>
           <div class="finding"><b>Claim boundary:</b> Balanced 400-example source sets test capability. They do not estimate real source or label prevalence. <em>Proposed rule: limit every result to this balanced, company-only, four-aspect task.</em></div>
         </section>
@@ -195,7 +196,7 @@
         stageIndex: 0,
         phase: "Preflight",
         buildDecision: "No build",
-        prerequisites: "Stage 1 Common Pile yield/date and three free route accounts are not confirmed",
+        prerequisites: "Stage 1 Common Pile yield/date and all candidate free route checks are not confirmed; at least three must pass",
         inputRule: "Same complete-sentence input; 1,024 total ModernBERT tokens",
         trainingRule: "Rented NVIDIA GPU; M3 for compatibility and local inference",
         manifests: "Not sealed",
@@ -227,7 +228,7 @@
 
         if (action.type === "CONFIRM_PREREQUISITES") {
           if (state.phase !== "Preflight") return reject(state, "Only the current stage preflight gate can accept this evidence.");
-          next.prerequisites = `${stage(state).name} sources and three fixed free label routes confirmed`;
+          next.prerequisites = `${stage(state).name} sources and all eligible free label routes confirmed; at least three passed and the set is frozen`;
           next.buildDecision = `${stage(state).name} eligible for a build check`;
           next.stopped = false;
           next.stopReason = "None";
@@ -304,7 +305,7 @@
           next.stageIndex += 1;
           next.phase = "Preflight";
           next.buildDecision = `${stages[next.stageIndex].name} not yet eligible`;
-          next.prerequisites = `${stages[next.stageIndex].name} source rights and three free label routes are not confirmed`;
+          next.prerequisites = `${stages[next.stageIndex].name} source rights and all candidate free route checks are not confirmed; at least three must pass`;
           next.manifests = "Not sealed";
           next.changeBudget = "Not confirmed";
           next.candidateIntake = "Source annex and ordered candidate manifest not sealed";
