@@ -152,6 +152,7 @@
           <ul class="spec-list">
             <li>Use the cumulative specialist for each stage. Seal all inputs and configurations before blind inference.</li>
             <li>Call only <code>cx/gpt-5.6-sol-medium</code>, at medium reasoning effort, with the frozen zero-shot prompt and strict one-label schema. GPT supplies no training or development artifact.</li>
+            <li>For a timeout, connection error, HTTP 429, or HTTP 5xx response, permit at most three total attempts with fixed delays. Keep the route, model, prompt, input, settings, and schema unchanged. Log every attempt and cost. Do not retry a malformed model answer, use a fallback route, or replace the example.</li>
             <li>Each source uses a separate 400-example blind set, with 25 examples in each of the 16 aspect-and-label cells. Use four-class macro-F1 and 10,000 paired event-group bootstrap samples with seed 20260905.</li>
             <li>A source passes when the lower 95% interval for specialist minus GPT macro-F1 is at least -0.03. Superiority needs a lower limit greater than zero.</li>
             <li>One failed or invalid new-source or regression-source test stops the stage. A pooled score cannot replace a failed source result.</li>
@@ -172,7 +173,7 @@
           <div class="finding"><b>Human decision applied:</b> Candidate intake must not permit favorable passage selection or discretionary replacement. <em>Current rule: seal one source annex and ordered candidate manifest before labeling. Group events and remove duplicates before splitting. Use the fixed SHA-256 order and only the next eligible candidate in the same source and required cell. A quota failure stops the source.</em></div>
           <div class="finding"><b>Human decision applied:</b> A fixed source order can change the result and make the stage harder to audit. <em>Current rule: add both new-source datasets together, train one cumulative checkpoint, and test that same checkpoint on all required sources.</em></div>
           <div class="finding"><b>Human decision applied:</b> A new GPT call for an earlier source adds cost and a new failure point without changing the baseline design. <em>Current rule: seal and reuse one valid GPT prediction file for each source. Run only the new specialist on earlier regression sets.</em></div>
-          <div class="finding"><b>Infeasible invalid-run rule:</b> One bad blind call requires a new untouched blind set, but the data plan and budget include only one blind set for each source. <em>Proposed rule: permit no automatic rerun. Return to a new planning decision for added data, cost, and invalidation controls.</em></div>
+          <div class="finding"><b>Human decision applied:</b> A temporary server problem is not a model answer and can use a controlled retry. <em>Current rule: permit at most three identical attempts for fixed server and transport errors. Log all attempts. A malformed model answer or three failed attempts invalidates the source test. Do not use a fallback route or replacement example.</em></div>
           <div class="finding"><b>Unclear free-label schedule:</b> The latest size includes development votes, so each route can process 21,000 examples. The Groq plan can need 93 daily token grants, not the earlier 88-day estimate for only 20,000 candidates. <em>Proposed rule: use the later 21,000-example estimate and require a dated account-limit calculation.</em></div>
           <div class="finding"><b>Easy to game budget categories:</b> A total-only spend check can hide a paid label call or an unapproved move between categories. <em>Proposed rule: enforce each frozen category limit and the USD 100 total in one append-only ledger. Require a new map decision before a category limit changes.</em></div>
           <div class="finding"><b>Claim boundary:</b> Balanced 400-example source sets test capability. They do not estimate real source or label prevalence. <em>Proposed rule: limit every result to this balanced, company-only, four-aspect task.</em></div>
@@ -205,6 +206,7 @@
         uniqueBlind: 0,
         specialistRun: false,
         gptRun: false,
+        blindServerFailures: 0,
         sourceTestsPassed: 0,
         spendCommitted: 0,
         spendActual: 0,
@@ -279,6 +281,7 @@
         if (action.type === "RUN_GPT") {
           if (state.phase !== "Blind run sealed" && state.phase !== "One blind output sealed") return reject(state, "Seal the blind run first.");
           next.gptRun = true;
+          next.blindServerFailures = 0;
           next.phase = next.specialistRun ? "Ready to score" : "One blind output sealed";
           next.lastChange = "The fixed GPT route produced one valid label for every new-source example. Earlier sealed GPT files are reused.";
           return next;
@@ -307,6 +310,7 @@
           next.candidateIntake = "Source annex and ordered candidate manifest not sealed";
           next.specialistRun = false;
           next.gptRun = false;
+          next.blindServerFailures = 0;
           next.sourceTestsPassed = 0;
           next.stopped = true;
           next.stopReason = `${stages[next.stageIndex].name} needs its own source-rights and free-route preflight check.`;
@@ -327,12 +331,27 @@
           next.lastChange = next.stopReason;
           return next;
         }
-        if (action.type === "BLIND_FAILURE") {
+        if (action.type === "SERVER_FAILURE") {
           if (!["Blind run sealed", "One blind output sealed", "Ready to score"].includes(state.phase)) return reject(state, "No blind run is active.");
+          if (state.gptRun) return reject(state, "The GPT output is already sealed.");
+          next.blindServerFailures += 1;
+          if (next.blindServerFailures < 3) {
+            next.lastChange = `Server attempt ${next.blindServerFailures} of 3 failed without a model answer. Retry the exact request after the fixed delay.`;
+            return next;
+          }
           next.stopped = true;
           next.invalidRun = true;
           next.phase = "Invalid; new planning decision required";
-          next.stopReason = "A blind output failed. This run has no result. The frozen data and budget do not include a replacement blind set.";
+          next.stopReason = "Three fixed attempts failed without a model answer. This source test has no result.";
+          next.lastChange = next.stopReason;
+          return next;
+        }
+        if (action.type === "MALFORMED_OUTPUT") {
+          if (!["Blind run sealed", "One blind output sealed", "Ready to score"].includes(state.phase)) return reject(state, "No blind run is active.");
+          next.stopped = true;
+          next.invalidRun = true;
+          next.phase = "Invalid model output";
+          next.stopReason = "A model response arrived but did not contain one valid required label. Retrying could hide model failure.";
           next.lastChange = next.stopReason;
           return next;
         }
@@ -410,7 +429,8 @@
       ["Commit USD 20", "COMMIT_SPEND"],
       ["Trigger free-limit failure", "QUOTA_FAILURE", "danger"],
       ["Trigger source-rights failure", "RIGHTS_FAILURE", "danger"],
-      ["Trigger blind-call failure", "BLIND_FAILURE", "danger"],
+      ["Trigger blind server error", "SERVER_FAILURE", "danger"],
+      ["Trigger malformed model answer", "MALFORMED_OUTPUT", "danger"],
       ["Fail one source gate", "SOURCE_FAIL", "danger"],
       ["Expose truncated blind evidence", "UNFAIR_INPUT", "danger"],
       ["Hand-pick a candidate", "HAND_PICK_CANDIDATE", "danger"],
@@ -435,9 +455,14 @@
         steps: [["Confirm preflight", "CONFIRM_PREREQUISITES"], ["Seal manifests", "SEAL_MANIFESTS"], ["Trigger limit failure", "QUOTA_FAILURE"], ["Try to collect", "COLLECT"]]
       },
       {
-        name: "Invalid blind run",
-        description: "Show the missing recovery plan. One blind failure invalidates the run, but no replacement blind set or budget is in the fixed plan.",
-        steps: [["Confirm preflight", "CONFIRM_PREREQUISITES"], ["Seal manifests", "SEAL_MANIFESTS"], ["Collect data", "COLLECT"], ["Fit label model", "FIT_LABEL_MODEL"], ["Train specialist", "TRAIN"], ["Seal blind run", "SEAL_BLIND"], ["Trigger blind failure", "BLIND_FAILURE"]]
+        name: "Server retry limit",
+        description: "Show that a temporary server error permits the same fixed request again, but three failed attempts invalidate the source test.",
+        steps: [["Confirm preflight", "CONFIRM_PREREQUISITES"], ["Seal manifests", "SEAL_MANIFESTS"], ["Collect data", "COLLECT"], ["Fit label model", "FIT_LABEL_MODEL"], ["Train specialist", "TRAIN"], ["Seal blind run", "SEAL_BLIND"], ["First server error", "SERVER_FAILURE"], ["Second server error", "SERVER_FAILURE"], ["Third server error", "SERVER_FAILURE"]]
+      },
+      {
+        name: "Malformed answer",
+        description: "Show that a model response without one valid required label is a model failure, not a server error. Do not retry it.",
+        steps: [["Confirm preflight", "CONFIRM_PREREQUISITES"], ["Seal manifests", "SEAL_MANIFESTS"], ["Collect data", "COLLECT"], ["Fit label model", "FIT_LABEL_MODEL"], ["Train specialist", "TRAIN"], ["Seal blind run", "SEAL_BLIND"], ["Receive malformed answer", "MALFORMED_OUTPUT"]]
       },
       {
         name: "Unfair input",
@@ -488,6 +513,7 @@
         ["Human development", `${state.development.toLocaleString()} of 1,000`],
         ["Unique human blind", `${state.uniqueBlind.toLocaleString()} of 2,000`],
         ["Blind outputs", `Specialist: ${state.specialistRun ? "sealed" : "not sealed"}; GPT: ${state.gptRun ? "sealed" : "not sealed"}`],
+        ["Current blind server failures", `${state.blindServerFailures} of 3 attempts`],
         ["Source gates", `${state.sourceTestsPassed} of ${currentStage.tests.length} passed`],
         ["Spend exposure", `USD ${state.spendCommitted + state.spendActual} of USD 100`],
         ["Stop reason", state.stopReason],
