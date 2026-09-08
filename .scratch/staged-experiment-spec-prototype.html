@@ -160,7 +160,7 @@
           </ul>
 
           <h3>One hard budget</h3>
-          <p>Use USD 0 for silver-label calls, USD 35 for specialist training and device checks, USD 25 for the GPT blind comparison, USD 20 for data and storage, and USD 20 for contingency. Within the USD 35 specialist limit, use a USD 5 GPU pilot limit, a USD 20 normal training limit, and a USD 25 absolute training limit. Stop before committed plus actual external spend can exceed USD 100.</p>
+          <p>Use USD 0 for silver-label calls, USD 35 for specialist training and device checks, USD 25 for the GPT blind comparison, USD 20 for data and storage, and USD 20 for contingency. These are category limits for the normal case, not a completion guarantee. The 1,024-token pilot must project all remaining training within the specialist balance. A non-blind token check must project 2,000 first GPT attempts and a declared charged-retry reserve within the GPT balance. Record every commitment and actual cost in one append-only ledger. Stop before a category limit or the USD 100 total can be exceeded. A category change needs a new planning decision.</p>
         </section>
       </div>
 
@@ -176,7 +176,7 @@
           <div class="finding"><b>Human decision applied:</b> A new GPT call for an earlier source adds cost and a new failure point without changing the baseline design. <em>Current rule: seal and reuse one valid GPT prediction file for each source. Run only the new specialist on earlier regression sets.</em></div>
           <div class="finding"><b>Human decision applied:</b> A temporary server problem is not a model answer and can use a controlled retry. <em>Current rule: permit at most three identical attempts for fixed server and transport errors. Log all attempts. A malformed model answer or three failed attempts invalidates the source test. Do not use a fallback route or replacement example.</em></div>
           <div class="finding"><b>Human decision applied:</b> Across all stages, each accepted route can process up to 20,000 silver candidates and 1,000 development examples. Groq can need about 93 daily quota grants, but it is not the only permitted route. <em>Current rule: calculate current-stage demand and remaining complete-experiment demand for every accepted route. Record the quota, token use, start date, and finish date. The slowest accepted route sets that stage’s schedule. Use no paid overflow.</em></div>
-          <div class="finding"><b>Easy to game budget categories:</b> A total-only spend check can hide a paid label call or an unapproved move between categories. <em>Proposed rule: enforce each frozen category limit and the USD 100 total in one append-only ledger. Require a new map decision before a category limit changes.</em></div>
+          <div class="finding"><b>Human decision applied after cost research:</b> The normal planning case is about USD 81.60, but a conservative slow-training and maximum-charged-retry case exceeds USD 135. <em>Current rule: keep the USD 0, USD 35, USD 25, USD 20, and USD 20 category limits as conditional controls. Enforce each category and the USD 100 total in one append-only ledger. Require a passing training pilot and GPT token forecast. A category change needs a new planning decision.</em></div>
           <div class="finding"><b>Claim boundary:</b> Balanced 400-example source sets test capability. They do not estimate real source or label prevalence. <em>Proposed rule: limit every result to this balanced, company-only, four-aspect task.</em></div>
         </section>
       </aside>
@@ -191,6 +191,14 @@
         { name: "Stage 2", train: "Company announcements and regulatory filings", tests: ["Company announcements", "Regulatory filings", "Financial news regression"], accepted: 4000, development: 400, blind: 800 },
         { name: "Stage 3", train: "Earnings calls and financial social media", tests: ["Earnings calls", "Financial social media", "Financial news regression", "Company announcements regression", "Regulatory filings regression"], accepted: 4000, development: 400, blind: 800 }
       ];
+      const categoryLimits = { silver: 0, specialist: 35, gpt: 25, data: 20, contingency: 20 };
+      const spendActions = {
+        COMMIT_SPECIALIST: { category: "specialist", amount: 20, label: "specialist" },
+        COMMIT_GPT: { category: "gpt", amount: 20, label: "GPT" },
+        COMMIT_DATA: { category: "data", amount: 20, label: "data and storage" },
+        COMMIT_CONTINGENCY: { category: "contingency", amount: 20, label: "contingency" },
+        TRY_PAID_LABEL: { category: "silver", amount: 1, label: "silver labels" }
+      };
 
       const initial = () => ({
         stageIndex: 0,
@@ -211,6 +219,7 @@
         sourceTestsPassed: 0,
         spendCommitted: 0,
         spendActual: 0,
+        categoryCommitted: { silver: 0, specialist: 0, gpt: 0, data: 0, contingency: 0 },
         stopped: true,
         stopReason: "The Stage 1 source-rights and free-route preflight gate fails.",
         invalidRun: false,
@@ -218,7 +227,7 @@
         lastChange: "Loaded the actual known state. No run is permitted."
       });
 
-      const copy = state => ({ ...state, reviewFlags: [...state.reviewFlags] });
+      const copy = state => ({ ...state, reviewFlags: [...state.reviewFlags], categoryCommitted: { ...state.categoryCommitted } });
       const reject = (state, reason) => ({ ...copy(state), lastChange: `Action rejected: ${reason}` });
       const stage = state => stages[state.stageIndex];
 
@@ -364,11 +373,13 @@
           next.lastChange = "The stage stops. A pooled result cannot offset this source failure.";
           return next;
         }
-        if (action.type === "COMMIT_SPEND") {
-          const amount = action.amount || 20;
+        if (spendActions[action.type]) {
+          const { category, amount, label } = spendActions[action.type];
+          if (state.categoryCommitted[category] + amount > categoryLimits[category]) return reject(state, `The ${label} commitment would exceed its USD ${categoryLimits[category]} category limit.`);
           if (state.spendCommitted + state.spendActual + amount > 100) return reject(state, "The committed and actual spend would exceed USD 100.");
+          next.categoryCommitted[category] += amount;
           next.spendCommitted += amount;
-          next.lastChange = `USD ${amount} was committed. The total exposure is USD ${next.spendCommitted + next.spendActual}.`;
+          next.lastChange = `USD ${amount} was committed to ${label}. Its category exposure is USD ${next.categoryCommitted[category]}. The total exposure is USD ${next.spendCommitted + next.spendActual}.`;
           return next;
         }
         if (action.type === "UNFAIR_INPUT") {
@@ -427,7 +438,11 @@
       ["Run or reuse fixed GPT baseline", "RUN_GPT"],
       ["Pass every source gate", "SCORE_PASS"],
       ["Advance stage", "ADVANCE", "primary"],
-      ["Commit USD 20", "COMMIT_SPEND"],
+      ["Commit USD 20 to specialist", "COMMIT_SPECIALIST"],
+      ["Commit USD 20 to GPT", "COMMIT_GPT"],
+      ["Commit USD 20 to data", "COMMIT_DATA"],
+      ["Commit USD 20 to contingency", "COMMIT_CONTINGENCY"],
+      ["Try USD 1 paid label spend", "TRY_PAID_LABEL", "danger"],
       ["Trigger free-limit failure", "QUOTA_FAILURE", "danger"],
       ["Trigger source-rights failure", "RIGHTS_FAILURE", "danger"],
       ["Trigger blind server error", "SERVER_FAILURE", "danger"],
@@ -464,6 +479,11 @@
         name: "Malformed answer",
         description: "Show that a model response without one valid required label is a model failure, not a server error. Do not retry it.",
         steps: [["Confirm preflight", "CONFIRM_PREREQUISITES"], ["Seal manifests", "SEAL_MANIFESTS"], ["Collect data", "COLLECT"], ["Fit label model", "FIT_LABEL_MODEL"], ["Train specialist", "TRAIN"], ["Seal blind run", "SEAL_BLIND"], ["Receive malformed answer", "MALFORMED_OUTPUT"]]
+      },
+      {
+        name: "Category budget",
+        description: "Show that a category limit can stop a commitment even when the USD 100 total still has room. Paid silver labels have a zero-dollar limit.",
+        steps: [["Commit USD 20 to specialist", "COMMIT_SPECIALIST"], ["Try another USD 20 for specialist", "COMMIT_SPECIALIST"], ["Try USD 1 for paid labels", "TRY_PAID_LABEL"]]
       },
       {
         name: "Unfair input",
@@ -517,6 +537,7 @@
         ["Current blind server failures", `${state.blindServerFailures} of 3 attempts`],
         ["Source gates", `${state.sourceTestsPassed} of ${currentStage.tests.length} passed`],
         ["Spend exposure", `USD ${state.spendCommitted + state.spendActual} of USD 100`],
+        ["Category commitments", `Silver USD ${state.categoryCommitted.silver}/0; specialist USD ${state.categoryCommitted.specialist}/35; GPT USD ${state.categoryCommitted.gpt}/25; data USD ${state.categoryCommitted.data}/20; contingency USD ${state.categoryCommitted.contingency}/20`],
         ["Stop reason", state.stopReason],
         ["Review flags", state.reviewFlags.length ? state.reviewFlags.join("; ") : "None triggered"]
       ];
