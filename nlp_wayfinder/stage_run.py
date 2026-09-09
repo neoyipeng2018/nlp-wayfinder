@@ -1,4 +1,4 @@
-"""Safe Stage 1 preflight and append-only audit records."""
+"""Safe Stage 1 feasibility gate and append-only audit records."""
 
 from __future__ import annotations
 
@@ -42,6 +42,7 @@ RIGHTS_FIELDS = (
 
 ROUTE_ELIGIBILITY_FIELDS = (
     "model_identity_verified",
+    "non_gpt_verified",
     "account_free_limit_verified",
     "training_use_permitted",
     "audit_fields_supported",
@@ -82,7 +83,7 @@ def confirm_manifest(
 ) -> dict[str, object]:
     """Return a copy with evidence that confirms its current semantic content."""
     if not confirmed_by.strip():
-        raise ValueError("confirmed_by must not be empty")
+        raise ValueError("The confirmed-by value must contain text.")
     confirmed = copy.deepcopy(dict(manifest))
     confirmed["confirmation"] = {
         "confirmed_by": confirmed_by,
@@ -108,22 +109,28 @@ class _AppendOnlyJsonl:
         previous_hash: str | None = None
         for index, line in enumerate(text.splitlines(), start=1):
             if not line.strip():
-                raise AuditLogError(f"blank append-only record at line {index}")
+                raise AuditLogError(
+                    f"The append-only record at line {index} is blank."
+                )
             try:
                 record = json.loads(line)
             except json.JSONDecodeError as error:
                 raise AuditLogError(
-                    f"invalid append-only record at line {index}"
+                    f"The append-only record at line {index} is not valid."
                 ) from error
             if not isinstance(record, dict):
-                raise AuditLogError(f"invalid append-only record at line {index}")
+                raise AuditLogError(
+                    f"The append-only record at line {index} is not valid."
+                )
             if record.get("sequence") != index:
-                raise AuditLogError(f"invalid sequence at line {index}")
+                raise AuditLogError(f"The sequence at line {index} is not valid.")
             if record.get("previous_record_sha256") != previous_hash:
-                raise AuditLogError(f"broken hash chain at line {index}")
+                raise AuditLogError(f"The hash chain breaks at line {index}.")
             expected_hash = self._record_hash(record)
             if record.get("record_sha256") != expected_hash:
-                raise AuditLogError(f"changed append-only record at line {index}")
+                raise AuditLogError(
+                    f"The append-only record at line {index} changed."
+                )
             previous_hash = expected_hash
             records.append(record)
         return records
@@ -131,14 +138,28 @@ class _AppendOnlyJsonl:
     def read(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
-        return self._parse(self.path.read_text(encoding="utf-8"))
+        with self.path.open(encoding="utf-8") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_SH)
+            text = stream.read()
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        return self._parse(text)
 
     def append(self, payload: Mapping[str, object]) -> dict[str, Any]:
+        return self.append_checked(lambda _records: payload)
+
+    def append_checked(
+        self,
+        payload_factory: Callable[
+            [list[dict[str, Any]]], Mapping[str, object]
+        ],
+    ) -> dict[str, Any]:
+        """Check current records and append while one exclusive lock is held."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a+", encoding="utf-8") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
             stream.seek(0)
             records = self._parse(stream.read())
+            payload = payload_factory(records)
             record: dict[str, Any] = {
                 "sequence": len(records) + 1,
                 "recorded_at": self.clock(),
@@ -160,9 +181,11 @@ def _money(value: object) -> Decimal:
     try:
         amount = Decimal(str(value))
     except (InvalidOperation, ValueError) as error:
-        raise ValueError("invalid USD amount") from error
+        raise ValueError("The USD amount is not valid.") from error
     if not amount.is_finite() or amount < 0 or amount != amount.quantize(Decimal("0.01")):
-        raise ValueError("USD amounts must be non-negative and have at most two decimals")
+        raise ValueError(
+            "The USD amount must be zero or more and have at most two decimals."
+        )
     return amount
 
 
@@ -192,9 +215,15 @@ class StageRun:
         return self._decision_log.read()
 
     def budget_exposure(self) -> dict[str, Decimal]:
+        return self._budget_exposure_from(self.cost_records())
+
+    @staticmethod
+    def _budget_exposure_from(
+        records: list[dict[str, Any]],
+    ) -> dict[str, Decimal]:
         exposure = {category: Decimal("0.00") for category in BUDGET_LIMITS}
         actions: dict[str, dict[str, Any]] = {}
-        for record in self.cost_records():
+        for record in records:
             action_id = str(record["action_id"])
             if record["kind"] == "commitment":
                 actions[action_id] = record
@@ -215,51 +244,67 @@ class StageRun:
     ) -> dict[str, Any]:
         """Append one commitment or actual cost after all limits pass."""
         if not action_id.strip() or not evidence.strip():
-            raise ValueError("action_id and evidence must not be empty")
+            raise ValueError("The action ID and evidence must contain text.")
         if category not in BUDGET_LIMITS:
-            raise ValueError("unknown budget category")
+            raise ValueError("The budget category is not valid.")
         if kind not in {"commitment", "actual"}:
-            raise ValueError("cost kind must be commitment or actual")
+            raise ValueError("The cost kind must be commitment or actual.")
         amount = _money(amount_usd)
         if category == "contingency":
             raise CostLimitError("contingency-not-authorized")
 
-        records = self.cost_records()
-        matching = [record for record in records if record["action_id"] == action_id]
-        if kind == "commitment":
-            if matching:
-                raise ValueError("an action_id can have only one commitment")
-        else:
-            commitments = [record for record in matching if record["kind"] == "commitment"]
-            actuals = [record for record in matching if record["kind"] == "actual"]
-            if len(commitments) != 1 or actuals:
-                raise ValueError("an actual cost needs one unsettled commitment")
-            commitment = commitments[0]
-            if commitment["category"] != category:
-                raise ValueError("actual cost category must match its commitment")
-            if amount > _money(commitment["amount_usd"]):
-                raise CostLimitError("actual-cost-exceeds-commitment")
+        def checked_payload(
+            records: list[dict[str, Any]],
+        ) -> Mapping[str, object]:
+            matching = [
+                record for record in records if record["action_id"] == action_id
+            ]
+            if kind == "commitment":
+                if matching:
+                    raise ValueError("An action ID can have only one commitment.")
+            else:
+                commitments = [
+                    record for record in matching if record["kind"] == "commitment"
+                ]
+                actuals = [
+                    record for record in matching if record["kind"] == "actual"
+                ]
+                if len(commitments) != 1 or actuals:
+                    raise ValueError(
+                        "An actual cost must have one unsettled commitment."
+                    )
+                commitment = commitments[0]
+                if commitment["category"] != category:
+                    raise ValueError(
+                        "The actual cost category must agree with its commitment."
+                    )
+                if amount > _money(commitment["amount_usd"]):
+                    raise CostLimitError("actual-cost-exceeds-commitment")
 
-        exposure = self.budget_exposure()
-        current_action_amount = Decimal("0.00")
-        if kind == "actual":
-            current_action_amount = _money(matching[0]["amount_usd"])
-        proposed_category = exposure[category] - current_action_amount + amount
-        proposed_total = sum(exposure.values()) - current_action_amount + amount
-        if proposed_category > BUDGET_LIMITS[category]:
-            raise CostLimitError("category-budget-exceeded")
-        if proposed_total > TOTAL_BUDGET_LIMIT:
-            raise CostLimitError("total-budget-exceeded")
+            exposure = self._budget_exposure_from(records)
+            current_action_amount = Decimal("0.00")
+            if kind == "actual":
+                current_action_amount = _money(matching[0]["amount_usd"])
+            proposed_category = exposure[category] - current_action_amount + amount
+            proposed_total = (
+                sum(exposure.values(), start=Decimal("0.00"))
+                - current_action_amount
+                + amount
+            )
+            if proposed_category > BUDGET_LIMITS[category]:
+                raise CostLimitError("category-budget-exceeded")
+            if proposed_total > TOTAL_BUDGET_LIMIT:
+                raise CostLimitError("total-budget-exceeded")
 
-        return self._spend_ledger.append(
-            {
+            return {
                 "action_id": action_id,
                 "kind": kind,
                 "category": category,
                 "amount_usd": _usd(amount),
                 "evidence": evidence,
             }
-        )
+
+        return self._spend_ledger.append_checked(checked_payload)
 
     def _decision(
         self,
@@ -340,6 +385,27 @@ class StageRun:
                 "semantic-manifest-change",
                 record=False,
             )
+
+        if prior_confirmations and isinstance(confirmation, Mapping):
+            prior_confirmation = prior_confirmations[0]
+            confirmation_changed = any(
+                confirmation.get(field) != prior_confirmation.get(field)
+                for field in ("confirmed_by", "confirmed_at", "semantic_sha256")
+            )
+            if confirmation_changed:
+                self._decision_log.append(
+                    {
+                        "event": "confirmation-change-attempted",
+                        "run_id": run_id,
+                        "semantic_sha256": actual_hash,
+                    }
+                )
+                return self._decision(
+                    run_id,
+                    "no-build",
+                    "confirmation-evidence-changed",
+                    record=False,
+                )
 
         if isinstance(confirmation, Mapping) and not prior_confirmations:
             if not confirmation.get("confirmed_by") or not confirmation.get("confirmed_at"):
@@ -505,7 +571,7 @@ def _read_manifest(path: str) -> dict[str, object]:
     with Path(path).open(encoding="utf-8") as stream:
         value = json.load(stream)
     if not isinstance(value, dict):
-        raise ValueError("manifest must be a JSON object")
+        raise ValueError("The manifest must be a JSON object.")
     return value
 
 
@@ -518,7 +584,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Control a safe Stage 1 run.")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    check = commands.add_parser("check", help="Run all Stage 1 preflight gates.")
+    check = commands.add_parser(
+        "check", help="Apply the Stage 1 staged feasibility gate."
+    )
     check.add_argument("manifest")
     check.add_argument("--state-dir", required=True)
 

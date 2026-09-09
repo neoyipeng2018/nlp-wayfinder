@@ -5,7 +5,9 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
@@ -24,6 +26,7 @@ def route(route_id: str) -> dict[str, object]:
     return {
         "route_id": route_id,
         "model_identity_verified": True,
+        "non_gpt_verified": True,
         "account_free_limit_verified": True,
         "training_use_permitted": True,
         "audit_fields_supported": True,
@@ -113,6 +116,18 @@ class StageRunTests(unittest.TestCase):
         self.assertEqual("insufficient-eligible-routes", decision["stop_reason"])
         self.assertEqual([], decision["permitted_external_actions"])
 
+    def test_gpt_route_cannot_satisfy_the_non_gpt_route_minimum(self) -> None:
+        manifest = draft_manifest()
+        manifest["route_panel"]["routes"][0]["training_use_permitted"] = False  # type: ignore[index]
+        gpt_route = route("provider/gpt-model")
+        gpt_route["non_gpt_verified"] = False
+        manifest["route_panel"]["routes"].append(gpt_route)  # type: ignore[index]
+
+        decision = self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+
+        self.assertEqual("no-build", decision["decision"])
+        self.assertEqual("insufficient-eligible-routes", decision["stop_reason"])
+
     def test_valid_preflight_records_all_gate_evidence(self) -> None:
         decision = self.runner.evaluate(
             confirm_manifest(draft_manifest(), "fixture-owner")
@@ -171,6 +186,21 @@ class StageRunTests(unittest.TestCase):
         records = [json.loads(line) for line in changed_log.splitlines()]
         self.assertEqual("semantic-change-attempted", records[-1]["event"])
 
+    def test_confirmation_evidence_cannot_change_after_it_is_recorded(self) -> None:
+        manifest = confirm_manifest(draft_manifest(), "fixture-owner")
+        self.runner.evaluate(manifest)
+        changed = copy.deepcopy(manifest)
+        changed["confirmation"]["confirmed_by"] = "different-owner"  # type: ignore[index]
+
+        decision = self.runner.evaluate(changed)
+
+        self.assertEqual("no-build", decision["decision"])
+        self.assertEqual("confirmation-evidence-changed", decision["stop_reason"])
+        self.assertEqual(
+            "confirmation-change-attempted",
+            self.runner.decision_records()[-1]["event"],
+        )
+
     def test_cost_ledger_keeps_commitments_and_actual_costs_in_one_file(self) -> None:
         self.runner.record_cost(
             action_id="gpu-pilot",
@@ -214,6 +244,29 @@ class StageRunTests(unittest.TestCase):
             )
 
         self.assertEqual([before], self.runner.cost_records())
+
+    def test_parallel_commitments_cannot_exceed_a_category_limit(self) -> None:
+        worker_count = 40
+        start = threading.Barrier(worker_count)
+
+        def commit(index: int) -> None:
+            start.wait()
+            try:
+                self.runner.record_cost(
+                    action_id=f"parallel-{index}",
+                    kind="commitment",
+                    category="specialist",
+                    amount_usd="1.00",
+                    evidence="parallel limit test",
+                )
+            except CostLimitError:
+                pass
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            list(executor.map(commit, range(worker_count)))
+
+        self.assertEqual(Decimal("35.00"), self.runner.budget_exposure()["specialist"])
+        self.assertEqual(35, len(self.runner.cost_records()))
 
     def test_initial_manifest_cli_returns_machine_readable_no_build(self) -> None:
         result = subprocess.run(

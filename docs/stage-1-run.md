@@ -13,8 +13,8 @@ python3 -m nlp_wayfinder.stage_run check manifests/stage-1.initial.json \
 The command returns exit code `2`, decision `no-build`, and stop reason
 `source-rights-failed`.
 
-Make and review a new manifest before you confirm it. Then add confirmation
-evidence to a new file:
+Make and review a new manifest before zero-change confirmation. Then add the
+zero-change confirmation evidence to a new file:
 
 ```sh
 python3 -m nlp_wayfinder.stage_run confirm draft.json \
@@ -24,7 +24,7 @@ python3 -m nlp_wayfinder.stage_run confirm draft.json \
 Do not edit a confirmed manifest. A semantic change returns
 `semantic-manifest-change`. The decision log keeps the attempted change.
 
-Run the preflight:
+Apply the staged feasibility gate:
 
 ```sh
 python3 -m nlp_wayfinder.stage_run check confirmed.json \
