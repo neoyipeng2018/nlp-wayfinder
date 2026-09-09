@@ -44,7 +44,7 @@ python3 -m nlp_wayfinder.stage_run record-cost \
 ```
 
 The command stores commitments and actual costs in `spend-ledger.jsonl`. Each
-record contains the hash of the prior record. The control rejects a record before
+record contains the hash of the previous record. The control rejects a record before
 it can exceed a category limit or the USD 100 total limit. It does not permit use
 of contingency without a new planning decision.
 

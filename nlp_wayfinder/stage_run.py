@@ -271,7 +271,8 @@ class StageRun:
                 ]
                 if len(commitments) != 1 or actuals:
                     raise ValueError(
-                        "An actual cost must have one unsettled commitment."
+                        "An actual cost must have one commitment that does not have "
+                        "an actual cost record."
                     )
                 commitment = commitments[0]
                 if commitment["category"] != category:
@@ -468,16 +469,28 @@ class StageRun:
         required_days = 0
         try:
             for route in eligible_routes:
-                remaining = int(route["remaining_experiment_requests"])
-                free = int(route["free_requests_remaining"])
-                current = int(route["current_stage_requests"])
-                daily = int(route["requests_per_day"])
+                remaining_experiment_requests = int(
+                    route["remaining_experiment_requests"]
+                )
+                free_requests_remaining = int(route["free_requests_remaining"])
+                current_stage_requests = int(route["current_stage_requests"])
+                requests_per_day = int(route["requests_per_day"])
                 available_days = int(route["available_days"])
-                if min(remaining, free, current, daily, available_days) < 0 or daily == 0:
+                if (
+                    min(
+                        remaining_experiment_requests,
+                        free_requests_remaining,
+                        current_stage_requests,
+                        requests_per_day,
+                        available_days,
+                    )
+                    < 0
+                    or requests_per_day == 0
+                ):
                     raise ValueError
-                if free < remaining:
+                if free_requests_remaining < remaining_experiment_requests:
                     return self._stop(run_id, "route-demand-exceeds-free-capacity")
-                route_days = math.ceil(current / daily)
+                route_days = math.ceil(current_stage_requests / requests_per_day)
                 required_days = max(required_days, route_days)
                 if route_days > available_days:
                     return self._stop(run_id, "route-schedule-infeasible")
