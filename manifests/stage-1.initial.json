@@ -1,0 +1,38 @@
+{
+  "budget": {
+    "evidence": "No approved cost projection exists.",
+    "planned_commitments_usd": {
+      "contingency": "0.00",
+      "data-and-storage": "0.00",
+      "gpt": "0.00",
+      "paid-silver-labels": "0.00",
+      "specialist": "0.00"
+    }
+  },
+  "route_panel": {
+    "inspection_complete": false,
+    "routes": []
+  },
+  "run_id": "stage-1-initial",
+  "schedule": {
+    "evidence": "No route schedule is approved.",
+    "must_finish_by": "",
+    "starts_on": ""
+  },
+  "schema_version": 1,
+  "source": {
+    "access_permitted": false,
+    "evidence": {
+      "checked_at": "",
+      "reviewer": "",
+      "terms_url": ""
+    },
+    "private_evaluation_permitted": false,
+    "source_id": "unapproved-financial-news-source",
+    "source_type": "financial-news",
+    "text_redistribution_permitted": false,
+    "training_permitted": false,
+    "weight_release_permitted": false
+  },
+  "stage": 1
+}
