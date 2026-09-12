@@ -63,6 +63,7 @@ class FixedVoteTransport:
 
     def __init__(self) -> None:
         self.requests: list[tuple[dict[str, object], float]] = []
+        self.bodies: dict[str, bytes] = {}
 
     def complete(
         self, request: Mapping[str, object], timeout_seconds: float
@@ -83,6 +84,8 @@ class FixedVoteTransport:
                 "total_tokens": 96,
             },
         }
+        raw_body = json.dumps(body, indent=1).encode("utf-8")
+        self.bodies[f"request-{len(self.requests)}"] = raw_body
         return OmniRouteResponse(
             status_code=200,
             headers={
@@ -101,6 +104,7 @@ class FixedVoteTransport:
                 "x-omniroute-version": "3.8.49",
             },
             body=body,
+            raw_body=raw_body,
         )
 
 
@@ -223,6 +227,16 @@ def draft_manifest() -> dict[str, object]:
     }
 
 
+def company_record(company_id: str) -> dict[str, object]:
+    """Give the verified public company record for one company ID."""
+    return {
+        "name": f"{company_id} Ltd",
+        "ticker": company_id.upper().replace(" ", "")[:8],
+        "exchange": "LSE",
+        "publicly_traded": True,
+    }
+
+
 def candidate_manifest() -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -274,6 +288,8 @@ def candidate_manifest() -> dict[str, object]:
                 "published_at": "2026-07-10T09:00:00Z",
                 "normalized_passage": "Harbor Grid opened its second plant.",
                 "near_duplicate_reviewed": True,
+                "company_id": "harbor-grid",
+                "company": company_record("harbor-grid"),
             },
             {
                 "candidate_id": "candidate-a",
@@ -281,6 +297,8 @@ def candidate_manifest() -> dict[str, object]:
                 "published_at": "2026-03-10T09:00:00Z",
                 "normalized_passage": "Harbor Grid opened its first plant.",
                 "near_duplicate_reviewed": True,
+                "company_id": "harbor-grid",
+                "company": company_record("harbor-grid"),
             },
         ],
     }
@@ -313,6 +331,7 @@ def allocation_manifest() -> tuple[dict[str, object], list[dict[str, object]]]:
                 "normalized_passage": f"Unique passage for {candidate_id}.",
                 "near_duplicate_reviewed": True,
                 "company_id": company_id,
+                "company": company_record(company_id),
                 "aspect": aspect,
             }
         )
@@ -937,6 +956,7 @@ class StageOneAllocationTests(unittest.TestCase):
                     "normalized_passage": f"Unique passage for {candidate_id}.",
                     "near_duplicate_reviewed": True,
                     "company_id": f"seen-{index // 5:04d}",
+                    "company": company_record(f"seen-{index // 5:04d}"),
                     "aspect": STAGE_1_ASPECTS[index % 4],
                 }
             )
@@ -970,6 +990,7 @@ class StageOneAllocationTests(unittest.TestCase):
                 "normalized_passage": "Unique passage for the blind replacement.",
                 "near_duplicate_reviewed": True,
                 "company_id": "unseen-replacement",
+                "company": company_record("unseen-replacement"),
                 "aspect": STAGE_1_ASPECTS[0],
             }
         )
@@ -1029,6 +1050,7 @@ class StageOneAllocationTests(unittest.TestCase):
         ]
         for candidate in first_cell[:6]:
             candidate["company_id"] = "unseen-shared"
+            candidate["company"] = company_record("unseen-shared")
         candidates.append(
             {
                 "candidate_id": "blind-balance-replacement",
@@ -1037,6 +1059,7 @@ class StageOneAllocationTests(unittest.TestCase):
                 "normalized_passage": "Unique balance replacement passage.",
                 "near_duplicate_reviewed": True,
                 "company_id": "unseen-balance-replacement",
+                "company": company_record("unseen-balance-replacement"),
                 "aspect": STAGE_1_ASPECTS[0],
             }
         )
@@ -1100,8 +1123,10 @@ class StageOneAllocationTests(unittest.TestCase):
         ]
         for index, candidate in enumerate(first_cell[:3]):
             candidate["company_id"] = f"single-{index}"
+            candidate["company"] = company_record(f"single-{index}")
         for index, candidate in enumerate(other_blind):
             candidate["company_id"] = f"unseen-{index % 97}"
+            candidate["company"] = company_record(f"unseen-{index % 97}")
 
         def tail_id(prefix: str, cell_candidates: list[dict[str, object]]) -> str:
             largest = max(
@@ -1131,6 +1156,7 @@ class StageOneAllocationTests(unittest.TestCase):
                     "normalized_passage": f"Unique passage for {candidate_id}.",
                     "near_duplicate_reviewed": True,
                     "company_id": company_id,
+                    "company": company_record(company_id),
                     "aspect": aspect,
                 }
             )
@@ -1205,6 +1231,7 @@ class StageOneAllocationTests(unittest.TestCase):
                     "normalized_passage": f"Unique large-cell passage {index}.",
                     "near_duplicate_reviewed": True,
                     "company_id": f"large-cell-company-{index:04d}",
+                    "company": company_record(f"large-cell-company-{index:04d}"),
                     "aspect": STAGE_1_ASPECTS[0],
                 }
             )
@@ -1254,14 +1281,20 @@ class StageOneAllocationTests(unittest.TestCase):
             ),
             "too-many-for-company": (
                 lambda candidates: [
-                    candidate.update(company_id="unseen-shared")
+                    candidate.update(
+                        company_id="unseen-shared",
+                        company=company_record("unseen-shared"),
+                    )
                     for candidate in candidates[:6]
                 ],
                 "blind-company-balance-failed",
             ),
             "too-few-unseen-issuers": (
                 lambda candidates: [
-                    candidate.update(company_id=f"unseen-{index // 5:03d}")
+                    candidate.update(
+                        company_id=f"unseen-{index // 5:03d}",
+                        company=company_record(f"unseen-{index // 5:03d}"),
+                    )
                     for index, candidate in enumerate(candidates)
                 ],
                 "blind-unseen-issuer-balance-failed",
@@ -1308,6 +1341,7 @@ class VoteCollectionTests(unittest.TestCase):
                 "candidate_id": "silver-1",
                 "event_group_id": "event-silver-1",
                 "company_id": "Harbor Grid Ltd",
+                "company": company_record("Harbor Grid Ltd"),
                 "aspect": STAGE_1_ASPECTS[0],
                 "published_at": "2026-03-10T09:00:00Z",
                 "normalized_passage": "Harbor Grid revenue increased by ten percent.",
@@ -1317,6 +1351,7 @@ class VoteCollectionTests(unittest.TestCase):
                 "candidate_id": "development-1",
                 "event_group_id": "event-development-1",
                 "company_id": "Harbor Grid Ltd",
+                "company": company_record("Harbor Grid Ltd"),
                 "aspect": STAGE_1_ASPECTS[1],
                 "published_at": "2026-07-10T09:00:00Z",
                 "normalized_passage": "Harbor Grid won three new supply contracts.",
@@ -1326,6 +1361,7 @@ class VoteCollectionTests(unittest.TestCase):
                 "candidate_id": "blind-1",
                 "event_group_id": "event-blind-1",
                 "company_id": "Harbor Grid Ltd",
+                "company": company_record("Harbor Grid Ltd"),
                 "aspect": STAGE_1_ASPECTS[2],
                 "published_at": "2026-09-10T09:00:00Z",
                 "normalized_passage": "Harbor Grid opened a new factory.",
@@ -1396,6 +1432,15 @@ class VoteCollectionTests(unittest.TestCase):
         message: dict[str, object] = {"content": content}
         if refusal is not None:
             message["refusal"] = refusal
+        body = {
+            "model": model,
+            "choices": [{"message": message}],
+            "usage": {
+                "prompt_tokens": 91,
+                "completion_tokens": 5,
+                "total_tokens": 96,
+            },
+        }
         return OmniRouteResponse(
             status_code=status_code,
             headers={
@@ -1413,15 +1458,8 @@ class VoteCollectionTests(unittest.TestCase):
                 "x-omniroute-request-id": "request-first",
                 "x-omniroute-version": "3.8.49",
             },
-            body={
-                "model": model,
-                "choices": [{"message": message}],
-                "usage": {
-                    "prompt_tokens": 91,
-                    "completion_tokens": 5,
-                    "total_tokens": 96,
-                },
-            },
+            body=body,
+            raw_body=json.dumps(body, indent=1).encode("utf-8"),
         )
 
     def test_failures_and_substitution_are_abstentions(self) -> None:
@@ -1739,6 +1777,113 @@ class VoteCollectionTests(unittest.TestCase):
         self.assertEqual("true", headers["x-omniroute-no-cache"])
         self.assertEqual("true", headers["x-omniroute-no-memory"])
 
+    def test_each_raw_vote_keeps_the_original_response_bytes(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+        transport = FixedVoteTransport()
+
+        self.runner.collect_votes(
+            stage_manifest, candidates, allocation, transport
+        )
+
+        records = self.runner.raw_vote_records()
+        self.assertEqual(6, len(records))
+        for record in records:
+            raw_body = transport.bodies[record["transport"]["request_id"]]  # type: ignore[index]
+            self.assertEqual(
+                hashlib.sha256(raw_body).hexdigest(), record["raw_body_sha256"]
+            )
+            self.assertNotEqual(record["raw_body_sha256"], record["response_sha256"])
+            pointer = Path(self.temp_dir.name) / str(record["raw_body_pointer"])
+            self.assertEqual(raw_body, pointer.read_bytes())
+
+    def test_a_refused_response_keeps_its_raw_body(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+        refused = self.response(content="", refusal="I cannot help with that.")
+        transport = SequenceVoteTransport(refused)
+
+        self.runner.collect_votes(
+            stage_manifest, candidates, allocation, transport
+        )
+
+        record = self.runner.raw_vote_records()[0]
+        self.assertEqual("refusal", record["abstention_reason"])
+        pointer = Path(self.temp_dir.name) / str(record["raw_body_pointer"])
+        self.assertEqual(refused.raw_body, pointer.read_bytes())
+
+    def test_a_malformed_response_keeps_its_raw_body(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+        malformed = self.response(content="not an answer")
+        transport = SequenceVoteTransport(malformed)
+
+        self.runner.collect_votes(
+            stage_manifest, candidates, allocation, transport
+        )
+
+        record = self.runner.raw_vote_records()[0]
+        self.assertEqual("malformed-answer", record["abstention_reason"])
+        pointer = Path(self.temp_dir.name) / str(record["raw_body_pointer"])
+        self.assertEqual(malformed.raw_body, pointer.read_bytes())
+
+    def test_the_transport_keeps_the_bytes_of_a_response_that_is_not_json(
+        self,
+    ) -> None:
+        def transport_for(payload: bytes) -> OmniRouteResponse:
+            class Response:
+                status = 200
+                headers = {"x-omniroute-model": "qwen/qwen3.6-27b"}
+
+                def read(self) -> bytes:
+                    return payload
+
+                def __enter__(self) -> Response:
+                    return self
+
+                def __exit__(self, *exception: object) -> None:
+                    return None
+
+            transport = OmniRouteHttpTransport("http://127.0.0.1:20128/")
+            with unittest.mock.patch(
+                "nlp_wayfinder.stage_run.urllib.request.urlopen",
+                lambda request, timeout: Response(),
+            ):
+                return transport.complete({"model": "groq/qwen/qwen3.6-27b"}, 30)
+
+        broken = transport_for(b'{"label": ')
+        valid = transport_for(b'{"label":"positive"}')
+
+        self.assertEqual(b'{"label": ', broken.raw_body)
+        self.assertEqual(
+            hashlib.sha256(b'{"label": ').hexdigest(),
+            hashlib.sha256(broken.raw_body).hexdigest(),
+        )
+        self.assertEqual(b'{"label":"positive"}', valid.raw_body)
+
+    def test_two_bodies_that_parse_the_same_keep_different_raw_hashes(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+        compact = self.response()
+        spaced = compact._replace(
+            raw_body=json.dumps(dict(compact.body), indent=2).encode("utf-8")
+        )
+
+        class TwoEncodingsTransport:
+            """Return one parsed body twice, with two different byte forms."""
+
+            def __init__(self) -> None:
+                self.responses = [compact, spaced]
+
+            def complete(
+                self, request: Mapping[str, object], timeout_seconds: float
+            ) -> OmniRouteResponse:
+                return self.responses.pop(0) if self.responses else compact
+
+        self.runner.collect_votes(
+            stage_manifest, candidates, allocation, TwoEncodingsTransport()
+        )
+
+        first, second = self.runner.raw_vote_records()[:2]
+        self.assertEqual(first["response_sha256"], second["response_sha256"])
+        self.assertNotEqual(first["raw_body_sha256"], second["raw_body_sha256"])
+
     def test_paid_overflow_is_an_abstention_and_stops_collection(self) -> None:
         stage_manifest, candidates, allocation = self.vote_inputs()
         response = self.response()
@@ -2034,6 +2179,15 @@ def gpt_response(
     message: dict[str, object] = {"content": content}
     if refusal is not None:
         message["refusal"] = refusal
+    body = {
+        "model": model,
+        "choices": [{"message": message}],
+        "usage": {
+            "prompt_tokens": 1180,
+            "completion_tokens": 540,
+            "total_tokens": 1720,
+        },
+    }
     return OmniRouteResponse(
         status_code=status_code,
         headers={
@@ -2047,15 +2201,8 @@ def gpt_response(
             "x-omniroute-request-id": "gpt-request",
             "x-omniroute-version": "3.8.49",
         },
-        body={
-            "model": model,
-            "choices": [{"message": message}],
-            "usage": {
-                "prompt_tokens": 1180,
-                "completion_tokens": 540,
-                "total_tokens": 1720,
-            },
-        },
+        body=body,
+        raw_body=json.dumps(body, indent=1).encode("utf-8"),
     )
 
 
@@ -2115,6 +2262,7 @@ class GptBlindPredictionTests(unittest.TestCase):
                 "candidate_id": "development-1",
                 "event_group_id": "event-development-1",
                 "company_id": "Harbor Grid Ltd",
+                "company": company_record("Harbor Grid Ltd"),
                 "aspect": STAGE_1_ASPECTS[1],
                 "published_at": "2026-07-10T09:00:00Z",
                 "normalized_passage": "Harbor Grid won three new supply contracts.",
@@ -2124,6 +2272,7 @@ class GptBlindPredictionTests(unittest.TestCase):
                 "candidate_id": "blind-1",
                 "event_group_id": "event-blind-1",
                 "company_id": "Harbor Grid Ltd",
+                "company": company_record("Harbor Grid Ltd"),
                 "aspect": STAGE_1_ASPECTS[2],
                 "published_at": "2026-09-10T09:00:00Z",
                 "normalized_passage": "Harbor Grid opened a new factory.",
@@ -2133,6 +2282,7 @@ class GptBlindPredictionTests(unittest.TestCase):
                 "candidate_id": "blind-2",
                 "event_group_id": "event-blind-2",
                 "company_id": "Bay Rail Plc",
+                "company": company_record("Bay Rail Plc"),
                 "aspect": STAGE_1_ASPECTS[0],
                 "published_at": "2026-09-11T09:00:00Z",
                 "normalized_passage": "Bay Rail revenue decreased by four percent.",
@@ -2221,6 +2371,7 @@ class GptBlindPredictionTests(unittest.TestCase):
                 "candidate_id": "blind-1",
                 "event_group_id": "event-blind-1",
                 "company_id": "Harbor Grid Ltd",
+                "company": company_record("Harbor Grid Ltd"),
                 "aspect": STAGE_1_ASPECTS[2],
                 "published_at": "2026-09-10T09:00:00Z",
                 "normalized_passage": "Harbor Grid opened a new factory.",
@@ -2620,6 +2771,7 @@ class SpecialistTrainingTests(unittest.TestCase):
                     "candidate_id": f"training-{index}",
                     "event_group_id": f"event-training-{index}",
                     "company_id": "Harbor Grid Ltd",
+                    "company": company_record("Harbor Grid Ltd"),
                     "aspect": STAGE_1_ASPECTS[index % 4],
                     "published_at": "2026-03-10T09:00:00Z",
                     "normalized_passage": f"Harbor Grid training passage {index}.",
@@ -2632,6 +2784,7 @@ class SpecialistTrainingTests(unittest.TestCase):
                     "candidate_id": f"development-{index}",
                     "event_group_id": f"event-development-{index}",
                     "company_id": "Bay Rail Plc",
+                    "company": company_record("Bay Rail Plc"),
                     "aspect": STAGE_1_ASPECTS[index % 4],
                     "published_at": "2026-07-10T09:00:00Z",
                     "normalized_passage": f"Bay Rail development passage {index}.",
@@ -2644,6 +2797,7 @@ class SpecialistTrainingTests(unittest.TestCase):
                     "candidate_id": f"blind-{index}",
                     "event_group_id": f"event-blind-{index}",
                     "company_id": "Coast Metal Plc",
+                    "company": company_record("Coast Metal Plc"),
                     "aspect": STAGE_1_ASPECTS[index % 4],
                     "published_at": "2026-09-10T09:00:00Z",
                     "normalized_passage": f"Coast Metal blind passage {index}.",
@@ -3071,6 +3225,7 @@ class Stage1ReportTests(unittest.TestCase):
                 "candidate_id": f"training-{index}",
                 "event_group_id": f"event-training-{index}",
                 "company_id": "Harbor Grid Ltd",
+                "company": company_record("Harbor Grid Ltd"),
                 "aspect": STAGE_1_ASPECTS[index % 4],
                 "published_at": "2026-03-10T09:00:00Z",
                 "normalized_passage": f"Harbor Grid training passage {index}.",
@@ -3083,6 +3238,7 @@ class Stage1ReportTests(unittest.TestCase):
                 "candidate_id": f"development-{index}",
                 "event_group_id": f"event-development-{index}",
                 "company_id": "Bay Rail Plc",
+                "company": company_record("Bay Rail Plc"),
                 "aspect": STAGE_1_ASPECTS[index % 4],
                 "published_at": "2026-07-10T09:00:00Z",
                 "normalized_passage": f"Bay Rail development passage {index}.",
@@ -3097,6 +3253,7 @@ class Stage1ReportTests(unittest.TestCase):
                 # resamples fewer units than examples.
                 "event_group_id": f"event-blind-{index // 2:02d}",
                 "company_id": f"Coast Metal {index // 8} Plc",
+                "company": company_record(f"Coast Metal {index // 8} Plc"),
                 "aspect": STAGE_1_ASPECTS[index % 4],
                 "published_at": "2026-09-10T09:00:00Z",
                 "normalized_passage": blind_passage(index),
@@ -3114,6 +3271,7 @@ class Stage1ReportTests(unittest.TestCase):
                 "candidate_id": candidate_id,
                 "event_group_id": f"event-blind-{index // 2:02d}",
                 "company_id": f"Coast Metal {index // 8} Plc",
+                "company": company_record(f"Coast Metal {index // 8} Plc"),
                 "aspect": STAGE_1_ASPECTS[index % 4],
                 "label": label,
                 "labeled_at": "2026-09-11T00:00:00Z",

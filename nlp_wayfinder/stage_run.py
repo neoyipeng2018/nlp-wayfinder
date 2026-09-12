@@ -94,6 +94,8 @@ BUDGET_LIMITS = {
 }
 TOTAL_BUDGET_LIMIT = Decimal("100.00")
 
+RAW_BODY_DIR = "raw-bodies"
+
 CROWD_KIT_VERSION = "1.4.2"
 SILVER_DS_ITERATIONS = 100
 SILVER_DS_TOLERANCE = 1e-8
@@ -209,6 +211,8 @@ class OmniRouteResponse(NamedTuple):
     status_code: int
     headers: Mapping[str, str]
     body: Mapping[str, object]
+    # The bytes as they arrived. The parsed body cannot prove them.
+    raw_body: bytes = b""
 
 
 class VoteTransport(Protocol):
@@ -279,7 +283,7 @@ class OmniRouteHttpTransport:
             body = {"raw_response_sha256": hashlib.sha256(raw_body).hexdigest()}
         if not isinstance(body, Mapping):
             body = {"value": body}
-        return OmniRouteResponse(status_code, response_headers, body)
+        return OmniRouteResponse(status_code, response_headers, body, raw_body)
 
 
 LABELING_SYSTEM_PROMPT = (
@@ -1362,11 +1366,15 @@ def _software_versions() -> dict[str, str]:
     }
 
 
-def _gpt_error_response(reason: str, error: BaseException) -> OmniRouteResponse:
+def _transport_error_response(
+    reason: str, error: BaseException
+) -> OmniRouteResponse:
+    body = {"error": {"type": reason, "message": str(error)}}
     return OmniRouteResponse(
         status_code=0,
         headers={},
-        body={"error": {"type": reason, "message": str(error)}},
+        body=body,
+        raw_body=_canonical_json(body).encode("utf-8"),
     )
 
 
@@ -1950,6 +1958,19 @@ class StageRun:
     def specialist_records(self) -> list[dict[str, Any]]:
         return self._specialist_log.read()
 
+    def _retain_raw_body(self, raw_body: bytes) -> tuple[str, str]:
+        """Keep the response bytes under their own hash and return the pointer."""
+        digest = hashlib.sha256(raw_body).hexdigest()
+        pointer = f"{RAW_BODY_DIR}/{digest}"
+        path = self.state_dir / pointer
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            # The name is the content, so replace it whole. A torn file lies.
+            partial = path.with_suffix(f".{os.getpid()}.partial")
+            partial.write_bytes(raw_body)
+            os.replace(partial, path)
+        return digest, pointer
+
     def _collection_stop(
         self, reason: str, route_ids: Sequence[str]
     ) -> dict[str, object]:
@@ -1978,16 +1999,7 @@ class StageRun:
             forced_abstention_reason = (
                 "timeout" if isinstance(error, TimeoutError) else "transport-error"
             )
-            response = OmniRouteResponse(
-                status_code=0,
-                headers={},
-                body={
-                    "error": {
-                        "type": forced_abstention_reason,
-                        "message": str(error),
-                    }
-                },
-            )
+            response = _transport_error_response(forced_abstention_reason, error)
         completed_at = self._clock()
         headers = {key.lower(): value for key, value in response.headers.items()}
         returned_provider = headers.get("x-omniroute-provider")
@@ -2042,6 +2054,7 @@ class StageRun:
         usage = response.body.get("usage")
         if not isinstance(usage, Mapping):
             usage = {}
+        raw_body_sha256, raw_body_pointer = self._retain_raw_body(response.raw_body)
         prompt = request["messages"]
         record = {
             "event": "raw-vote",
@@ -2063,6 +2076,8 @@ class StageRun:
             "response_sha256": hashlib.sha256(
                 _canonical_json(response.body).encode("utf-8")
             ).hexdigest(),
+            "raw_body_sha256": raw_body_sha256,
+            "raw_body_pointer": raw_body_pointer,
             "outcome": outcome,
             "abstention_reason": abstention_reason,
             "label": label,
@@ -2573,10 +2588,10 @@ class StageRun:
                     response = transport.complete(request, timeout_seconds)
                 except TimeoutError as error:
                     retry_reason = "timeout"
-                    response = _gpt_error_response(retry_reason, error)
+                    response = _transport_error_response(retry_reason, error)
                 except OSError as error:
                     retry_reason = "connection-error"
-                    response = _gpt_error_response(retry_reason, error)
+                    response = _transport_error_response(retry_reason, error)
                 completed_at = self._clock()
                 headers = {
                     key.lower(): value for key, value in response.headers.items()
@@ -2618,6 +2633,9 @@ class StageRun:
                 usage = response.body.get("usage")
                 if not isinstance(usage, Mapping):
                     usage = {}
+                raw_body_sha256, raw_body_pointer = self._retain_raw_body(
+                    response.raw_body
+                )
                 self._gpt_blind_log.append(
                     {
                         "event": "gpt-blind-attempt",
@@ -2634,6 +2652,8 @@ class StageRun:
                         "response_sha256": hashlib.sha256(
                             _canonical_json(response.body).encode("utf-8")
                         ).hexdigest(),
+                        "raw_body_sha256": raw_body_sha256,
+                        "raw_body_pointer": raw_body_pointer,
                         "token_use": {
                             "prompt_tokens": usage.get("prompt_tokens"),
                             "completion_tokens": usage.get("completion_tokens"),
