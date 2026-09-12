@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -16,9 +17,11 @@ from typing import Any, Mapping, cast
 
 from nlp_wayfinder.stage_run import (
     MAX_EXAMPLE_TOKENS,
+    OmniRouteHttpTransport,
     RESULT_LABELS,
     STAGE_1_ASPECTS,
     CostLimitError,
+    OmniRouteResponse,
     StageRun,
     admit_example,
     allocate_stage_1,
@@ -42,6 +45,68 @@ class WordTokenizer:
         self.last_text = text
         self.last_options = kwargs
         return {"input_ids": [101, *range(len(text.split())), 102]}
+
+
+class FixedVoteTransport:
+    """Return one valid fixed-route response and retain each request."""
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[dict[str, object], float]] = []
+
+    def complete(
+        self, request: Mapping[str, object], timeout_seconds: float
+    ) -> OmniRouteResponse:
+        request_copy = copy.deepcopy(dict(request))
+        self.requests.append((request_copy, timeout_seconds))
+        route_id = str(request["model"])
+        provider, model = route_id.split("/", 1)
+        body = {
+            "id": f"response-{len(self.requests)}",
+            "model": model,
+            "choices": [
+                {"message": {"content": '{"label":"positive"}'}}
+            ],
+            "usage": {
+                "prompt_tokens": 91,
+                "completion_tokens": 5,
+                "total_tokens": 96,
+            },
+        }
+        return OmniRouteResponse(
+            status_code=200,
+            headers={
+                "x-omniroute-response-cost": "0.0000000000",
+                "x-omniroute-tokens-in": "91",
+                "x-omniroute-tokens-out": "5",
+                "x-omniroute-model": model,
+                "x-omniroute-provider": provider,
+                "x-omniroute-latency-ms": "125",
+                "x-omniroute-cache-hit": "false",
+                "x-omniroute-fallback-attempts": "0",
+                "x-omniroute-decision": (
+                    f"strategy=single; provider={provider}; latency_ms=125"
+                ),
+                "x-omniroute-request-id": f"request-{len(self.requests)}",
+                "x-omniroute-version": "3.8.49",
+            },
+            body=body,
+        )
+
+
+class SequenceVoteTransport(FixedVoteTransport):
+    def __init__(self, first: OmniRouteResponse | BaseException) -> None:
+        super().__init__()
+        self.first = first
+
+    def complete(
+        self, request: Mapping[str, object], timeout_seconds: float
+    ) -> OmniRouteResponse:
+        if not self.requests:
+            self.requests.append((copy.deepcopy(dict(request)), timeout_seconds))
+            if isinstance(self.first, BaseException):
+                raise self.first
+            return self.first
+        return super().complete(request, timeout_seconds)
 
 
 def example(
@@ -1198,6 +1263,399 @@ class StageOneAllocationTests(unittest.TestCase):
 
                 self.assertEqual("stopped", result["allocation"])
                 self.assertEqual(expected_reason, result["stop_reason"])
+
+
+class VoteCollectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.state_dir = Path(self.temp_dir.name)
+        self.runner = StageRun(
+            self.state_dir,
+            clock=lambda: "2026-09-12T00:00:00Z",
+        )
+
+    def vote_inputs(
+        self,
+    ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+        stage_manifest = confirm_manifest(draft_manifest(), "fixture-owner")
+        candidates = candidate_manifest()
+        candidates["candidates"] = [
+            {
+                "candidate_id": "silver-1",
+                "event_group_id": "event-silver-1",
+                "company_id": "Harbor Grid Ltd",
+                "aspect": STAGE_1_ASPECTS[0],
+                "published_at": "2026-03-10T09:00:00Z",
+                "normalized_passage": "Harbor Grid revenue increased by ten percent.",
+                "near_duplicate_reviewed": True,
+            },
+            {
+                "candidate_id": "development-1",
+                "event_group_id": "event-development-1",
+                "company_id": "Harbor Grid Ltd",
+                "aspect": STAGE_1_ASPECTS[1],
+                "published_at": "2026-07-10T09:00:00Z",
+                "normalized_passage": "Harbor Grid won three new supply contracts.",
+                "near_duplicate_reviewed": True,
+            },
+            {
+                "candidate_id": "blind-1",
+                "event_group_id": "event-blind-1",
+                "company_id": "Harbor Grid Ltd",
+                "aspect": STAGE_1_ASPECTS[2],
+                "published_at": "2026-09-10T09:00:00Z",
+                "normalized_passage": "Harbor Grid opened a new factory.",
+                "near_duplicate_reviewed": True,
+            },
+        ]
+        sealed_candidates = seal_candidate_manifest(candidates, "fixture-owner")
+        allocation = {
+            "allocation": "complete",
+            "stop_reason": None,
+            "candidate_manifest_sha256": cast(
+                Mapping[str, object], sealed_candidates["seal"]
+            )["semantic_sha256"],
+            "training": [{"candidate_id": "silver-1"}],
+            "development": [{"candidate_id": "development-1"}],
+            "blind": [{"candidate_id": "blind-1"}],
+        }
+        return stage_manifest, sealed_candidates, allocation
+
+    def test_each_frozen_route_votes_on_silver_and_development_only(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+        transport = FixedVoteTransport()
+
+        result = self.runner.collect_votes(
+            stage_manifest,
+            candidates,
+            allocation,
+            transport,
+            timeout_seconds=30,
+        )
+
+        self.assertEqual("complete", result["collection"])
+        self.assertEqual(6, result["raw_vote_count"])
+        self.assertEqual(list(ROUTE_IDS), result["frozen_route_ids"])
+        self.assertEqual(6, len(transport.requests))
+        self.assertNotIn(
+            "blind-1",
+            {
+                request["user"]
+                for request, _ in transport.requests
+            },
+        )
+        for request, timeout_seconds in transport.requests:
+            self.assertIn(request["model"], ROUTE_IDS)
+            self.assertNotIn("combo", request)
+            self.assertFalse(request["stream"])
+            self.assertEqual(30, timeout_seconds)
+        records = self.runner.raw_vote_records()
+        self.assertEqual(6, len(records))
+        self.assertEqual({"valid"}, {record["outcome"] for record in records})
+        self.assertEqual({"positive"}, {record["label"] for record in records})
+        for record in records:
+            self.assertTrue(record["prompt"])
+            self.assertEqual(64, len(record["request_sha256"]))
+            self.assertEqual(64, len(record["response_sha256"]))
+            self.assertEqual(96, record["token_use"]["total_tokens"])  # type: ignore[index]
+            self.assertEqual("0.0000000000", record["cost"]["response_cost_usd"])  # type: ignore[index]
+            self.assertEqual("2026-09-12T00:00:00Z", record["recorded_at"])
+
+    def response(
+        self,
+        *,
+        content: str = '{"label":"positive"}',
+        model: str = "mistral-medium-3-5",
+        status_code: int = 200,
+        refusal: str | None = None,
+    ) -> OmniRouteResponse:
+        message: dict[str, object] = {"content": content}
+        if refusal is not None:
+            message["refusal"] = refusal
+        return OmniRouteResponse(
+            status_code=status_code,
+            headers={
+                "x-omniroute-response-cost": "0.0000000000",
+                "x-omniroute-tokens-in": "91",
+                "x-omniroute-tokens-out": "5",
+                "x-omniroute-model": model,
+                "x-omniroute-provider": "mistral",
+                "x-omniroute-latency-ms": "125",
+                "x-omniroute-cache-hit": "false",
+                "x-omniroute-fallback-attempts": "0",
+                "x-omniroute-decision": (
+                    "strategy=single; provider=mistral; latency_ms=125"
+                ),
+                "x-omniroute-request-id": "request-first",
+                "x-omniroute-version": "3.8.49",
+            },
+            body={
+                "model": model,
+                "choices": [{"message": message}],
+                "usage": {
+                    "prompt_tokens": 91,
+                    "completion_tokens": 5,
+                    "total_tokens": 96,
+                },
+            },
+        )
+
+    def test_failures_and_substitution_are_abstentions(self) -> None:
+        cases: dict[str, OmniRouteResponse | BaseException] = {
+            "refusal": self.response(refusal="I cannot classify this passage."),
+            "malformed-answer": self.response(content="positive"),
+            "timeout": TimeoutError("The route timed out."),
+            "route-substitution": self.response(
+                content='{ "label": "insufficient evidence" }',
+                model="substituted-model",
+            ),
+        }
+        for expected_reason, first_response in cases.items():
+            with self.subTest(reason=expected_reason):
+                with tempfile.TemporaryDirectory() as state_dir:
+                    runner = StageRun(
+                        state_dir,
+                        clock=lambda: "2026-09-12T00:00:00Z",
+                    )
+                    stage_manifest, candidates, allocation = self.vote_inputs()
+
+                    result = runner.collect_votes(
+                        stage_manifest,
+                        candidates,
+                        allocation,
+                        SequenceVoteTransport(first_response),
+                    )
+
+                    self.assertEqual("complete", result["collection"])
+                    first_vote = runner.raw_vote_records()[0]
+                    self.assertEqual("abstention", first_vote["outcome"])
+                    self.assertEqual(expected_reason, first_vote["abstention_reason"])
+                    self.assertIsNone(first_vote["label"])
+
+    def test_free_limit_failure_is_recorded_and_stops_collection(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+        transport = SequenceVoteTransport(
+            self.response(content="", status_code=429)
+        )
+
+        result = self.runner.collect_votes(
+            stage_manifest,
+            candidates,
+            allocation,
+            transport,
+        )
+
+        self.assertEqual("stopped", result["collection"])
+        self.assertEqual("free-limit-failure", result["stop_reason"])
+        self.assertEqual(1, len(transport.requests))
+        self.assertEqual(1, result["raw_vote_count"])
+        vote = self.runner.raw_vote_records()[0]
+        self.assertEqual("abstention", vote["outcome"])
+        self.assertEqual("free-limit", vote["abstention_reason"])
+        self.assertNotEqual("insufficient evidence", vote["label"])
+
+    def test_automatic_or_bare_route_cannot_enter_the_frozen_set(self) -> None:
+        for invalid_route_id in ("auto", "fusion/free", "provider/latest"):
+            with self.subTest(route_id=invalid_route_id):
+                with tempfile.TemporaryDirectory() as state_dir:
+                    manifest = draft_manifest()
+                    manifest["route_panel"]["routes"].append(  # type: ignore[index]
+                        route(invalid_route_id)
+                    )
+                    runner = StageRun(state_dir)
+
+                    decision = runner.evaluate(
+                        confirm_manifest(manifest, "fixture-owner")
+                    )
+
+                    self.assertEqual("no-build", decision["decision"])
+                    self.assertEqual("route-panel-incomplete", decision["stop_reason"])
+
+    def test_routing_and_cache_telemetry_failures_are_abstentions(self) -> None:
+        response = self.response()
+        cases = {
+            "route-substitution": {
+                "x-omniroute-decision": (
+                    "strategy=fallback; provider=mistral; latency_ms=125"
+                )
+            },
+            "cache-hit": {"x-omniroute-cache-hit": "true"},
+        }
+        for expected_reason, changed_headers in cases.items():
+            with self.subTest(reason=expected_reason):
+                with tempfile.TemporaryDirectory() as state_dir:
+                    runner = StageRun(
+                        state_dir, clock=lambda: "2026-09-12T00:00:00Z"
+                    )
+                    stage_manifest, candidates, allocation = self.vote_inputs()
+                    headers = dict(response.headers)
+                    headers.update(changed_headers)
+
+                    runner.collect_votes(
+                        stage_manifest,
+                        candidates,
+                        allocation,
+                        SequenceVoteTransport(response._replace(headers=headers)),
+                    )
+
+                    vote = runner.raw_vote_records()[0]
+                    self.assertEqual("abstention", vote["outcome"])
+                    self.assertEqual(expected_reason, vote["abstention_reason"])
+                    self.assertIsNone(vote["label"])
+
+    def test_a_free_limit_vote_is_collected_again_after_the_reset(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+
+        stopped = self.runner.collect_votes(
+            stage_manifest,
+            candidates,
+            allocation,
+            SequenceVoteTransport(self.response(content="", status_code=429)),
+        )
+        self.assertEqual("free-limit-failure", stopped["stop_reason"])
+
+        transport = FixedVoteTransport()
+        result = self.runner.collect_votes(
+            stage_manifest, candidates, allocation, transport
+        )
+
+        self.assertEqual("complete", result["collection"])
+        self.assertEqual(6, len(transport.requests))
+        valid = [
+            record
+            for record in self.runner.raw_vote_records()
+            if record["outcome"] == "valid"
+        ]
+        self.assertEqual(6, len(valid))
+
+    def test_a_cloudflare_free_limit_error_body_stops_collection(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+        response = self.response(status_code=403)
+        transport = SequenceVoteTransport(
+            response._replace(
+                body={
+                    "errors": [
+                        {"code": 3040, "message": "Account limit reached"}
+                    ]
+                }
+            )
+        )
+
+        result = self.runner.collect_votes(
+            stage_manifest, candidates, allocation, transport
+        )
+
+        self.assertEqual("free-limit-failure", result["stop_reason"])
+        vote = self.runner.raw_vote_records()[0]
+        self.assertEqual("free-limit", vote["abstention_reason"])
+
+    def test_a_network_failure_is_an_abstention(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+
+        result = self.runner.collect_votes(
+            stage_manifest,
+            candidates,
+            allocation,
+            SequenceVoteTransport(OSError("The OmniRoute request failed.")),
+        )
+
+        self.assertEqual("complete", result["collection"])
+        vote = self.runner.raw_vote_records()[0]
+        self.assertEqual("abstention", vote["outcome"])
+        self.assertEqual("transport-error", vote["abstention_reason"])
+
+    def test_a_malformed_fallback_header_is_an_abstention(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+        response = self.response()
+        headers = dict(response.headers)
+        headers["x-omniroute-fallback-attempts"] = "unknown"
+
+        result = self.runner.collect_votes(
+            stage_manifest,
+            candidates,
+            allocation,
+            SequenceVoteTransport(response._replace(headers=headers)),
+        )
+
+        self.assertEqual("complete", result["collection"])
+        vote = self.runner.raw_vote_records()[0]
+        self.assertEqual("route-substitution", vote["abstention_reason"])
+
+    def test_a_changed_request_template_stops_collection(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+        self.runner.collect_votes(
+            stage_manifest, candidates, allocation, FixedVoteTransport()
+        )
+
+        with unittest.mock.patch(
+            "nlp_wayfinder.stage_run.LABELING_SYSTEM_PROMPT", "Other instructions."
+        ):
+            changed = self.runner.collect_votes(
+                stage_manifest, candidates, allocation, FixedVoteTransport()
+            )
+
+        self.assertEqual("frozen-vote-collection-changed", changed["stop_reason"])
+        freeze = self.runner.vote_collection_records()[0]
+        self.assertEqual(sorted(ROUTE_IDS), freeze["route_ids"])
+
+    def test_transport_uses_the_dedicated_provider_endpoint(self) -> None:
+        sent: dict[str, Any] = {}
+
+        class Response:
+            status = 200
+            headers = {"x-omniroute-model": "qwen/qwen3.6-27b"}
+
+            def read(self) -> bytes:
+                return b"{}"
+
+            def __enter__(self) -> Response:
+                return self
+
+            def __exit__(self, *exception: object) -> None:
+                return None
+
+        def fake_urlopen(request: Any, timeout: float) -> Response:
+            sent["url"] = request.full_url
+            sent["headers"] = dict(request.headers)
+            sent["body"] = json.loads(request.data)
+            return Response()
+
+        transport = OmniRouteHttpTransport("http://127.0.0.1:20128/")
+        with unittest.mock.patch(
+            "nlp_wayfinder.stage_run.urllib.request.urlopen", fake_urlopen
+        ):
+            transport.complete({"model": "groq/qwen/qwen3.6-27b"}, 30)
+
+        self.assertEqual(
+            "http://127.0.0.1:20128/v1/providers/groq/chat/completions",
+            sent["url"],
+        )
+        self.assertEqual("qwen/qwen3.6-27b", sent["body"]["model"])
+        headers = {key.lower(): value for key, value in sent["headers"].items()}
+        self.assertEqual("true", headers["x-omniroute-no-cache"])
+        self.assertEqual("true", headers["x-omniroute-no-memory"])
+
+    def test_paid_overflow_is_an_abstention_and_stops_collection(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+        response = self.response()
+        paid_headers = dict(response.headers)
+        paid_headers["x-omniroute-response-cost"] = "0.0001000000"
+        transport = SequenceVoteTransport(response._replace(headers=paid_headers))
+
+        result = self.runner.collect_votes(
+            stage_manifest,
+            candidates,
+            allocation,
+            transport,
+        )
+
+        self.assertEqual("stopped", result["collection"])
+        self.assertEqual("paid-overflow-detected", result["stop_reason"])
+        self.assertEqual(1, len(transport.requests))
+        vote = self.runner.raw_vote_records()[0]
+        self.assertEqual("abstention", vote["outcome"])
+        self.assertEqual("paid-overflow", vote["abstention_reason"])
 
 
 if __name__ == "__main__":

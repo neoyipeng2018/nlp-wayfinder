@@ -9,13 +9,16 @@ import hashlib
 import json
 import math
 import os
+import socket
 import sys
+import urllib.error
+import urllib.request
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, NamedTuple, Protocol
+from typing import Any, NamedTuple, Protocol, cast
 
 
 EXPECTED_ROUTE_IDS = (
@@ -100,6 +103,8 @@ ROUTE_ELIGIBILITY_FIELDS = (
     "no_paid_overflow",
 )
 
+FORBIDDEN_ROUTE_PARTS = {"auto", "free", "fusion", "fallback", "latest"}
+
 
 class AuditLogError(ValueError):
     """Raised when an append-only record is invalid or was changed."""
@@ -115,6 +120,83 @@ class Tokenizer(Protocol):
     def __call__(self, text: str, **kwargs: object) -> Mapping[str, object]: ...
 
 
+class OmniRouteResponse(NamedTuple):
+    """One non-streaming OmniRoute transport response."""
+
+    status_code: int
+    headers: Mapping[str, str]
+    body: Mapping[str, object]
+
+
+class VoteTransport(Protocol):
+    """The fixed-route transport operation that vote collection needs."""
+
+    def complete(
+        self, request: Mapping[str, object], timeout_seconds: float
+    ) -> OmniRouteResponse: ...
+
+
+class OmniRouteHttpTransport:
+    """Send fixed-route requests to the OmniRoute chat endpoint."""
+
+    def __init__(self, base_url: str, *, api_key: str | None = None) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+
+    def complete(
+        self, request: Mapping[str, object], timeout_seconds: float
+    ) -> OmniRouteResponse:
+        # The dedicated provider endpoint validates the model against one
+        # provider. The shared endpoint can resolve a combo of the same name.
+        provider, model = str(request["model"]).split("/", 1)
+        request_body = {**request, "model": model}
+        headers = {
+            "Content-Type": "application/json",
+            "X-OmniRoute-No-Cache": "true",
+            "X-OmniRoute-No-Memory": "true",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        http_request = urllib.request.Request(
+            f"{self.base_url}/v1/providers/{provider}/chat/completions",
+            data=_canonical_json(request_body).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                http_request, timeout=timeout_seconds
+            ) as http_response:
+                status_code = http_response.status
+                response_headers = dict(http_response.headers.items())
+                raw_body = http_response.read()
+        except urllib.error.HTTPError as error:
+            status_code = error.code
+            response_headers = dict(error.headers.items())
+            raw_body = error.read()
+        except (TimeoutError, socket.timeout) as error:
+            raise TimeoutError("The OmniRoute request timed out.") from error
+        except urllib.error.URLError as error:
+            if isinstance(error.reason, (TimeoutError, socket.timeout)):
+                raise TimeoutError("The OmniRoute request timed out.") from error
+            raise OSError("The OmniRoute request failed.") from error
+        try:
+            body = json.loads(raw_body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            body = {"raw_response_sha256": hashlib.sha256(raw_body).hexdigest()}
+        if not isinstance(body, Mapping):
+            body = {"value": body}
+        return OmniRouteResponse(status_code, response_headers, body)
+
+
+LABELING_SYSTEM_PROMPT = (
+    "Classify the supplied company and aspect from only the supplied financial "
+    "passage. Use one label: positive, neutral, negative, or insufficient "
+    "evidence. Return only a JSON object with one label field. Do not add an "
+    "explanation."
+)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
         "+00:00", "Z"
@@ -123,6 +205,13 @@ def _now() -> str:
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _is_fixed_route_id(value: object) -> bool:
+    if not isinstance(value, str) or value.count("/") < 1:
+        return False
+    parts = {part.lower() for part in value.split("/") if part}
+    return bool(parts) and parts.isdisjoint(FORBIDDEN_ROUTE_PARTS)
 
 
 def semantic_manifest_sha256(manifest: Mapping[str, object]) -> str:
@@ -1064,6 +1153,101 @@ def load_modernbert_tokenizer() -> Tokenizer:
     )
 
 
+def _vote_prompt(candidate: Mapping[str, object]) -> list[dict[str, str]]:
+    user_prompt = _canonical_json(
+        {
+            "passage": candidate["normalized_passage"],
+            "company": candidate["company_id"],
+            "aspect": candidate["aspect"],
+        }
+    )
+    return [
+        {"role": "system", "content": LABELING_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def _vote_request(
+    route_id: str, candidate: Mapping[str, object]
+) -> dict[str, object]:
+    return {
+        "model": route_id,
+        "messages": _vote_prompt(candidate),
+        "stream": False,
+        "temperature": 0,
+        "max_tokens": 20,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "independent_model_vote",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {"label": {"enum": list(RESULT_LABELS)}},
+                    "required": ["label"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "user": candidate["candidate_id"],
+    }
+
+
+def _response_message(response: OmniRouteResponse) -> Mapping[str, object] | None:
+    choices = response.body.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1:
+        return None
+    choice = choices[0]
+    if not isinstance(choice, Mapping):
+        return None
+    message = choice.get("message")
+    return message if isinstance(message, Mapping) else None
+
+
+def _response_label(response: OmniRouteResponse) -> str | None:
+    message = _response_message(response)
+    if message is None or message.get("refusal"):
+        return None
+    content = message.get("content")
+    if not isinstance(content, str):
+        return None
+    try:
+        value = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"label"}
+        or value.get("label") not in RESULT_LABELS
+    ):
+        return None
+    return str(value["label"])
+
+
+def _response_is_refusal(response: OmniRouteResponse) -> bool:
+    message = _response_message(response)
+    return message is not None and bool(message.get("refusal"))
+
+
+def _is_free_limit(response: OmniRouteResponse) -> bool:
+    """Report a spent free quota. Cloudflare does not always answer 429."""
+    if response.status_code == 429:
+        return True
+    if response.status_code == 200:
+        return False
+    return any(
+        word in _canonical_json(response.body).lower()
+        for word in ("quota", "limit reached", "rate limit", "out of credits")
+    )
+
+
+def _int_header(headers: Mapping[str, str], name: str) -> int | None:
+    try:
+        return int(headers[name])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 class StageRun:
     """Evaluate Stage 1 gates and own its append-only audit logs."""
 
@@ -1074,16 +1258,23 @@ class StageRun:
         clock: Callable[[], str] = _now,
     ) -> None:
         self.state_dir = Path(state_dir)
+        self._clock = clock
         self.spend_ledger_path = self.state_dir / "spend-ledger.jsonl"
         self.decision_log_path = self.state_dir / "decision-log.jsonl"
         self.candidate_inspection_log_path = (
             self.state_dir / "candidate-inspection-log.jsonl"
         )
+        self.vote_collection_log_path = self.state_dir / "vote-collection-log.jsonl"
+        self.raw_vote_log_path = self.state_dir / "raw-votes.jsonl"
         self._spend_ledger = _AppendOnlyJsonl(self.spend_ledger_path, clock)
         self._decision_log = _AppendOnlyJsonl(self.decision_log_path, clock)
         self._candidate_inspection_log = _AppendOnlyJsonl(
             self.candidate_inspection_log_path, clock
         )
+        self._vote_collection_log = _AppendOnlyJsonl(
+            self.vote_collection_log_path, clock
+        )
+        self._raw_vote_log = _AppendOnlyJsonl(self.raw_vote_log_path, clock)
 
     def cost_records(self) -> list[dict[str, Any]]:
         return self._spend_ledger.read()
@@ -1093,6 +1284,260 @@ class StageRun:
 
     def candidate_inspection_records(self) -> list[dict[str, Any]]:
         return self._candidate_inspection_log.read()
+
+    def vote_collection_records(self) -> list[dict[str, Any]]:
+        return self._vote_collection_log.read()
+
+    def raw_vote_records(self) -> list[dict[str, Any]]:
+        return self._raw_vote_log.read()
+
+    def _collection_stop(
+        self, reason: str, route_ids: Sequence[str]
+    ) -> dict[str, object]:
+        return {
+            "collection": "stopped",
+            "stop_reason": reason,
+            "raw_vote_count": len(self.raw_vote_records()),
+            "frozen_route_ids": list(route_ids),
+        }
+
+    def collect_votes(
+        self,
+        stage_manifest: Mapping[str, object],
+        candidate_manifest: Mapping[str, object],
+        allocation: Mapping[str, object],
+        transport: VoteTransport,
+        *,
+        timeout_seconds: float = 60,
+    ) -> dict[str, object]:
+        """Collect one independent vote per fixed route and non-blind example."""
+        decision = self.evaluate(stage_manifest)
+        if decision["decision"] != "build-eligible":
+            return self._collection_stop(str(decision["stop_reason"]), [])
+        if not _is_valid_sealed_candidate_manifest(candidate_manifest):
+            return self._collection_stop("unsealed-annex", [])
+        seal = candidate_manifest["seal"]
+        assert isinstance(seal, Mapping)
+        candidate_manifest_sha256 = str(seal["semantic_sha256"])
+        if (
+            allocation.get("allocation") != "complete"
+            or allocation.get("candidate_manifest_sha256")
+            != candidate_manifest_sha256
+        ):
+            return self._collection_stop("allocation-not-complete", [])
+
+        evidence = decision["evidence"]
+        assert isinstance(evidence, Mapping)
+        route_evidence = evidence["routes"]
+        assert isinstance(route_evidence, Mapping)
+        route_ids_value = route_evidence["eligible_route_ids"]
+        assert isinstance(route_ids_value, list)
+        route_ids = [str(route_id) for route_id in route_ids_value]
+        freeze = {
+            "event": "vote-collection-frozen",
+            "run_id": stage_manifest["run_id"],
+            "stage_manifest_sha256": semantic_manifest_sha256(stage_manifest),
+            "candidate_manifest_sha256": candidate_manifest_sha256,
+            "route_ids": sorted(route_ids),
+            "request_template_sha256": hashlib.sha256(
+                _canonical_json(
+                    _vote_request(
+                        "",
+                        {
+                            "candidate_id": "",
+                            "normalized_passage": "",
+                            "company_id": "",
+                            "aspect": "",
+                        },
+                    )
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+        freeze_records = [
+            record
+            for record in self.vote_collection_records()
+            if record.get("event") == "vote-collection-frozen"
+        ]
+        if freeze_records:
+            prior = freeze_records[0]
+            if any(prior.get(field) != freeze[field] for field in freeze):
+                return self._collection_stop(
+                    "frozen-vote-collection-changed",
+                    cast(Sequence[str], prior.get("route_ids", [])),
+                )
+        else:
+            self._vote_collection_log.append(freeze)
+
+        candidates_value = candidate_manifest["candidates"]
+        assert isinstance(candidates_value, list)
+        candidate_by_id = {
+            str(candidate["candidate_id"]): candidate
+            for candidate in candidates_value
+            if isinstance(candidate, Mapping)
+        }
+        scheduled: list[Mapping[str, object]] = []
+        for split in ("training", "development"):
+            selected = allocation.get(split)
+            if not isinstance(selected, list):
+                return self._collection_stop("allocation-not-complete", route_ids)
+            for item in selected:
+                candidate_id = (
+                    item.get("candidate_id") if isinstance(item, Mapping) else None
+                )
+                candidate = candidate_by_id.get(str(candidate_id))
+                if candidate is None or candidate.get("split") != split:
+                    return self._collection_stop("vote-candidate-invalid", route_ids)
+                scheduled.append(candidate)
+
+        # A spent free quota resets. That attempt must not block the later vote.
+        collected = {
+            (record.get("candidate_id"), record.get("requested_route_id"))
+            for record in self.raw_vote_records()
+            if record.get("abstention_reason") != "free-limit"
+        }
+        for candidate in scheduled:
+            for route_id in route_ids:
+                key = (candidate["candidate_id"], route_id)
+                if key in collected:
+                    continue
+                request = _vote_request(route_id, candidate)
+                started_at = self._clock()
+                forced_abstention_reason: str | None = None
+                try:
+                    response = transport.complete(request, timeout_seconds)
+                except (TimeoutError, OSError) as error:
+                    forced_abstention_reason = (
+                        "timeout" if isinstance(error, TimeoutError) else "transport-error"
+                    )
+                    response = OmniRouteResponse(
+                        status_code=0,
+                        headers={},
+                        body={
+                            "error": {
+                                "type": forced_abstention_reason,
+                                "message": str(error),
+                            }
+                        },
+                    )
+                completed_at = self._clock()
+                headers = {key.lower(): value for key, value in response.headers.items()}
+                returned_provider = headers.get("x-omniroute-provider")
+                returned_model = headers.get("x-omniroute-model")
+                returned_route_id = (
+                    f"{returned_provider}/{returned_model}"
+                    if returned_provider and returned_model
+                    else None
+                )
+                label = _response_label(response)
+                fallback_attempts = _int_header(
+                    headers, "x-omniroute-fallback-attempts"
+                )
+                outcome = "valid"
+                abstention_reason: str | None = None
+                if forced_abstention_reason is not None:
+                    outcome, abstention_reason, label = (
+                        "abstention",
+                        forced_abstention_reason,
+                        None,
+                    )
+                elif _is_free_limit(response):
+                    outcome, abstention_reason, label = "abstention", "free-limit", None
+                elif response.status_code != 200:
+                    outcome, abstention_reason, label = "abstention", "transport-error", None
+                elif (
+                    returned_route_id != route_id
+                    or fallback_attempts != 0
+                    or "strategy=single"
+                    not in str(headers.get("x-omniroute-decision", ""))
+                ):
+                    outcome, abstention_reason, label = "abstention", "route-substitution", None
+                elif str(headers.get("x-omniroute-cache-hit", "")).lower() == "true":
+                    outcome, abstention_reason, label = "abstention", "cache-hit", None
+                elif _response_is_refusal(response):
+                    outcome, abstention_reason, label = "abstention", "refusal", None
+                elif label is None:
+                    outcome, abstention_reason = "abstention", "malformed-answer"
+                response_cost = headers.get("x-omniroute-response-cost")
+                try:
+                    paid_overflow = (
+                        response_cost is not None and Decimal(response_cost) > 0
+                    )
+                except InvalidOperation:
+                    paid_overflow = True
+                if paid_overflow:
+                    outcome, abstention_reason, label = (
+                        "abstention",
+                        "paid-overflow",
+                        None,
+                    )
+                usage = response.body.get("usage")
+                if not isinstance(usage, Mapping):
+                    usage = {}
+                prompt = request["messages"]
+                record = {
+                    "event": "raw-vote",
+                    "candidate_id": candidate["candidate_id"],
+                    "split": candidate["split"],
+                    "requested_route_id": route_id,
+                    "status_code": response.status_code,
+                    "returned_route_id": returned_route_id,
+                    "returned_provider": returned_provider,
+                    "returned_model": returned_model,
+                    "prompt": prompt,
+                    "prompt_sha256": hashlib.sha256(
+                        _canonical_json(prompt).encode("utf-8")
+                    ).hexdigest(),
+                    "request_sha256": hashlib.sha256(
+                        _canonical_json(request).encode("utf-8")
+                    ).hexdigest(),
+                    "response_sha256": hashlib.sha256(
+                        _canonical_json(response.body).encode("utf-8")
+                    ).hexdigest(),
+                    "outcome": outcome,
+                    "abstention_reason": abstention_reason,
+                    "label": label,
+                    "token_use": {
+                        "prompt_tokens": usage.get("prompt_tokens"),
+                        "completion_tokens": usage.get("completion_tokens"),
+                        "total_tokens": usage.get("total_tokens"),
+                        "omniroute_tokens_in": headers.get(
+                            "x-omniroute-tokens-in"
+                        ),
+                        "omniroute_tokens_out": headers.get(
+                            "x-omniroute-tokens-out"
+                        ),
+                    },
+                    "time": {
+                        "started_at": started_at,
+                        "completed_at": completed_at,
+                        "latency_ms": headers.get("x-omniroute-latency-ms"),
+                    },
+                    "cost": {
+                        "response_cost_usd": headers.get(
+                            "x-omniroute-response-cost"
+                        ),
+                        "cache_hit": headers.get("x-omniroute-cache-hit"),
+                    },
+                    "transport": {
+                        "request_id": headers.get("x-omniroute-request-id"),
+                        "omniroute_version": headers.get("x-omniroute-version"),
+                        "decision": headers.get("x-omniroute-decision"),
+                        "fallback_attempts": fallback_attempts,
+                    },
+                }
+                self._raw_vote_log.append(record)
+                collected.add(key)
+                if abstention_reason == "free-limit":
+                    return self._collection_stop("free-limit-failure", route_ids)
+                if abstention_reason == "paid-overflow":
+                    return self._collection_stop("paid-overflow-detected", route_ids)
+
+        return {
+            "collection": "complete",
+            "stop_reason": None,
+            "raw_vote_count": len(self.raw_vote_records()),
+            "frozen_route_ids": route_ids,
+        }
 
     def inspect_candidate(
         self,
@@ -1405,8 +1850,11 @@ class StageRun:
         route_ids = [
             route.get("route_id") for route in routes if isinstance(route, Mapping)
         ]
-        if len(route_ids) != len(set(route_ids)) or not set(EXPECTED_ROUTE_IDS).issubset(
-            route_ids
+        if (
+            len(route_ids) != len(routes)
+            or len(route_ids) != len(set(route_ids))
+            or not set(EXPECTED_ROUTE_IDS).issubset(route_ids)
+            or any(not _is_fixed_route_id(route_id) for route_id in route_ids)
         ):
             return self._stop(run_id, "route-panel-incomplete")
         eligible_routes = [
@@ -1609,6 +2057,19 @@ def main(argv: list[str] | None = None) -> int:
     allocate.add_argument("--output", required=True)
     allocate.add_argument("--state-dir", required=True)
 
+    collect = commands.add_parser(
+        "collect-votes", help="Collect fixed-route Stage 1 model votes."
+    )
+    collect.add_argument("stage_manifest")
+    collect.add_argument("candidate_manifest")
+    collect.add_argument("allocation")
+    collect.add_argument("--state-dir", required=True)
+    collect.add_argument(
+        "--base-url",
+        default=os.environ.get("OMNIROUTE_BASE_URL", "http://127.0.0.1:20128"),
+    )
+    collect.add_argument("--timeout-seconds", type=float, default=60)
+
     args = parser.parse_args(argv)
     try:
         if args.command == "admit-example":
@@ -1647,6 +2108,21 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             return 0 if allocation["allocation"] == "complete" else 2
+        if args.command == "collect-votes":
+            if args.timeout_seconds <= 0:
+                raise ValueError("The timeout must be more than zero.")
+            result = StageRun(args.state_dir).collect_votes(
+                _read_manifest(args.stage_manifest),
+                _read_manifest(args.candidate_manifest),
+                _read_manifest(args.allocation),
+                OmniRouteHttpTransport(
+                    args.base_url,
+                    api_key=os.environ.get("OMNIROUTE_API_KEY"),
+                ),
+                timeout_seconds=args.timeout_seconds,
+            )
+            _write_json(result)
+            return 0 if result["collection"] == "complete" else 2
         if args.command == "confirm":
             confirmed = confirm_manifest(_read_manifest(args.manifest), args.confirmed_by)
             output_path = Path(args.output)

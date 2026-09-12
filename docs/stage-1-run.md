@@ -151,6 +151,46 @@ first permitted relabel time, which is 14 days after its first human label. The
 first label stays unchanged. The allocation contains the sealed candidate-manifest
 hash and its own SHA-256 hash.
 
+Collect one independent vote from each frozen route:
+
+```sh
+python3 -m nlp_wayfinder.stage_run collect-votes \
+  confirmed.json sealed-candidates.json stage-1-allocation.json \
+  --state-dir .wayfinder-state --base-url http://127.0.0.1:20128
+```
+
+The operation first applies the staged feasibility gate. It then freezes the
+complete set of eligible routes for the stage in `vote-collection-log.jsonl`. The
+gate permits no fewer than three eligible routes. A later change of the routes,
+the stage manifest, the candidate manifest, or the prompt returns
+`frozen-vote-collection-changed`.
+
+Each accepted silver candidate and each development example receives one vote
+from each frozen route. Blind examples never enter this path. Each request goes
+to the dedicated provider endpoint with the fully qualified model, no cache, and
+no memory. There is no automatic routing, no Fusion, no fallback, and no bare
+alias.
+
+The operation writes one append-only record for each attempt in
+`raw-votes.jsonl`. The record contains the prompt, the request and response
+hashes, the returned route and model identity, the token use, the times, and the
+cost metadata.
+
+A refusal, a malformed answer, a timeout, a route substitution, or a cache hit is
+an abstention. An abstention has no label. It is not `insufficient evidence`.
+
+A free-limit failure or a paid response stops collection. The command returns
+exit code `2` with stop reason `free-limit-failure` or `paid-overflow-detected`.
+Run the command again after the free quota resets. Collection does not repeat a
+vote that is already in the log, but it does collect again each vote that stopped
+on the free limit.
+
+The command also stops with `unsealed-annex` for a candidate manifest that has no
+valid seal, `allocation-not-complete` for an allocation that is not complete or
+does not agree with the candidate manifest, and `vote-candidate-invalid` for a
+selected example that is not in the candidate manifest or is in a different
+split.
+
 Record a cost commitment before the related action. Record the actual cost after
 the action:
 
