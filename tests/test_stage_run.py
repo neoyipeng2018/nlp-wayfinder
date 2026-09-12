@@ -17,6 +17,8 @@ from typing import Any, Mapping, cast
 
 from nlp_wayfinder.stage_run import (
     MAX_EXAMPLE_TOKENS,
+    SILVER_CALIBRATION_FOLDS,
+    SILVER_MIN_PROBABILITY,
     OmniRouteHttpTransport,
     RESULT_LABELS,
     STAGE_1_ASPECTS,
@@ -25,6 +27,8 @@ from nlp_wayfinder.stage_run import (
     StageRun,
     admit_example,
     allocate_stage_1,
+    _calibration_fold,
+    _silver_rejection,
     candidate_order_sha256,
     seal_candidate_manifest,
     confirm_manifest,
@@ -1656,6 +1660,265 @@ class VoteCollectionTests(unittest.TestCase):
         vote = self.runner.raw_vote_records()[0]
         self.assertEqual("abstention", vote["outcome"])
         self.assertEqual("paid-overflow", vote["abstention_reason"])
+
+
+class SilverAggregationTests(unittest.TestCase):
+    """Aggregate the collected votes into calibrated accepted silver labels."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.runner = StageRun(
+            Path(self.temp_dir.name),
+            clock=lambda: "2026-09-12T00:00:00Z",
+        )
+        self.stage_manifest = confirm_manifest(draft_manifest(), "fixture-owner")
+        self.candidates = seal_candidate_manifest(
+            candidate_manifest(), "fixture-owner"
+        )
+        self.development = [
+            {
+                "candidate_id": f"development-{index:04d}",
+                "label": RESULT_LABELS[index % 4],
+            }
+            for index in range(200)
+        ]
+
+    def allocation(self, training_ids: list[str]) -> dict[str, object]:
+        return {
+            "allocation": "complete",
+            "stop_reason": None,
+            "candidate_manifest_sha256": cast(
+                Mapping[str, object], self.candidates["seal"]
+            )["semantic_sha256"],
+            "training": [{"candidate_id": item} for item in training_ids],
+            "development": self.development,
+            "blind": [],
+        }
+
+    def add_votes(self, candidate_id: str, labels: Mapping[str, str]) -> None:
+        for route_id, label in labels.items():
+            self.runner._raw_vote_log.append(
+                {
+                    "event": "raw-vote",
+                    "candidate_id": candidate_id,
+                    "requested_route_id": route_id,
+                    "outcome": "valid",
+                    "label": label,
+                }
+            )
+
+    def add_development_votes(self, *, noisy_routes: int = 0) -> None:
+        """Vote on every development example. The first routes can be unreliable."""
+        for index, item in enumerate(self.development):
+            gold = str(item["label"])
+            gold_index = RESULT_LABELS.index(gold)
+            self.add_votes(
+                str(item["candidate_id"]),
+                {
+                    route_id: RESULT_LABELS[
+                        (gold_index + 1 + (index + position) % 3) % 4
+                    ]
+                    if position < noisy_routes and (index + position) % 5 < 2
+                    else gold
+                    for position, route_id in enumerate(ROUTE_IDS)
+                },
+            )
+
+    def aggregate(self, training_ids: list[str]) -> dict[str, object]:
+        return self.runner.aggregate_silver_labels(
+            self.stage_manifest, self.candidates, self.allocation(training_ids)
+        )
+
+    def test_agreed_votes_become_one_accepted_silver_label(self) -> None:
+        self.add_development_votes()
+        self.add_votes("silver-1", dict.fromkeys(ROUTE_IDS, "positive"))
+
+        result = self.aggregate(["silver-1"])
+
+        self.assertEqual("complete", result["aggregation"])
+        self.assertIsNone(result["stop_reason"])
+        self.assertEqual(1, result["accepted_silver_count"])
+        accepted = cast(list[Mapping[str, object]], result["accepted_silver"])[0]
+        self.assertEqual("silver-1", accepted["candidate_id"])
+        self.assertEqual("positive", accepted["label"])
+        self.assertGreaterEqual(
+            cast(float, accepted["probability"]), SILVER_MIN_PROBABILITY
+        )
+        self.assertEqual(64, len(cast(str, result["aggregation_sha256"])))
+
+    def test_the_sealed_fit_keeps_one_four_by_four_matrix_for_each_voter(self) -> None:
+        self.add_development_votes(noisy_routes=1)
+        self.add_votes("silver-1", dict.fromkeys(ROUTE_IDS, "positive"))
+
+        result = self.aggregate(["silver-1"])
+
+        records = self.runner.silver_aggregation_records()
+        fit = next(item for item in records if item["event"] == "silver-fit-sealed")
+        posteriors = next(
+            item for item in records if item["event"] == "silver-posteriors-sealed"
+        )
+        self.assertEqual("1.4.2", fit["crowd_kit_version"])
+        self.assertEqual(100, fit["n_iter"])
+        self.assertEqual(1e-8, fit["tol"])
+        self.assertEqual(0, fit["route_dependency_parameter_count"])
+        self.assertEqual("20260905", fit["calibration_seed"])
+        self.assertEqual(SILVER_CALIBRATION_FOLDS, fit["calibration_folds"])
+        self.assertEqual(
+            SILVER_CALIBRATION_FOLDS, len(cast(list[float], fit["fold_temperatures"]))
+        )
+        matrices = cast(Mapping[str, Mapping[str, Mapping[str, float]]], fit["confusion_matrices"])
+        self.assertEqual(set(ROUTE_IDS), set(matrices))
+        for matrix in matrices.values():
+            self.assertEqual(set(RESULT_LABELS), set(matrix))
+            for row in matrix.values():
+                self.assertEqual(set(RESULT_LABELS), set(row))
+        self.assertEqual(
+            200, len(cast(Mapping[str, object], posteriors["development_out_of_fold"]))
+        )
+        self.assertEqual(
+            64, len(cast(str, result["fit_sha256"]))
+        )
+        self.assertEqual(64, len(cast(str, result["posterior_sha256"])))
+
+    def test_a_route_that_always_abstains_keeps_its_matrix(self) -> None:
+        for item in self.development:
+            gold = str(item["label"])
+            self.add_votes(
+                str(item["candidate_id"]),
+                {ROUTE_IDS[0]: gold, ROUTE_IDS[1]: gold},
+            )
+        self.add_votes("silver-1", dict.fromkeys(ROUTE_IDS[:2], "positive"))
+
+        self.aggregate(["silver-1"])
+
+        fit = next(
+            item
+            for item in self.runner.silver_aggregation_records()
+            if item["event"] == "silver-fit-sealed"
+        )
+        matrices = cast(Mapping[str, object], fit["confusion_matrices"])
+        self.assertEqual(set(ROUTE_IDS), set(matrices))
+
+    def test_an_abstention_is_a_missing_vote(self) -> None:
+        self.add_development_votes()
+        self.runner._raw_vote_log.append(
+            {
+                "event": "raw-vote",
+                "candidate_id": "silver-1",
+                "requested_route_id": ROUTE_IDS[1],
+                "outcome": "abstention",
+                "abstention_reason": "refusal",
+                "label": None,
+            }
+        )
+        self.add_votes("silver-1", {ROUTE_IDS[0]: "positive"})
+
+        result = self.aggregate(["silver-1"])
+
+        self.assertEqual(0, result["accepted_silver_count"])
+        self.assertEqual({"insufficient-votes": 1}, result["rejected_counts"])
+
+    def test_a_split_vote_has_no_strict_majority(self) -> None:
+        self.add_development_votes(noisy_routes=2)
+        self.add_votes(
+            "silver-1",
+            {
+                ROUTE_IDS[0]: "positive",
+                ROUTE_IDS[1]: "neutral",
+                ROUTE_IDS[2]: "negative",
+            },
+        )
+
+        result = self.aggregate(["silver-1"])
+
+        self.assertEqual({"no-strict-majority": 1}, result["rejected_counts"])
+
+    def test_an_unsure_posterior_is_below_the_confidence_floor(self) -> None:
+        unsure = {
+            "positive": 0.60,
+            "neutral": 0.30,
+            "negative": 0.06,
+            "insufficient evidence": 0.04,
+        }
+
+        self.assertEqual(
+            "low-confidence",
+            _silver_rejection(["positive", "positive", "neutral"], unsure),
+        )
+        self.assertLess(unsure["positive"], SILVER_MIN_PROBABILITY)
+
+    def test_a_thin_development_class_stops_the_source(self) -> None:
+        self.development = [
+            {"candidate_id": f"development-{index:04d}", "label": RESULT_LABELS[index % 3]}
+            for index in range(24)
+        ]
+        self.add_development_votes()
+
+        result = self.aggregate(["silver-1"])
+
+        self.assertEqual("stopped", result["aggregation"])
+        self.assertEqual("development-class-underfilled", result["stop_reason"])
+        self.assertEqual([], self.runner.silver_aggregation_records())
+
+    def test_an_incomplete_allocation_stops_the_aggregation(self) -> None:
+        allocation = self.allocation(["silver-1"])
+        allocation["allocation"] = "stopped"
+
+        result = self.runner.aggregate_silver_labels(
+            self.stage_manifest, self.candidates, allocation
+        )
+
+        self.assertEqual("allocation-not-complete", result["stop_reason"])
+
+    def test_a_changed_fit_cannot_replace_the_sealed_fit(self) -> None:
+        self.add_development_votes()
+        self.add_votes("silver-1", dict.fromkeys(ROUTE_IDS, "positive"))
+        self.aggregate(["silver-1"])
+        self.add_votes("silver-2", dict.fromkeys(ROUTE_IDS, "negative"))
+
+        result = self.aggregate(["silver-1", "silver-2"])
+
+        self.assertEqual("stopped", result["aggregation"])
+        self.assertEqual("frozen-aggregation-changed", result["stop_reason"])
+
+    def test_the_calibration_fold_is_fixed_by_the_seed(self) -> None:
+        folds = [_calibration_fold(f"development-{index:04d}") for index in range(200)]
+
+        self.assertEqual(
+            folds, [_calibration_fold(f"development-{index:04d}") for index in range(200)]
+        )
+        self.assertEqual(set(range(SILVER_CALIBRATION_FOLDS)), set(folds))
+
+    def test_a_close_posterior_is_a_tie(self) -> None:
+        tied = {
+            "positive": 0.5,
+            "neutral": 0.5 - 1e-13,
+            "negative": 0.0,
+            "insufficient evidence": 0.0,
+        }
+
+        self.assertEqual(
+            "posterior-tie",
+            _silver_rejection(["positive", "positive", "neutral"], tied),
+        )
+
+    def test_a_majority_for_another_class_does_not_support_the_top_class(self) -> None:
+        calibrated = {
+            "positive": 0.9,
+            "neutral": 0.1,
+            "negative": 0.0,
+            "insufficient evidence": 0.0,
+        }
+
+        self.assertEqual(
+            "top-class-unsupported",
+            _silver_rejection(["neutral", "neutral", "positive"], calibrated),
+        )
+        self.assertIsNone(
+            _silver_rejection(["positive", "positive", "neutral"], calibrated)
+        )
+
 
 
 if __name__ == "__main__":

@@ -191,6 +191,53 @@ does not agree with the candidate manifest, and `vote-candidate-invalid` for a
 selected example that is not in the candidate manifest or is in a different
 split.
 
+Aggregate the collected votes into accepted silver labels:
+
+```sh
+python3 -m pip install 'crowd-kit==1.4.2'
+python3 -m nlp_wayfinder.stage_run aggregate-silver \
+  confirmed.json sealed-candidates.json stage-1-allocation.json \
+  --state-dir .wayfinder-state --output accepted-silver.json
+```
+
+The operation applies the staged feasibility gate again. It then reads the
+append-only raw vote log. It keeps the last outcome for each example and route.
+An abstention is a missing vote. It is not a label.
+
+The operation stops with `development-class-underfilled` if any of the four human
+development classes has fewer than 25 examples. It also stops with
+`unsealed-annex`, `allocation-not-complete`, `development-label-invalid`,
+`no-valid-votes`, `crowd-kit-missing`, or `crowd-kit-version-mismatch`.
+
+The operation fits Crowd-Kit 1.4.2 Dawid–Skene with 100 iterations and tolerance
+`1e-8`. The human development labels anchor the fit. The result keeps one full
+four-by-four confusion matrix for each frozen route, including a route that
+abstained on every example. The model has no route-dependency
+parameter. The operation then applies the fitted matrices and priors to each
+example again, without the gold correction, to get the raw posterior.
+
+Calibration uses five out-of-fold temperature folds with seed `20260905`. Each
+development example gets its fold from the SHA-256 of
+`nlp-wayfinder1financial-news-silver-calibration + candidate_id + 20260905`. Each
+fold temperature comes from the other four folds. Each temperature comes from a
+golden-section search of 80 steps between 0.05 and 10.0. The mean of the five
+fold temperatures calibrates the training examples.
+
+The operation rejects a training candidate for one of these reasons:
+
+- `insufficient-votes`, for fewer than two valid votes
+- `posterior-tie`, for two top probabilities within `1e-12`
+- `no-strict-majority`, when no single class has more valid votes than each other
+  class
+- `top-class-unsupported`, when the strict majority class is not the calibrated
+  top class
+- `low-confidence`, for a calibrated top probability below 0.70
+
+The operation seals the fit and the posterior artifacts in
+`silver-aggregation-log.jsonl`. A later change of the fit or the posteriors
+returns `frozen-aggregation-changed`. The result contains the accepted silver
+labels, the rejection counts, the artifact hashes, and its own SHA-256 hash.
+
 Record a cost commitment before the related action. Record the actual cost after
 the action:
 

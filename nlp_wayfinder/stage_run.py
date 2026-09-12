@@ -17,6 +17,8 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as metadata_version
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, cast
 
@@ -85,6 +87,19 @@ BUDGET_LIMITS = {
     "contingency": Decimal("20.00"),
 }
 TOTAL_BUDGET_LIMIT = Decimal("100.00")
+
+CROWD_KIT_VERSION = "1.4.2"
+SILVER_DS_ITERATIONS = 100
+SILVER_DS_TOLERANCE = 1e-8
+SILVER_PROBABILITY_FLOOR = 1e-10
+SILVER_CALIBRATION_SEED = "20260905"
+SILVER_CALIBRATION_FOLDS = 5
+SILVER_CALIBRATION_RANGE = (0.05, 10.0)
+SILVER_CALIBRATION_STEPS = 80
+SILVER_MIN_VALID_VOTES = 2
+SILVER_MIN_PROBABILITY = 0.70
+SILVER_TIE_TOLERANCE = 1e-12
+SILVER_MIN_DEVELOPMENT_CLASS = 25
 
 RIGHTS_FIELDS = (
     "access_permitted",
@@ -1248,6 +1263,165 @@ def _int_header(headers: Mapping[str, str], name: str) -> int | None:
         return None
 
 
+def _calibration_fold(candidate_id: str) -> int:
+    """Assign one fixed calibration fold to one candidate."""
+    fold_input = (
+        "nlp-wayfinder1financial-news-silver-calibration"
+        f"{candidate_id}{SILVER_CALIBRATION_SEED}"
+    )
+    digest = hashlib.sha256(fold_input.encode("utf-8")).hexdigest()
+    return int(digest, 16) % SILVER_CALIBRATION_FOLDS
+
+
+def _temperature_scaled(
+    posterior: Mapping[str, float], temperature: float
+) -> dict[str, float]:
+    """Scale one posterior by one temperature and normalize it again."""
+    powered = {
+        label: value ** (1.0 / temperature) for label, value in posterior.items()
+    }
+    total = sum(powered.values())
+    return {label: value / total for label, value in powered.items()}
+
+
+def _ranked_labels(calibrated: Mapping[str, float]) -> list[tuple[str, float]]:
+    """Rank the labels by decreasing probability, then by name."""
+    return sorted(calibrated.items(), key=lambda item: (-item[1], item[0]))
+
+
+def _calibration_loss(
+    items: Sequence[tuple[Mapping[str, float], str]], temperature: float
+) -> float:
+    return -sum(
+        math.log(
+            max(
+                _temperature_scaled(posterior, temperature)[label],
+                SILVER_PROBABILITY_FLOOR,
+            )
+        )
+        for posterior, label in items
+    )
+
+
+def _fit_temperature(
+    items: Sequence[tuple[Mapping[str, float], str]]
+) -> float:
+    """Find the temperature with the lowest loss by golden-section search."""
+    if not items:
+        return 1.0
+    low, high = SILVER_CALIBRATION_RANGE
+    ratio = (math.sqrt(5.0) - 1.0) / 2.0
+    left, right = high - ratio * (high - low), low + ratio * (high - low)
+    left_loss, right_loss = (
+        _calibration_loss(items, left),
+        _calibration_loss(items, right),
+    )
+    for _ in range(SILVER_CALIBRATION_STEPS):
+        if left_loss <= right_loss:
+            high = right
+            right, right_loss = left, left_loss
+            left = high - ratio * (high - low)
+            left_loss = _calibration_loss(items, left)
+        else:
+            low = left
+            left, left_loss = right, right_loss
+            right = low + ratio * (high - low)
+            right_loss = _calibration_loss(items, right)
+    return (low + high) / 2.0
+
+
+def _silver_rejection(
+    vote_labels: Sequence[str], calibrated: Mapping[str, float]
+) -> str | None:
+    """Return the frozen reason to reject one candidate, or None to accept it."""
+    ranked = _ranked_labels(calibrated)
+    top_label, top_probability = ranked[0]
+    if len(vote_labels) < SILVER_MIN_VALID_VOTES:
+        return "insufficient-votes"
+    if abs(top_probability - ranked[1][1]) <= SILVER_TIE_TOLERANCE:
+        return "posterior-tie"
+    counts = Counter(vote_labels).most_common()
+    if counts[0][1] == 1 or (len(counts) > 1 and counts[0][1] == counts[1][1]):
+        return "no-strict-majority"
+    if counts[0][0] != top_label:
+        return "top-class-unsupported"
+    if top_probability < SILVER_MIN_PROBABILITY:
+        return "low-confidence"
+    return None
+
+
+def _dawid_skene_fit(
+    votes: Sequence[Mapping[str, str]],
+    development_labels: Mapping[str, str],
+    route_ids: Sequence[str],
+) -> tuple[dict[str, dict[str, dict[str, float]]], dict[str, float], int]:
+    """Fit gold-anchored Crowd-Kit Dawid-Skene and return full 4x4 matrices."""
+    try:
+        installed = metadata_version("crowd-kit")
+    except PackageNotFoundError as error:
+        raise RuntimeError("crowd-kit-missing") from error
+    if installed != CROWD_KIT_VERSION:
+        raise RuntimeError("crowd-kit-version-mismatch")
+    import pandas as pd
+    from crowdkit.aggregation import DawidSkene
+
+    model = DawidSkene(n_iter=SILVER_DS_ITERATIONS, tol=SILVER_DS_TOLERANCE)
+    model.fit(
+        pd.DataFrame(list(votes), columns=["task", "worker", "label"]),
+        true_labels=pd.Series(dict(development_labels), name="label"),
+    )
+    errors = model.errors_
+    priors = model.priors_
+    assert errors is not None and priors is not None
+
+    # One full four-by-four matrix for each voter. Crowd-Kit returns only the
+    # observed rows and columns, so absent cells take the probability floor.
+    confusion: dict[str, dict[str, dict[str, float]]] = {}
+    for worker in sorted(route_ids):
+        matrix: dict[str, dict[str, float]] = {}
+        for observed in RESULT_LABELS:
+            row: dict[str, float] = {}
+            for true_label in RESULT_LABELS:
+                value = SILVER_PROBABILITY_FLOOR
+                if (worker, observed) in errors.index and true_label in errors.columns:
+                    value = max(
+                        float(errors.loc[(worker, observed), true_label]),
+                        SILVER_PROBABILITY_FLOOR,
+                    )
+                row[true_label] = value
+            matrix[observed] = row
+        confusion[worker] = matrix
+    prior = {
+        label: max(float(priors.get(label, 0.0)), SILVER_PROBABILITY_FLOOR)
+        for label in RESULT_LABELS
+    }
+    total = sum(prior.values())
+    return confusion, {k: v / total for k, v in prior.items()}, len(model.loss_history_)
+
+
+def _dawid_skene_posterior(
+    labels_by_worker: Mapping[str, str],
+    confusion: Mapping[str, Mapping[str, Mapping[str, float]]],
+    prior: Mapping[str, float],
+) -> dict[str, float]:
+    """Apply the fitted matrices to one example without any gold correction."""
+    log_likelihood = {
+        true_label: math.log(prior[true_label]) for true_label in RESULT_LABELS
+    }
+    for worker, observed in labels_by_worker.items():
+        matrix = confusion.get(worker)
+        if matrix is None:
+            continue
+        for true_label in RESULT_LABELS:
+            log_likelihood[true_label] += math.log(matrix[observed][true_label])
+    largest = max(log_likelihood.values())
+    weights = {
+        label: math.exp(value - largest) for label, value in log_likelihood.items()
+    }
+    total = sum(weights.values())
+    return {label: value / total for label, value in weights.items()}
+
+
 class StageRun:
     """Evaluate Stage 1 gates and own its append-only audit logs."""
 
@@ -1266,6 +1440,9 @@ class StageRun:
         )
         self.vote_collection_log_path = self.state_dir / "vote-collection-log.jsonl"
         self.raw_vote_log_path = self.state_dir / "raw-votes.jsonl"
+        self.silver_aggregation_log_path = (
+            self.state_dir / "silver-aggregation-log.jsonl"
+        )
         self._spend_ledger = _AppendOnlyJsonl(self.spend_ledger_path, clock)
         self._decision_log = _AppendOnlyJsonl(self.decision_log_path, clock)
         self._candidate_inspection_log = _AppendOnlyJsonl(
@@ -1275,6 +1452,9 @@ class StageRun:
             self.vote_collection_log_path, clock
         )
         self._raw_vote_log = _AppendOnlyJsonl(self.raw_vote_log_path, clock)
+        self._silver_aggregation_log = _AppendOnlyJsonl(
+            self.silver_aggregation_log_path, clock
+        )
 
     def cost_records(self) -> list[dict[str, Any]]:
         return self._spend_ledger.read()
@@ -1290,6 +1470,9 @@ class StageRun:
 
     def raw_vote_records(self) -> list[dict[str, Any]]:
         return self._raw_vote_log.read()
+
+    def silver_aggregation_records(self) -> list[dict[str, Any]]:
+        return self._silver_aggregation_log.read()
 
     def _collection_stop(
         self, reason: str, route_ids: Sequence[str]
@@ -1538,6 +1721,220 @@ class StageRun:
             "raw_vote_count": len(self.raw_vote_records()),
             "frozen_route_ids": route_ids,
         }
+
+    def _aggregation_stop(self, reason: str) -> dict[str, object]:
+        return {
+            "aggregation": "stopped",
+            "stop_reason": reason,
+            "accepted_silver_count": 0,
+            "rejected_counts": {},
+        }
+
+    def _valid_votes(self) -> dict[str, dict[str, str]]:
+        """Keep the last outcome for each example and route. Drop abstentions."""
+        latest: dict[tuple[str, str], dict[str, Any]] = {}
+        for record in self.raw_vote_records():
+            if record.get("event") != "raw-vote":
+                continue
+            latest[
+                (str(record.get("candidate_id")), str(record.get("requested_route_id")))
+            ] = record
+        votes: dict[str, dict[str, str]] = {}
+        for (candidate_id, route_id), record in latest.items():
+            if (
+                record.get("outcome") != "valid"
+                or record.get("label") not in RESULT_LABELS
+            ):
+                continue
+            votes.setdefault(candidate_id, {})[route_id] = str(record["label"])
+        return votes
+
+    def aggregate_silver_labels(
+        self,
+        stage_manifest: Mapping[str, object],
+        candidate_manifest: Mapping[str, object],
+        allocation: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Aggregate fixed-route votes into calibrated accepted silver labels."""
+        decision = self.evaluate(stage_manifest)
+        if decision["decision"] != "build-eligible":
+            return self._aggregation_stop(str(decision["stop_reason"]))
+        if not _is_valid_sealed_candidate_manifest(candidate_manifest):
+            return self._aggregation_stop("unsealed-annex")
+        seal = candidate_manifest["seal"]
+        assert isinstance(seal, Mapping)
+        candidate_manifest_sha256 = str(seal["semantic_sha256"])
+        if (
+            allocation.get("allocation") != "complete"
+            or allocation.get("candidate_manifest_sha256") != candidate_manifest_sha256
+        ):
+            return self._aggregation_stop("allocation-not-complete")
+
+        development = allocation.get("development")
+        training = allocation.get("training")
+        if not isinstance(development, list) or not isinstance(training, list):
+            return self._aggregation_stop("allocation-not-complete")
+        development_labels: dict[str, str] = {}
+        for item in development:
+            if not isinstance(item, Mapping) or item.get("label") not in RESULT_LABELS:
+                return self._aggregation_stop("development-label-invalid")
+            development_labels[str(item["candidate_id"])] = str(item["label"])
+        class_counts = Counter(development_labels.values())
+        if any(
+            class_counts[label] < SILVER_MIN_DEVELOPMENT_CLASS
+            for label in RESULT_LABELS
+        ):
+            return self._aggregation_stop("development-class-underfilled")
+
+        evidence = decision["evidence"]
+        assert isinstance(evidence, Mapping)
+        route_evidence = evidence["routes"]
+        assert isinstance(route_evidence, Mapping)
+        route_ids = [
+            str(route_id)
+            for route_id in cast(list[object], route_evidence["eligible_route_ids"])
+        ]
+
+        votes = self._valid_votes()
+        training_ids = [
+            str(item["candidate_id"])
+            for item in training
+            if isinstance(item, Mapping)
+        ]
+        # An abstention is a missing vote, so the fit reads only the valid votes.
+        fit_rows = [
+            {"task": candidate_id, "worker": route_id, "label": label}
+            for candidate_id in [*training_ids, *development_labels]
+            for route_id, label in sorted(votes.get(candidate_id, {}).items())
+        ]
+        if not fit_rows:
+            return self._aggregation_stop("no-valid-votes")
+        try:
+            confusion, prior, iterations = _dawid_skene_fit(
+                fit_rows, development_labels, route_ids
+            )
+        except RuntimeError as error:
+            return self._aggregation_stop(str(error))
+
+        posteriors = {
+            candidate_id: _dawid_skene_posterior(
+                votes.get(candidate_id, {}), confusion, prior
+            )
+            for candidate_id in [*training_ids, *development_labels]
+        }
+
+        folds = {
+            candidate_id: _calibration_fold(candidate_id)
+            for candidate_id in development_labels
+        }
+        fold_temperatures: list[float] = []
+        out_of_fold: dict[str, dict[str, float]] = {}
+        for fold in range(SILVER_CALIBRATION_FOLDS):
+            temperature = _fit_temperature(
+                [
+                    (posteriors[candidate_id], label)
+                    for candidate_id, label in development_labels.items()
+                    if folds[candidate_id] != fold
+                ]
+            )
+            fold_temperatures.append(temperature)
+            for candidate_id in development_labels:
+                if folds[candidate_id] == fold:
+                    out_of_fold[candidate_id] = _temperature_scaled(
+                        posteriors[candidate_id], temperature
+                    )
+        temperature = sum(fold_temperatures) / SILVER_CALIBRATION_FOLDS
+
+        accepted: list[dict[str, object]] = []
+        rejected_counts: Counter[str] = Counter()
+        posterior_records: list[dict[str, object]] = []
+        for candidate_id in training_ids:
+            candidate_votes = votes.get(candidate_id, {})
+            calibrated = _temperature_scaled(posteriors[candidate_id], temperature)
+            top_label = _ranked_labels(calibrated)[0][0]
+            reason = _silver_rejection(sorted(candidate_votes.values()), calibrated)
+            if reason is None:
+                accepted.append(
+                    {
+                        "candidate_id": candidate_id,
+                        "label": top_label,
+                        "probability": calibrated[top_label],
+                    }
+                )
+            else:
+                rejected_counts[reason] += 1
+            posterior_records.append(
+                {
+                    "candidate_id": candidate_id,
+                    "valid_vote_count": len(candidate_votes),
+                    "posterior": posteriors[candidate_id],
+                    "calibrated": calibrated,
+                    "accepted": reason is None,
+                    "rejection_reason": reason,
+                }
+            )
+
+        fit_artifact: dict[str, object] = {
+            "event": "silver-fit-sealed",
+            "run_id": stage_manifest["run_id"],
+            "stage_manifest_sha256": semantic_manifest_sha256(stage_manifest),
+            "candidate_manifest_sha256": candidate_manifest_sha256,
+            "crowd_kit_version": CROWD_KIT_VERSION,
+            "n_iter": SILVER_DS_ITERATIONS,
+            "tol": SILVER_DS_TOLERANCE,
+            "iterations_used": iterations,
+            "route_dependency_parameter_count": 0,
+            "confusion_matrices": confusion,
+            "priors": prior,
+            "calibration_seed": SILVER_CALIBRATION_SEED,
+            "calibration_folds": SILVER_CALIBRATION_FOLDS,
+            "fold_temperatures": fold_temperatures,
+            "temperature": temperature,
+            "development_class_counts": dict(class_counts),
+        }
+        posterior_artifact: dict[str, object] = {
+            "event": "silver-posteriors-sealed",
+            "candidate_manifest_sha256": candidate_manifest_sha256,
+            "development_out_of_fold": out_of_fold,
+            "training_posteriors": posterior_records,
+        }
+        artifacts = (fit_artifact, posterior_artifact)
+        sealed = self.silver_aggregation_records()
+        unsealed: list[dict[str, object]] = []
+        for artifact in artifacts:
+            prior_records = [
+                record for record in sealed if record.get("event") == artifact["event"]
+            ]
+            if not prior_records:
+                unsealed.append(artifact)
+            elif any(
+                prior_records[0].get(field) != artifact[field] for field in artifact
+            ):
+                return self._aggregation_stop("frozen-aggregation-changed")
+        if unsealed and len(unsealed) != len(artifacts):
+            return self._aggregation_stop("frozen-aggregation-changed")
+        for artifact in unsealed:
+            self._silver_aggregation_log.append(artifact)
+
+        result: dict[str, object] = {
+            "aggregation": "complete",
+            "stop_reason": None,
+            "candidate_manifest_sha256": candidate_manifest_sha256,
+            "accepted_silver_count": len(accepted),
+            "rejected_counts": dict(sorted(rejected_counts.items())),
+            "accepted_silver": accepted,
+            "temperature": temperature,
+            "fit_sha256": hashlib.sha256(
+                _canonical_json(fit_artifact).encode("utf-8")
+            ).hexdigest(),
+            "posterior_sha256": hashlib.sha256(
+                _canonical_json(posterior_artifact).encode("utf-8")
+            ).hexdigest(),
+        }
+        result["aggregation_sha256"] = hashlib.sha256(
+            _canonical_json(result).encode("utf-8")
+        ).hexdigest()
+        return result
 
     def inspect_candidate(
         self,
@@ -2070,6 +2467,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     collect.add_argument("--timeout-seconds", type=float, default=60)
 
+    aggregate = commands.add_parser(
+        "aggregate-silver", help="Aggregate votes into accepted silver labels."
+    )
+    aggregate.add_argument("stage_manifest")
+    aggregate.add_argument("candidate_manifest")
+    aggregate.add_argument("allocation")
+    aggregate.add_argument("--output", required=True)
+    aggregate.add_argument("--state-dir", required=True)
+
     args = parser.parse_args(argv)
     try:
         if args.command == "admit-example":
@@ -2123,6 +2529,27 @@ def main(argv: list[str] | None = None) -> int:
             )
             _write_json(result)
             return 0 if result["collection"] == "complete" else 2
+        if args.command == "aggregate-silver":
+            aggregated = StageRun(args.state_dir).aggregate_silver_labels(
+                _read_manifest(args.stage_manifest),
+                _read_manifest(args.candidate_manifest),
+                _read_manifest(args.allocation),
+            )
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps(aggregated, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            _write_json(
+                {
+                    "accepted_silver_labels": str(output_path),
+                    "aggregation": aggregated["aggregation"],
+                    "stop_reason": aggregated["stop_reason"],
+                    "accepted_silver_count": aggregated["accepted_silver_count"],
+                }
+            )
+            return 0 if aggregated["aggregation"] == "complete" else 2
         if args.command == "confirm":
             confirmed = confirm_manifest(_read_manifest(args.manifest), args.confirmed_by)
             output_path = Path(args.output)
