@@ -3966,8 +3966,8 @@ class Stage1ReportTests(unittest.TestCase):
 STAGE_2_RIGHTS = {field: True for field in RIGHTS_FIELDS}
 
 
-def stage_2_source(source_type: str) -> dict[str, object]:
-    """Give the complete gate record of one Stage 2 source."""
+def stage_source(source_type: str) -> dict[str, object]:
+    """Give the complete gate record of one later-stage source."""
     return {
         "source_id": f"{source_type}-fixture",
         "source_type": source_type,
@@ -3997,18 +3997,22 @@ def stage_2_source(source_type: str) -> dict[str, object]:
     }
 
 
-def draft_stage_2_manifest() -> dict[str, object]:
+def draft_stage_manifest(stage: int) -> dict[str, object]:
     return {
         "schema_version": 1,
-        "run_id": "stage-2-fixture",
-        "stage": 2,
-        "sources": [stage_2_source(name) for name in STAGE_SOURCES[2]],
+        "run_id": f"stage-{stage}-fixture",
+        "stage": stage,
+        "sources": [stage_source(name) for name in STAGE_SOURCES[stage]],
         "route_panel": {
             "inspection_complete": True,
             "routes": [route(route_id) for route_id in ROUTE_IDS],
         },
-        "budget": {"evidence": "fixture Stage 2 cost projection"},
+        "budget": {"evidence": f"fixture Stage {stage} cost projection"},
     }
+
+
+def draft_stage_2_manifest() -> dict[str, object]:
+    return draft_stage_manifest(2)
 
 
 class StageTwoGateTests(unittest.TestCase):
@@ -4193,6 +4197,8 @@ GPT_FORECAST: dict[str, object] = {
 class StageTwoCumulativeTests(unittest.TestCase):
     """One cumulative checkpoint, one decision for each source, one pooled view."""
 
+    stage = 2
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
@@ -4201,9 +4207,14 @@ class StageTwoCumulativeTests(unittest.TestCase):
         self.delays: list[float] = []
         self.stage_manifests = {
             1: confirm_manifest(draft_manifest(), "fixture-owner"),
-            2: confirm_manifest(draft_stage_2_manifest(), "fixture-owner"),
+            **{
+                stage: confirm_manifest(
+                    draft_stage_manifest(stage), "fixture-owner"
+                )
+                for stage in range(2, self.stage + 1)
+            },
         }
-        self.sources = list(cumulative_sources(2))
+        self.sources = list(cumulative_sources(self.stage))
         self.reference: dict[str, dict[str, str]] = {}
         self.fixtures: dict[str, tuple[dict[str, object], ...]] = {}
         for source in self.sources:
@@ -4220,7 +4231,9 @@ class StageTwoCumulativeTests(unittest.TestCase):
         self.gpt_requests: dict[str, int] = {}
 
     def stage_of(self, source: str) -> int:
-        return 1 if source in STAGE_SOURCES[1] else 2
+        return next(
+            stage for stage, names in STAGE_SOURCES.items() if source in names
+        )
 
     def relabels(self, source: str) -> list[dict[str, object]]:
         return [
@@ -4280,7 +4293,7 @@ class StageTwoCumulativeTests(unittest.TestCase):
         }
         self.backend = FakeTrainingBackend(blind_labels=labels)
         return self.runner.train_specialist(
-            self.stage_manifests[2],
+            self.stage_manifests[self.stage],
             [
                 {
                     "candidate_manifest": self.fixtures[source][0],
@@ -4295,7 +4308,7 @@ class StageTwoCumulativeTests(unittest.TestCase):
 
     def report(self) -> dict[str, object]:
         return self.runner.report_stage(
-            self.stage_manifests[2],
+            self.stage_manifests[self.stage],
             [
                 {
                     "candidate_manifest": self.fixtures[source][0],
@@ -4318,27 +4331,28 @@ class StageTwoCumulativeTests(unittest.TestCase):
 
         prediction_file = self.train()
 
+        count = len(self.sources)
         self.assertEqual("sealed", prediction_file["specialist_predictions"])
-        self.assertEqual(2, prediction_file["stage"])
+        self.assertEqual(self.stage, prediction_file["stage"])
         self.assertEqual(self.sources, prediction_file["sources"])
         self.assertEqual(
-            BLIND_REPORT_SIZE * 3, prediction_file["prediction_count"]
+            BLIND_REPORT_SIZE * count, prediction_file["prediction_count"]
         )
         config = self.backend.trainings[0]
-        self.assertEqual(2 * 3, len(cast(list[Any], config["training"])))
-        self.assertEqual(4 * 3, len(cast(list[Any], config["development"])))
+        self.assertEqual(2 * count, len(cast(list[Any], config["training"])))
+        self.assertEqual(4 * count, len(cast(list[Any], config["development"])))
         self.assertEqual(3, len(self.backend.trainings))
 
     def test_a_missing_earlier_source_stops_the_cumulative_run(self) -> None:
         result = self.runner.train_specialist(
-            self.stage_manifests[2],
+            self.stage_manifests[self.stage],
             [
                 {
                     "candidate_manifest": self.fixtures[source][0],
                     "allocation": self.fixtures[source][1],
                     "aggregation": self.fixtures[source][2],
                 }
-                for source in STAGE_SOURCES[2]
+                for source in STAGE_SOURCES[self.stage]
             ],
             FakeTrainingBackend(),
             device_checks={"m3": M3_CHECK, "gpu_pilot": GPU_PILOT},
@@ -4351,9 +4365,16 @@ class StageTwoCumulativeTests(unittest.TestCase):
 
         decision = cast(Mapping[str, Any], report["decision"])
         self.assertEqual("complete", report["report"])
-        self.assertEqual(2, report["stage"])
+        self.assertEqual(self.stage, report["stage"])
         self.assertEqual(self.sources, report["sources"])
-        self.assertEqual(["financial-news"], report["regression_sources"])
+        self.assertEqual(
+            [
+                source
+                for source in self.sources
+                if source not in STAGE_SOURCES[self.stage]
+            ],
+            report["regression_sources"],
+        )
         self.assertEqual(
             {source: "pass" for source in self.sources},
             decision["source_guardrail"],
@@ -4370,7 +4391,7 @@ class StageTwoCumulativeTests(unittest.TestCase):
 
     def test_the_pooled_score_cannot_hide_a_failed_source(self) -> None:
         for source in self.sources:
-            # Only the regulatory-filings answers are wrong.
+            # Only the answers of the last new source are wrong.
             self.seal_gpt(source)
         labels = {}
         for source in self.sources:
@@ -4379,11 +4400,11 @@ class StageTwoCumulativeTests(unittest.TestCase):
             ):
                 labels[candidate_id] = (
                     RESULT_LABELS[(RESULT_LABELS.index(label) + 1) % 4]
-                    if source == "regulatory-filings" and index < 32
+                    if source == self.sources[-1] and index < 32
                     else label
                 )
         self.runner.train_specialist(
-            self.stage_manifests[2],
+            self.stage_manifests[self.stage],
             [
                 {
                     "candidate_manifest": self.fixtures[source][0],
@@ -4400,7 +4421,7 @@ class StageTwoCumulativeTests(unittest.TestCase):
 
         decision = cast(Mapping[str, Any], report["decision"])
         pooled = cast(Mapping[str, Any], report["metrics"])["pooled"]
-        self.assertEqual("fail", decision["source_guardrail"]["regulatory-filings"])
+        self.assertEqual("fail", decision["source_guardrail"][self.sources[-1]])
         self.assertEqual("pass", decision["source_guardrail"]["financial-news"])
         self.assertEqual("fail", decision["stage_guardrail"])
         self.assertTrue(pooled["diagnostic_only"])
@@ -4409,7 +4430,7 @@ class StageTwoCumulativeTests(unittest.TestCase):
         by_source = cast(Mapping[str, Any], report["metrics"])["by_source"]
         self.assertGreater(
             pooled["macro_f1_difference"],
-            by_source["regulatory-filings"]["macro_f1_difference"],
+            by_source[self.sources[-1]]["macro_f1_difference"],
         )
 
     def test_the_regression_source_reuses_its_sealed_gpt_file(self) -> None:
@@ -4448,7 +4469,7 @@ class StageTwoCumulativeTests(unittest.TestCase):
         }
 
         result = self.runner.train_specialist(
-            self.stage_manifests[2],
+            self.stage_manifests[self.stage],
             bundles,
             FakeTrainingBackend(),
             device_checks={"m3": M3_CHECK, "gpu_pilot": GPU_PILOT},
@@ -4466,13 +4487,20 @@ class StageTwoCumulativeTests(unittest.TestCase):
             }
             for source in self.sources
         ]
-        # The regulatory-filings allocation now names a financial-news example.
-        allocation = cast(Mapping[str, Any], sources[2]["allocation"])
+        # The last source allocation now names a financial-news example.
+        allocation = cast(Mapping[str, Any], sources[-1]["allocation"])
         allocation["blind"][0]["candidate_id"] = "blind-00"
 
-        result = self.runner.report_stage(self.stage_manifests[2], sources)
+        result = self.runner.report_stage(self.stage_manifests[self.stage], sources)
 
         self.assertEqual("duplicate-candidate-id", result["stop_reason"])
+
+    def test_the_report_marks_only_the_last_stage_as_final(self) -> None:
+        report = self.complete_run()
+
+        claim = cast(Mapping[str, Any], report["claim"])
+        self.assertEqual(self.stage == 3, claim["final_staged_decision"])
+        self.assertIn("company-only", cast(str, claim["scope"]))
 
     def test_the_checkpoint_record_keeps_each_source_development_result(self) -> None:
         for source in self.sources:
@@ -4484,3 +4512,98 @@ class StageTwoCumulativeTests(unittest.TestCase):
         self.assertEqual(
             set(self.sources), set(checkpoint["development_macro_f1_by_source"])
         )
+
+
+class StageThreeGateTests(unittest.TestCase):
+    """Stage 3 starts only after both final sources pass their own gate."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.runner = StageRun(
+            Path(self.temp_dir.name), clock=lambda: "2026-09-28T00:00:00Z"
+        )
+
+    def evaluate(self, manifest: Mapping[str, object]) -> dict[str, object]:
+        return self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+
+    def test_both_final_sources_pass_their_own_gate(self) -> None:
+        decision = self.evaluate(draft_stage_manifest(3))
+
+        self.assertEqual("build-eligible", decision["decision"])
+        self.assertEqual(3, decision["stage"])
+        self.assertEqual(["stage-3-build"], decision["permitted_external_actions"])
+        evidence = cast(dict[str, Any], decision["evidence"])
+        self.assertEqual(set(STAGE_SOURCES[3]), set(evidence["sources"]))
+
+    def test_one_final_source_alone_cannot_start_the_stage(self) -> None:
+        manifest = draft_stage_manifest(3)
+        manifest["sources"] = cast(list[object], manifest["sources"])[:1]
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("stage-source-incomplete", decision["stop_reason"])
+
+    def test_a_stage_2_source_cannot_enter_the_stage_3_gate(self) -> None:
+        manifest = draft_stage_manifest(3)
+        cast(list[dict[str, object]], manifest["sources"])[0][
+            "source_type"
+        ] = "regulatory-filings"
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("source-rights-failed", decision["stop_reason"])
+
+    def test_a_failed_right_of_one_final_source_stops_the_stage(self) -> None:
+        manifest = draft_stage_manifest(3)
+        cast(list[dict[str, object]], manifest["sources"])[1][
+            "weight_release_permitted"
+        ] = False
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("source-rights-failed", decision["stop_reason"])
+
+    def test_each_final_source_keeps_the_smaller_allocation(self) -> None:
+        for source in STAGE_SOURCES[3]:
+            sealed = seal_candidate_manifest(
+                candidate_manifest(3, source), "fixture-owner"
+            )
+            limits = cast(Mapping[str, Any], sealed["annex"])["limits"]
+            self.assertEqual(3_333, limits["silver_candidate_limit"])
+            self.assertEqual(
+                {"training": 2_000, "development": 200, "blind": 400},
+                SOURCE_ALLOCATION_TARGETS[source],
+            )
+        self.assertEqual(20_000, sum(SOURCE_SILVER_CANDIDATE_LIMITS.values()))
+
+
+class StageThreeCumulativeTests(StageTwoCumulativeTests):
+    """Stage 3 trains one final checkpoint and decides all five sources."""
+
+    stage = 3
+
+    def test_all_five_sources_receive_a_separate_final_decision(self) -> None:
+        report = self.complete_run()
+
+        decision = cast(Mapping[str, Any], report["decision"])
+        claim = cast(Mapping[str, Any], report["claim"])
+        self.assertEqual(5, len(self.sources))
+        self.assertEqual(
+            {source: "pass" for source in self.sources},
+            decision["source_guardrail"],
+        )
+        self.assertEqual(
+            ["financial-news", "company-announcements", "regulatory-filings"],
+            report["regression_sources"],
+        )
+        self.assertTrue(claim["final_staged_decision"])
+        self.assertEqual(self.sources, claim["tested_sources"])
+        for phrase in ("natural-distribution", "general-parity", "trading"):
+            self.assertIn(phrase, cast(str, claim["scope"]))
+
+    def test_an_earlier_source_reuses_its_sealed_gpt_file(self) -> None:
+        self.complete_run()
+
+        for source in ("financial-news", "company-announcements"):
+            self.assertEqual(BLIND_REPORT_SIZE, self.gpt_requests[source])

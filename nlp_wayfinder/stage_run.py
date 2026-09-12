@@ -77,6 +77,7 @@ CANDIDATE_SPLITS = ("training", "development", "blind")
 STAGE_SOURCES = {
     1: ("financial-news",),
     2: ("company-announcements", "regulatory-filings"),
+    3: ("earnings-calls", "financial-social-media"),
 }
 # Stage 1 collects 4,000 silver examples. Each later source adds 2,000. The
 # total silver-candidate inspection limit of 20,000 divides in the same ratio.
@@ -84,11 +85,15 @@ SOURCE_ALLOCATION_TARGETS = {
     "financial-news": {"training": 4_000, "development": 200, "blind": 400},
     "company-announcements": {"training": 2_000, "development": 200, "blind": 400},
     "regulatory-filings": {"training": 2_000, "development": 200, "blind": 400},
+    "earnings-calls": {"training": 2_000, "development": 200, "blind": 400},
+    "financial-social-media": {"training": 2_000, "development": 200, "blind": 400},
 }
 SOURCE_SILVER_CANDIDATE_LIMITS = {
     "financial-news": 6_668,
     "company-announcements": 3_333,
     "regulatory-filings": 3_333,
+    "earnings-calls": 3_333,
+    "financial-social-media": 3_333,
 }
 BLIND_CELL_TARGET = 25
 BLIND_RELABEL_SEED = "20260905"
@@ -98,6 +103,13 @@ BLIND_BOOTSTRAP_SEED = "20260905"
 BLIND_BOOTSTRAP_SAMPLES = 10_000
 BLIND_BOOTSTRAP_INTERVAL = 0.95
 NON_INFERIORITY_MARGIN = -0.03
+FINAL_STAGE = max(STAGE_SOURCES)
+CLAIM_SCOPE = (
+    "This result applies only to the sealed, balanced, company-only, "
+    "four-aspect blind test of each listed source. It makes no "
+    "natural-distribution claim, no general-parity claim, no return "
+    "forecast, and no trading claim."
+)
 SOURCE_ANNEX_FIELDS = (
     "acquisition",
     "rights",
@@ -3533,6 +3545,11 @@ class StageRun:
                 for source in ordered_sources
                 if source not in STAGE_SOURCES[stage]
             ],
+            "claim": {
+                "scope": CLAIM_SCOPE,
+                "tested_sources": ordered_sources,
+                "final_staged_decision": stage == FINAL_STAGE,
+            },
             "decision": {
                 "blind_comparison": "valid",
                 "non_inferiority_margin": NON_INFERIORITY_MARGIN,
