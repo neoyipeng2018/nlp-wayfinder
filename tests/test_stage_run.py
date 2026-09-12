@@ -27,6 +27,8 @@ from nlp_wayfinder.stage_run import (
     StageRun,
     admit_example,
     allocate_stage_1,
+    main as stage_run_main,
+    project_gpt_blind_cost,
     _calibration_fold,
     _silver_rejection,
     candidate_order_sha256,
@@ -1923,3 +1925,485 @@ class SilverAggregationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def gpt_response(
+    *,
+    content: str = '{"label":"positive"}',
+    model: str = "gpt-5.6-sol-medium",
+    status_code: int = 200,
+    refusal: str | None = None,
+) -> OmniRouteResponse:
+    message: dict[str, object] = {"content": content}
+    if refusal is not None:
+        message["refusal"] = refusal
+    return OmniRouteResponse(
+        status_code=status_code,
+        headers={
+            "x-omniroute-response-cost": "0.0043000000",
+            "x-omniroute-model": model,
+            "x-omniroute-provider": "cx",
+            "x-omniroute-latency-ms": "2400",
+            "x-omniroute-cache-hit": "false",
+            "x-omniroute-fallback-attempts": "0",
+            "x-omniroute-decision": "strategy=single; provider=cx; latency_ms=2400",
+            "x-omniroute-request-id": "gpt-request",
+            "x-omniroute-version": "3.8.49",
+        },
+        body={
+            "model": model,
+            "choices": [{"message": message}],
+            "usage": {
+                "prompt_tokens": 1180,
+                "completion_tokens": 540,
+                "total_tokens": 1720,
+            },
+        },
+    )
+
+
+class GptTransport:
+    """Return the declared failures first, then one valid GPT answer."""
+
+    def __init__(
+        self, failures: list[OmniRouteResponse | BaseException] | None = None
+    ) -> None:
+        self.requests: list[tuple[dict[str, object], float]] = []
+        self.failures = list(failures or [])
+
+    def complete(
+        self, request: Mapping[str, object], timeout_seconds: float
+    ) -> OmniRouteResponse:
+        self.requests.append((copy.deepcopy(dict(request)), timeout_seconds))
+        if self.failures:
+            failure = self.failures.pop(0)
+            if isinstance(failure, BaseException):
+                raise failure
+            return failure
+        return gpt_response()
+
+
+
+class GptBlindPredictionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.state_dir = Path(self.temp_dir.name)
+        self.runner = StageRun(
+            self.state_dir,
+            clock=lambda: "2026-09-12T00:00:00Z",
+        )
+        self.delays: list[float] = []
+
+    def forecast(self, **changes: object) -> dict[str, object]:
+        declared: dict[str, object] = {
+            "measured_split": "development",
+            "measured_candidate_ids": ["development-1"],
+            "prompt_tokens_per_example": 1200,
+            "completion_tokens_per_example": 600,
+            "prompt_usd_per_1k_tokens": "0.0012",
+            "completion_usd_per_1k_tokens": "0.0060",
+            "charged_retry_reserve_attempts": 100,
+        }
+        declared.update(changes)
+        return declared
+
+    def gpt_inputs(
+        self,
+    ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+        stage_manifest = confirm_manifest(draft_manifest(), "fixture-owner")
+        candidates = candidate_manifest()
+        candidates["candidates"] = [
+            {
+                "candidate_id": "development-1",
+                "event_group_id": "event-development-1",
+                "company_id": "Harbor Grid Ltd",
+                "aspect": STAGE_1_ASPECTS[1],
+                "published_at": "2026-07-10T09:00:00Z",
+                "normalized_passage": "Harbor Grid won three new supply contracts.",
+                "near_duplicate_reviewed": True,
+            },
+            {
+                "candidate_id": "blind-1",
+                "event_group_id": "event-blind-1",
+                "company_id": "Harbor Grid Ltd",
+                "aspect": STAGE_1_ASPECTS[2],
+                "published_at": "2026-09-10T09:00:00Z",
+                "normalized_passage": "Harbor Grid opened a new factory.",
+                "near_duplicate_reviewed": True,
+            },
+            {
+                "candidate_id": "blind-2",
+                "event_group_id": "event-blind-2",
+                "company_id": "Bay Rail Plc",
+                "aspect": STAGE_1_ASPECTS[0],
+                "published_at": "2026-09-11T09:00:00Z",
+                "normalized_passage": "Bay Rail revenue decreased by four percent.",
+                "near_duplicate_reviewed": True,
+            },
+        ]
+        sealed_candidates = seal_candidate_manifest(candidates, "fixture-owner")
+        allocation = {
+            "allocation": "complete",
+            "stop_reason": None,
+            "candidate_manifest_sha256": cast(
+                Mapping[str, object], sealed_candidates["seal"]
+            )["semantic_sha256"],
+            "training": [],
+            "development": [{"candidate_id": "development-1"}],
+            "blind": [
+                {"candidate_id": "blind-1", "label": "positive"},
+                {"candidate_id": "blind-2", "label": "negative"},
+            ],
+        }
+        return stage_manifest, sealed_candidates, allocation
+
+    def predict(
+        self, transport: Any, *, forecast: Mapping[str, object] | None = None
+    ) -> dict[str, object]:
+        stage_manifest, candidates, allocation = self.gpt_inputs()
+        return self.runner.predict_blind_gpt(
+            stage_manifest,
+            candidates,
+            allocation,
+            transport,
+            forecast=forecast if forecast is not None else self.forecast(),
+            sleep=self.delays.append,
+        )
+
+    def test_the_sealed_file_uses_the_fixed_route_prompt_and_schema(self) -> None:
+        transport = GptTransport()
+
+        result = self.predict(transport)
+
+        self.assertEqual("sealed", result["gpt_predictions"])
+        self.assertIsNone(result["stop_reason"])
+        self.assertEqual("cx/gpt-5.6-sol-medium", result["route_id"])
+        self.assertEqual("medium", result["reasoning_effort"])
+        self.assertEqual(2, result["prediction_count"])
+        self.assertEqual(64, len(cast(str, result["prediction_file_sha256"])))
+        self.assertEqual(
+            ["blind-1", "blind-2"],
+            [
+                cast(Mapping[str, object], item)["candidate_id"]
+                for item in cast(list[object], result["predictions"])
+            ],
+        )
+        self.assertEqual(2, len(transport.requests))
+        for request, _ in transport.requests:
+            self.assertEqual("cx/gpt-5.6-sol-medium", request["model"])
+            self.assertEqual("medium", request["reasoning_effort"])
+            self.assertFalse(request["stream"])
+            schema = cast(Any, request["response_format"])["json_schema"]
+            self.assertTrue(schema["strict"])
+            self.assertEqual(
+                list(RESULT_LABELS), schema["schema"]["properties"]["label"]["enum"]
+            )
+            self.assertEqual(2, len(cast(list[Any], request["messages"])))
+
+    def test_the_prompt_never_carries_a_blind_reference_label(self) -> None:
+        transport = GptTransport()
+
+        self.predict(transport)
+
+        for request, _ in transport.requests:
+            messages = cast(list[Mapping[str, str]], request["messages"])
+            user_content = json.loads(messages[1]["content"])
+            self.assertEqual({"passage", "company", "aspect"}, set(user_content))
+            sent = json.dumps(request)
+            for reference_label in ("positive", "negative"):
+                self.assertNotIn(f'"{reference_label}"', sent.replace(
+                    json.dumps(list(RESULT_LABELS))[1:-1], ""
+                ))
+
+    def test_a_candidate_manifest_label_stops_the_run(self) -> None:
+        stage_manifest = confirm_manifest(draft_manifest(), "fixture-owner")
+        candidates = candidate_manifest()
+        candidates["candidates"] = [
+            {
+                "candidate_id": "blind-1",
+                "event_group_id": "event-blind-1",
+                "company_id": "Harbor Grid Ltd",
+                "aspect": STAGE_1_ASPECTS[2],
+                "published_at": "2026-09-10T09:00:00Z",
+                "normalized_passage": "Harbor Grid opened a new factory.",
+                "near_duplicate_reviewed": True,
+                "label": "positive",
+            }
+        ]
+        sealed = seal_candidate_manifest(candidates, "fixture-owner")
+        allocation = {
+            "allocation": "complete",
+            "stop_reason": None,
+            "candidate_manifest_sha256": cast(
+                Mapping[str, object], sealed["seal"]
+            )["semantic_sha256"],
+            "training": [],
+            "development": [],
+            "blind": [{"candidate_id": "blind-1", "label": "positive"}],
+        }
+        transport = GptTransport()
+
+        result = self.runner.predict_blind_gpt(
+            stage_manifest,
+            sealed,
+            allocation,
+            transport,
+            forecast=self.forecast(),
+            sleep=self.delays.append,
+        )
+
+        self.assertEqual("invalid", result["gpt_predictions"])
+        self.assertEqual("blind-label-exposed", result["stop_reason"])
+        self.assertEqual(0, len(transport.requests))
+
+    def test_a_non_blind_token_check_must_fit_the_gpt_allocation(self) -> None:
+        projection = project_gpt_blind_cost(self.forecast())
+
+        self.assertEqual("within-budget", projection["forecast"])
+        self.assertEqual(2000, projection["first_attempts"])
+        self.assertEqual(100, projection["reserve_attempts"])
+        self.assertEqual("10.59", projection["projected_usd"])
+        self.assertEqual("25.00", projection["remaining_usd"])
+
+    def test_recorded_gpt_spend_lowers_the_projection_allowance(self) -> None:
+        projection = project_gpt_blind_cost(
+            self.forecast(), remaining_usd=Decimal("5.00")
+        )
+
+        self.assertEqual("stopped", projection["forecast"])
+        self.assertEqual("gpt-budget-exceeded", projection["stop_reason"])
+        self.assertEqual("10.59", projection["projected_usd"])
+        self.assertEqual("5.00", projection["remaining_usd"])
+
+    def test_a_sealed_file_does_not_serve_another_candidate_manifest(self) -> None:
+        self.predict(GptTransport())
+        stage_manifest, candidates, allocation = self.gpt_inputs()
+        cast(list[Any], candidates["candidates"])[2]["normalized_passage"] = (
+            "Bay Rail revenue decreased by five percent."
+        )
+        draft = {key: value for key, value in candidates.items() if key != "seal"}
+        draft["candidates"] = [
+            {
+                key: value
+                for key, value in cast(Mapping[str, object], item).items()
+                if key not in ("content_sha256", "split")
+            }
+            for item in cast(list[Any], draft["candidates"])
+        ]
+        changed_candidates = seal_candidate_manifest(draft, "fixture-owner")
+        allocation["candidate_manifest_sha256"] = cast(
+            Mapping[str, object], changed_candidates["seal"]
+        )["semantic_sha256"]
+        transport = GptTransport()
+
+        result = self.runner.predict_blind_gpt(
+            stage_manifest,
+            changed_candidates,
+            allocation,
+            transport,
+            forecast=self.forecast(),
+            sleep=self.delays.append,
+        )
+
+        self.assertEqual("frozen-gpt-run-changed", result["stop_reason"])
+        self.assertEqual(0, len(transport.requests))
+
+    def test_a_projection_above_the_gpt_allocation_stops_the_run(self) -> None:
+        transport = GptTransport()
+
+        result = self.predict(
+            transport,
+            forecast=self.forecast(completion_tokens_per_example=4000),
+        )
+
+        self.assertEqual("gpt-budget-exceeded", result["stop_reason"])
+        self.assertEqual(0, len(transport.requests))
+
+    def test_a_blind_measured_token_check_stops_the_run(self) -> None:
+        transport = GptTransport()
+
+        result = self.predict(
+            transport, forecast=self.forecast(measured_split="blind")
+        )
+
+        self.assertEqual("gpt-forecast-blind-exposure", result["stop_reason"])
+        self.assertEqual(0, len(transport.requests))
+
+    def test_an_incomplete_token_check_stops_the_run(self) -> None:
+        forecast = self.forecast()
+        del forecast["charged_retry_reserve_attempts"]
+        transport = GptTransport()
+
+        result = self.predict(transport, forecast=forecast)
+
+        self.assertEqual("gpt-forecast-incomplete", result["stop_reason"])
+        self.assertEqual(0, len(transport.requests))
+
+    def test_transport_failures_get_three_identical_attempts(self) -> None:
+        for failure in (
+            TimeoutError("timed out"),
+            OSError("connection reset"),
+            gpt_response(status_code=429),
+            gpt_response(status_code=503),
+        ):
+            with self.subTest(failure=failure):
+                with tempfile.TemporaryDirectory() as state_dir:
+                    self.runner = StageRun(
+                        state_dir, clock=lambda: "2026-09-12T00:00:00Z"
+                    )
+                    self.delays = []
+                    transport = GptTransport(failures=[failure])
+
+                    result = self.predict(transport)
+
+                    self.assertEqual("sealed", result["gpt_predictions"])
+                    self.assertEqual(3, len(transport.requests))
+                    self.assertEqual([5.0], self.delays)
+                    first, second = transport.requests[0][0], transport.requests[1][0]
+                    self.assertEqual(first, second)
+                    attempts = [
+                        record
+                        for record in self.runner.gpt_blind_records()
+                        if record.get("event") == "gpt-blind-attempt"
+                    ]
+                    self.assertEqual(3, len(attempts))
+                    self.assertEqual("transport-failure", attempts[0]["outcome"])
+                    self.assertIsNone(attempts[0]["label"])
+
+    def test_three_failed_transport_attempts_invalidate_the_run(self) -> None:
+        failure = gpt_response(status_code=500)
+        transport = GptTransport(failures=[failure, failure, failure])
+
+        result = self.predict(transport)
+
+        self.assertEqual("invalid", result["gpt_predictions"])
+        self.assertEqual("gpt-transport-failed", result["stop_reason"])
+        self.assertEqual(3, len(transport.requests))
+        self.assertEqual([5.0, 20.0], self.delays)
+        self.assertEqual(0, result["prediction_count"])
+
+    def test_a_refusal_or_malformed_answer_is_not_retried(self) -> None:
+        cases = {
+            "refusal": gpt_response(refusal="I cannot classify this passage."),
+            "malformed-answer": gpt_response(content="positive"),
+            "malformed-answer-label": gpt_response(content='{"label":"bullish"}'),
+        }
+        for expected, response in cases.items():
+            with self.subTest(case=expected):
+                with tempfile.TemporaryDirectory() as state_dir:
+                    self.runner = StageRun(
+                        state_dir, clock=lambda: "2026-09-12T00:00:00Z"
+                    )
+                    transport = GptTransport(failures=[response])
+
+                    result = self.predict(transport)
+
+                    self.assertEqual("invalid", result["gpt_predictions"])
+                    self.assertEqual(
+                        expected.replace("-label", ""), result["stop_reason"]
+                    )
+                    self.assertEqual(1, len(transport.requests))
+                    self.assertEqual([], self.delays)
+                    self.assertEqual([], result["predictions"])
+
+    def test_a_route_mismatch_invalidates_the_run(self) -> None:
+        for header, value in (
+            ("x-omniroute-model", "gpt-5.6-sol-high"),
+            ("x-omniroute-fallback-attempts", "1"),
+            ("x-omniroute-cache-hit", "true"),
+            ("x-omniroute-decision", "strategy=fusion; provider=cx"),
+        ):
+            with self.subTest(header=header):
+                with tempfile.TemporaryDirectory() as state_dir:
+                    self.runner = StageRun(
+                        state_dir, clock=lambda: "2026-09-12T00:00:00Z"
+                    )
+                    response = gpt_response()
+                    headers = dict(response.headers)
+                    headers[header] = value
+                    transport = GptTransport(
+                        failures=[response._replace(headers=headers)]
+                    )
+
+                    result = self.predict(transport)
+
+                    self.assertEqual("route-mismatch", result["stop_reason"])
+                    self.assertEqual(1, len(transport.requests))
+
+    def test_a_changed_request_stops_the_run(self) -> None:
+        failure = gpt_response(status_code=500)
+        self.predict(GptTransport(failures=[failure, failure, failure]))
+
+        with unittest.mock.patch(
+            "nlp_wayfinder.stage_run.GPT_BLIND_SYSTEM_PROMPT", "Other instructions."
+        ):
+            changed = self.predict(GptTransport())
+
+        self.assertEqual("frozen-gpt-run-changed", changed["stop_reason"])
+        freeze = self.runner.gpt_blind_records()[0]
+        self.assertEqual("cx/gpt-5.6-sol-medium", freeze["route_id"])
+        self.assertEqual("medium", freeze["reasoning_effort"])
+
+    def test_the_sealed_file_is_reused_without_a_new_gpt_call(self) -> None:
+        first = self.predict(GptTransport())
+        transport = GptTransport()
+
+        again = self.predict(transport)
+
+        self.assertEqual(first, again)
+        self.assertEqual(0, len(transport.requests))
+
+    def test_a_blind_candidate_outside_the_manifest_stops_the_run(self) -> None:
+        stage_manifest, candidates, allocation = self.gpt_inputs()
+        cast(list[Any], allocation["blind"]).append({"candidate_id": "blind-9"})
+        transport = GptTransport()
+
+        result = self.runner.predict_blind_gpt(
+            stage_manifest,
+            candidates,
+            allocation,
+            transport,
+            forecast=self.forecast(),
+            sleep=self.delays.append,
+        )
+
+        self.assertEqual("gpt-candidate-invalid", result["stop_reason"])
+        self.assertEqual(0, len(transport.requests))
+
+    def test_the_cli_seals_one_prediction_file(self) -> None:
+        stage_manifest, candidates, allocation = self.gpt_inputs()
+        paths = {}
+        for name, value in (
+            ("stage.json", stage_manifest),
+            ("candidates.json", candidates),
+            ("allocation.json", allocation),
+            ("forecast.json", self.forecast()),
+        ):
+            path = self.state_dir / name
+            path.write_text(json.dumps(value), encoding="utf-8")
+            paths[name] = str(path)
+        output = self.state_dir / "gpt-predictions.json"
+
+        with unittest.mock.patch(
+            "nlp_wayfinder.stage_run.OmniRouteHttpTransport",
+            lambda *args, **kwargs: GptTransport(),
+        ):
+            code = stage_run_main(
+                [
+                    "predict-blind-gpt",
+                    paths["stage.json"],
+                    paths["candidates.json"],
+                    paths["allocation.json"],
+                    paths["forecast.json"],
+                    "--output",
+                    str(output),
+                    "--state-dir",
+                    str(self.state_dir / "cli-state"),
+                ]
+            )
+
+        self.assertEqual(0, code)
+        sealed = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual("sealed", sealed["gpt_predictions"])
+        self.assertEqual(2, sealed["prediction_count"])

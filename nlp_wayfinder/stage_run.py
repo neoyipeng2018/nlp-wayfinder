@@ -11,12 +11,13 @@ import math
 import os
 import socket
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as metadata_version
 from pathlib import Path
@@ -100,6 +101,23 @@ SILVER_MIN_VALID_VOTES = 2
 SILVER_MIN_PROBABILITY = 0.70
 SILVER_TIE_TOLERANCE = 1e-12
 SILVER_MIN_DEVELOPMENT_CLASS = 25
+
+GPT_ROUTE_ID = "cx/gpt-5.6-sol-medium"
+GPT_REASONING_EFFORT = "medium"
+GPT_RETRY_DELAYS_SECONDS = (5.0, 20.0)
+GPT_MAX_ATTEMPTS = len(GPT_RETRY_DELAYS_SECONDS) + 1
+GPT_MAX_OUTPUT_TOKENS = 2_048
+GPT_BLIND_FIRST_ATTEMPTS = 2_000
+GPT_FORECAST_FIELDS = (
+    "measured_split",
+    "measured_candidate_ids",
+    "prompt_tokens_per_example",
+    "completion_tokens_per_example",
+    "prompt_usd_per_1k_tokens",
+    "completion_usd_per_1k_tokens",
+    "charged_retry_reserve_attempts",
+)
+BLIND_LABEL_FIELDS = ("label", "reference_label", "silver_label", "labeled_at")
 
 RIGHTS_FIELDS = (
     "access_permitted",
@@ -207,6 +225,20 @@ class OmniRouteHttpTransport:
 LABELING_SYSTEM_PROMPT = (
     "Classify the supplied company and aspect from only the supplied financial "
     "passage. Use one label: positive, neutral, negative, or insufficient "
+    "evidence. Return only a JSON object with one label field. Do not add an "
+    "explanation."
+)
+
+
+GPT_BLIND_SYSTEM_PROMPT = (
+    "Classify the supplied company and aspect from only the supplied financial "
+    "passage. Use the evidence about the supplied company. Use the most specific "
+    "aspect that the evidence supports and do not copy one claim to another "
+    "aspect. Treat a clearly attributed claim as evidence, but do not change its "
+    "weight for the role of the speaker. An explicit statement of no material "
+    "effect supports neutral for that aspect. Use insufficient evidence when the "
+    "evidence is absent, unclear, about another aspect, or conflicting without a "
+    "resolution. Use one label: positive, neutral, negative, or insufficient "
     "evidence. Return only a JSON object with one label field. Do not add an "
     "explanation."
 )
@@ -1208,6 +1240,140 @@ def _vote_request(
     }
 
 
+def _gpt_prompt(candidate: Mapping[str, object]) -> list[dict[str, str]]:
+    """Build the one zero-shot GPT prompt. It carries no blind label."""
+    user_prompt = _canonical_json(
+        {
+            "passage": candidate["normalized_passage"],
+            "company": candidate["company_id"],
+            "aspect": candidate["aspect"],
+        }
+    )
+    return [
+        {"role": "system", "content": GPT_BLIND_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def _gpt_request(candidate: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "model": GPT_ROUTE_ID,
+        "messages": _gpt_prompt(candidate),
+        "stream": False,
+        "reasoning_effort": GPT_REASONING_EFFORT,
+        "max_tokens": GPT_MAX_OUTPUT_TOKENS,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "gpt_blind_prediction",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {"label": {"enum": list(RESULT_LABELS)}},
+                    "required": ["label"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "user": candidate["candidate_id"],
+    }
+
+
+def _is_label_free_prompt(request: Mapping[str, object]) -> bool:
+    """Report a prompt that holds only the passage, company, and aspect."""
+    messages = request.get("messages")
+    if not isinstance(messages, list) or len(messages) != 2:
+        return False
+    try:
+        user_content = json.loads(str(cast(Mapping[str, object], messages[1])["content"]))
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return False
+    return set(user_content) == {"passage", "company", "aspect"}
+
+
+def _software_versions() -> dict[str, str]:
+    try:
+        package_version = metadata_version("nlp-wayfinder")
+    except PackageNotFoundError:
+        package_version = "unpackaged"
+    return {
+        "python": sys.version.split()[0],
+        "nlp-wayfinder": package_version,
+    }
+
+
+def _gpt_error_response(reason: str, error: BaseException) -> OmniRouteResponse:
+    return OmniRouteResponse(
+        status_code=0,
+        headers={},
+        body={"error": {"type": reason, "message": str(error)}},
+    )
+
+
+def _decimal_rate(value: object) -> Decimal:
+    rate = Decimal(str(value))
+    if not rate.is_finite() or rate < 0:
+        raise ValueError("The token price must be zero or more.")
+    return rate
+
+
+def project_gpt_blind_cost(
+    forecast: Mapping[str, object],
+    *,
+    remaining_usd: Decimal = BUDGET_LIMITS["gpt"],
+) -> dict[str, object]:
+    """Project all first attempts and the declared reserve from non-blind text."""
+
+    def stop(reason: str) -> dict[str, object]:
+        return {
+            "forecast": "stopped",
+            "stop_reason": reason,
+            "first_attempts": GPT_BLIND_FIRST_ATTEMPTS,
+            "reserve_attempts": None,
+            "projected_usd": None,
+            "remaining_usd": _usd(remaining_usd),
+        }
+
+    if any(field not in forecast for field in GPT_FORECAST_FIELDS):
+        return stop("gpt-forecast-incomplete")
+    if forecast["measured_split"] not in ("training", "development"):
+        return stop("gpt-forecast-blind-exposure")
+    measured_ids = forecast["measured_candidate_ids"]
+    if not isinstance(measured_ids, list) or not measured_ids:
+        return stop("gpt-forecast-incomplete")
+    try:
+        prompt_tokens = int(cast(int, forecast["prompt_tokens_per_example"]))
+        completion_tokens = int(cast(int, forecast["completion_tokens_per_example"]))
+        reserve = int(cast(int, forecast["charged_retry_reserve_attempts"]))
+        prompt_rate = _decimal_rate(forecast["prompt_usd_per_1k_tokens"])
+        completion_rate = _decimal_rate(forecast["completion_usd_per_1k_tokens"])
+    except (InvalidOperation, TypeError, ValueError):
+        return stop("gpt-forecast-incomplete")
+    if prompt_tokens <= 0 or completion_tokens <= 0 or reserve < 0:
+        return stop("gpt-forecast-incomplete")
+
+    attempts = GPT_BLIND_FIRST_ATTEMPTS + reserve
+    per_attempt = (
+        prompt_tokens * prompt_rate + completion_tokens * completion_rate
+    ) / 1000
+    projected = (per_attempt * attempts).quantize(
+        Decimal("0.01"), rounding=ROUND_CEILING
+    )
+    result: dict[str, object] = {
+        "forecast": "within-budget",
+        "stop_reason": None,
+        "first_attempts": GPT_BLIND_FIRST_ATTEMPTS,
+        "reserve_attempts": reserve,
+        "projected_usd": _usd(projected),
+        "remaining_usd": _usd(remaining_usd),
+        "measured_split": forecast["measured_split"],
+        "measured_example_count": len(measured_ids),
+    }
+    if projected > remaining_usd:
+        return {**stop("gpt-budget-exceeded"), "projected_usd": _usd(projected)}
+    return result
+
+
 def _response_message(response: OmniRouteResponse) -> Mapping[str, object] | None:
     choices = response.body.get("choices")
     if not isinstance(choices, list) or len(choices) != 1:
@@ -1443,6 +1609,7 @@ class StageRun:
         self.silver_aggregation_log_path = (
             self.state_dir / "silver-aggregation-log.jsonl"
         )
+        self.gpt_blind_log_path = self.state_dir / "gpt-blind-log.jsonl"
         self._spend_ledger = _AppendOnlyJsonl(self.spend_ledger_path, clock)
         self._decision_log = _AppendOnlyJsonl(self.decision_log_path, clock)
         self._candidate_inspection_log = _AppendOnlyJsonl(
@@ -1455,6 +1622,7 @@ class StageRun:
         self._silver_aggregation_log = _AppendOnlyJsonl(
             self.silver_aggregation_log_path, clock
         )
+        self._gpt_blind_log = _AppendOnlyJsonl(self.gpt_blind_log_path, clock)
 
     def cost_records(self) -> list[dict[str, Any]]:
         return self._spend_ledger.read()
@@ -1473,6 +1641,9 @@ class StageRun:
 
     def silver_aggregation_records(self) -> list[dict[str, Any]]:
         return self._silver_aggregation_log.read()
+
+    def gpt_blind_records(self) -> list[dict[str, Any]]:
+        return self._gpt_blind_log.read()
 
     def _collection_stop(
         self, reason: str, route_ids: Sequence[str]
@@ -1935,6 +2106,260 @@ class StageRun:
             _canonical_json(result).encode("utf-8")
         ).hexdigest()
         return result
+
+    def _gpt_stop(self, reason: str) -> dict[str, object]:
+        return {
+            "gpt_predictions": "invalid",
+            "stop_reason": reason,
+            "route_id": GPT_ROUTE_ID,
+            "prediction_count": 0,
+            "predictions": [],
+        }
+
+    def predict_blind_gpt(
+        self,
+        stage_manifest: Mapping[str, object],
+        candidate_manifest: Mapping[str, object],
+        allocation: Mapping[str, object],
+        transport: VoteTransport,
+        *,
+        forecast: Mapping[str, object],
+        timeout_seconds: float = 120,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> dict[str, object]:
+        """Produce one sealed GPT-5.6-sol prediction file for the blind set."""
+        decision = self.evaluate(stage_manifest)
+        if decision["decision"] != "build-eligible":
+            return self._gpt_stop(str(decision["stop_reason"]))
+        if not _is_valid_sealed_candidate_manifest(candidate_manifest):
+            return self._gpt_stop("unsealed-annex")
+        seal = candidate_manifest["seal"]
+        assert isinstance(seal, Mapping)
+        candidate_manifest_sha256 = str(seal["semantic_sha256"])
+        if (
+            allocation.get("allocation") != "complete"
+            or allocation.get("candidate_manifest_sha256") != candidate_manifest_sha256
+        ):
+            return self._gpt_stop("allocation-not-complete")
+
+        records = self.gpt_blind_records()
+        # A sealed file serves each later regression test. Do not call GPT again.
+        sealed = [
+            record
+            for record in records
+            if record.get("event") == "gpt-blind-predictions-sealed"
+        ]
+        if sealed:
+            prior = cast(dict[str, object], sealed[0]["prediction_file"])
+            if prior.get("candidate_manifest_sha256") != candidate_manifest_sha256:
+                return self._gpt_stop("frozen-gpt-run-changed")
+            return prior
+
+        projection = project_gpt_blind_cost(
+            forecast,
+            remaining_usd=BUDGET_LIMITS["gpt"] - self.budget_exposure()["gpt"],
+        )
+        if projection["forecast"] != "within-budget":
+            return self._gpt_stop(str(projection["stop_reason"]))
+
+        blind = allocation.get("blind")
+        if not isinstance(blind, list) or not blind:
+            return self._gpt_stop("allocation-not-complete")
+        candidates_value = candidate_manifest["candidates"]
+        assert isinstance(candidates_value, list)
+        candidate_by_id = {
+            str(candidate["candidate_id"]): candidate
+            for candidate in candidates_value
+            if isinstance(candidate, Mapping)
+        }
+        scheduled: list[Mapping[str, object]] = []
+        for item in blind:
+            candidate_id = item.get("candidate_id") if isinstance(item, Mapping) else None
+            candidate = candidate_by_id.get(str(candidate_id))
+            if candidate is None or candidate.get("split") != "blind":
+                return self._gpt_stop("gpt-candidate-invalid")
+            if any(field in candidate for field in BLIND_LABEL_FIELDS):
+                return self._gpt_stop("blind-label-exposed")
+            scheduled.append(candidate)
+
+        freeze = {
+            "event": "gpt-blind-run-frozen",
+            "run_id": stage_manifest["run_id"],
+            "stage_manifest_sha256": semantic_manifest_sha256(stage_manifest),
+            "candidate_manifest_sha256": candidate_manifest_sha256,
+            "route_id": GPT_ROUTE_ID,
+            "reasoning_effort": GPT_REASONING_EFFORT,
+            "prompt_sha256": hashlib.sha256(
+                GPT_BLIND_SYSTEM_PROMPT.encode("utf-8")
+            ).hexdigest(),
+            "request_template_sha256": hashlib.sha256(
+                _canonical_json(
+                    _gpt_request(
+                        {
+                            "candidate_id": "",
+                            "normalized_passage": "",
+                            "company_id": "",
+                            "aspect": "",
+                        }
+                    )
+                ).encode("utf-8")
+            ).hexdigest(),
+            "max_attempts": GPT_MAX_ATTEMPTS,
+            "retry_delays_seconds": list(GPT_RETRY_DELAYS_SECONDS),
+            "timeout_seconds": timeout_seconds,
+            "projected_usd": projection["projected_usd"],
+            "reserve_attempts": projection["reserve_attempts"],
+        }
+        freeze_records = [
+            record for record in records if record.get("event") == "gpt-blind-run-frozen"
+        ]
+        if freeze_records:
+            if any(freeze_records[0].get(field) != freeze[field] for field in freeze):
+                return self._gpt_stop("frozen-gpt-run-changed")
+        else:
+            self._gpt_blind_log.append(freeze)
+
+        predictions: list[dict[str, object]] = []
+        for candidate in scheduled:
+            request = _gpt_request(candidate)
+            if not _is_label_free_prompt(request):
+                return self._gpt_stop("blind-label-exposed")
+            label: str | None = None
+            for attempt in range(1, GPT_MAX_ATTEMPTS + 1):
+                if attempt > 1:
+                    sleep(GPT_RETRY_DELAYS_SECONDS[attempt - 2])
+                started_at = self._clock()
+                retry_reason: str | None = None
+                try:
+                    response = transport.complete(request, timeout_seconds)
+                except TimeoutError as error:
+                    retry_reason = "timeout"
+                    response = _gpt_error_response(retry_reason, error)
+                except OSError as error:
+                    retry_reason = "connection-error"
+                    response = _gpt_error_response(retry_reason, error)
+                completed_at = self._clock()
+                headers = {
+                    key.lower(): value for key, value in response.headers.items()
+                }
+                returned_provider = headers.get("x-omniroute-provider")
+                returned_model = headers.get("x-omniroute-model")
+                returned_route_id = (
+                    f"{returned_provider}/{returned_model}"
+                    if returned_provider and returned_model
+                    else None
+                )
+                fallback_attempts = _int_header(
+                    headers, "x-omniroute-fallback-attempts"
+                )
+                if retry_reason is None and response.status_code == 429:
+                    retry_reason = "http-429"
+                elif retry_reason is None and 500 <= response.status_code <= 599:
+                    retry_reason = "http-5xx"
+                outcome = "valid"
+                failure_reason: str | None = None
+                if retry_reason is not None:
+                    outcome, failure_reason = "transport-failure", retry_reason
+                elif response.status_code != 200:
+                    outcome, failure_reason = "invalid", "transport-error"
+                elif (
+                    returned_route_id != GPT_ROUTE_ID
+                    or fallback_attempts != 0
+                    or "strategy=single"
+                    not in str(headers.get("x-omniroute-decision", ""))
+                    or str(headers.get("x-omniroute-cache-hit", "")).lower() == "true"
+                ):
+                    outcome, failure_reason = "invalid", "route-mismatch"
+                elif _response_is_refusal(response):
+                    outcome, failure_reason = "invalid", "refusal"
+                else:
+                    label = _response_label(response)
+                    if label is None:
+                        outcome, failure_reason = "invalid", "malformed-answer"
+                usage = response.body.get("usage")
+                if not isinstance(usage, Mapping):
+                    usage = {}
+                self._gpt_blind_log.append(
+                    {
+                        "event": "gpt-blind-attempt",
+                        "candidate_id": candidate["candidate_id"],
+                        "attempt": attempt,
+                        "status_code": response.status_code,
+                        "returned_route_id": returned_route_id,
+                        "outcome": outcome,
+                        "failure_reason": failure_reason,
+                        "label": label if outcome == "valid" else None,
+                        "request_sha256": hashlib.sha256(
+                            _canonical_json(request).encode("utf-8")
+                        ).hexdigest(),
+                        "response_sha256": hashlib.sha256(
+                            _canonical_json(response.body).encode("utf-8")
+                        ).hexdigest(),
+                        "token_use": {
+                            "prompt_tokens": usage.get("prompt_tokens"),
+                            "completion_tokens": usage.get("completion_tokens"),
+                            "total_tokens": usage.get("total_tokens"),
+                        },
+                        "cost": {
+                            "response_cost_usd": headers.get(
+                                "x-omniroute-response-cost"
+                            ),
+                        },
+                        "time": {
+                            "started_at": started_at,
+                            "completed_at": completed_at,
+                        },
+                        "transport": {
+                            "request_id": headers.get("x-omniroute-request-id"),
+                            "omniroute_version": headers.get("x-omniroute-version"),
+                            "decision": headers.get("x-omniroute-decision"),
+                            "fallback_attempts": fallback_attempts,
+                        },
+                    }
+                )
+                if outcome == "valid":
+                    predictions.append(
+                        {
+                            "candidate_id": candidate["candidate_id"],
+                            "label": label,
+                            "attempt_count": attempt,
+                            "returned_route_id": returned_route_id,
+                        }
+                    )
+                    break
+                # A refusal or malformed answer has no repair and no retry.
+                if outcome == "invalid":
+                    return self._gpt_stop(str(failure_reason))
+            else:
+                return self._gpt_stop("gpt-transport-failed")
+
+        if len(predictions) != len(scheduled):
+            return self._gpt_stop("missing-prediction")
+
+        prediction_file: dict[str, object] = {
+            "gpt_predictions": "sealed",
+            "stop_reason": None,
+            "route_id": GPT_ROUTE_ID,
+            "reasoning_effort": GPT_REASONING_EFFORT,
+            "candidate_manifest_sha256": candidate_manifest_sha256,
+            "prompt_sha256": freeze["prompt_sha256"],
+            "request_template_sha256": freeze["request_template_sha256"],
+            "projection": projection,
+            "software_versions": _software_versions(),
+            "prediction_count": len(predictions),
+            "predictions": predictions,
+        }
+        prediction_file["prediction_file_sha256"] = hashlib.sha256(
+            _canonical_json(prediction_file).encode("utf-8")
+        ).hexdigest()
+        self._gpt_blind_log.append(
+            {
+                "event": "gpt-blind-predictions-sealed",
+                "run_id": stage_manifest["run_id"],
+                "prediction_file": prediction_file,
+            }
+        )
+        return prediction_file
 
     def inspect_candidate(
         self,
@@ -2476,6 +2901,21 @@ def main(argv: list[str] | None = None) -> int:
     aggregate.add_argument("--output", required=True)
     aggregate.add_argument("--state-dir", required=True)
 
+    gpt = commands.add_parser(
+        "predict-blind-gpt", help="Seal the GPT blind prediction file."
+    )
+    gpt.add_argument("stage_manifest")
+    gpt.add_argument("candidate_manifest")
+    gpt.add_argument("allocation")
+    gpt.add_argument("forecast")
+    gpt.add_argument("--output", required=True)
+    gpt.add_argument("--state-dir", required=True)
+    gpt.add_argument(
+        "--base-url",
+        default=os.environ.get("OMNIROUTE_BASE_URL", "http://127.0.0.1:20128"),
+    )
+    gpt.add_argument("--timeout-seconds", type=float, default=120)
+
     args = parser.parse_args(argv)
     try:
         if args.command == "admit-example":
@@ -2529,6 +2969,37 @@ def main(argv: list[str] | None = None) -> int:
             )
             _write_json(result)
             return 0 if result["collection"] == "complete" else 2
+        if args.command == "predict-blind-gpt":
+            if args.timeout_seconds <= 0:
+                raise ValueError("The timeout must be more than zero.")
+            predictions = StageRun(args.state_dir).predict_blind_gpt(
+                _read_manifest(args.stage_manifest),
+                _read_manifest(args.candidate_manifest),
+                _read_manifest(args.allocation),
+                OmniRouteHttpTransport(
+                    args.base_url,
+                    api_key=os.environ.get("OMNIROUTE_API_KEY"),
+                ),
+                forecast=_read_manifest(args.forecast),
+                timeout_seconds=args.timeout_seconds,
+            )
+            complete = predictions["gpt_predictions"] == "sealed"
+            if complete:
+                output_path = Path(args.output)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(
+                    json.dumps(predictions, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+            _write_json(
+                {
+                    "gpt_prediction_file": args.output if complete else None,
+                    "gpt_predictions": predictions["gpt_predictions"],
+                    "stop_reason": predictions["stop_reason"],
+                    "prediction_count": predictions["prediction_count"],
+                }
+            )
+            return 0 if complete else 2
         if args.command == "aggregate-silver":
             aggregated = StageRun(args.state_dir).aggregate_silver_labels(
                 _read_manifest(args.stage_manifest),

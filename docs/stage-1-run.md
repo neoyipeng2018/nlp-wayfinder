@@ -238,6 +238,51 @@ The operation seals the fit and the posterior artifacts in
 returns `frozen-aggregation-changed`. The result contains the accepted silver
 labels, the rejection counts, the artifact hashes, and its own SHA-256 hash.
 
+Seal the GPT blind prediction file for the source:
+
+```sh
+python3 -m nlp_wayfinder.stage_run predict-blind-gpt \
+  confirmed.json sealed-candidates.json stage-1-allocation.json \
+  gpt-forecast.json --state-dir .wayfinder-state \
+  --output gpt-blind-predictions.json
+```
+
+The forecast file is the non-blind token check. It must contain
+`measured_split`, which is `training` or `development`, `measured_candidate_ids`,
+`prompt_tokens_per_example`, `completion_tokens_per_example`,
+`prompt_usd_per_1k_tokens`, `completion_usd_per_1k_tokens`, and
+`charged_retry_reserve_attempts`. The operation projects the 2,000 first attempts
+of the complete plan and the declared reserve against the unspent part of the USD
+25 GPT allocation. It stops with `gpt-forecast-blind-exposure`,
+`gpt-forecast-incomplete`, or `gpt-budget-exceeded` before it makes a call.
+Record the GPT cost commitment with `record-cost` before you start the run.
+
+The operation applies the staged feasibility gate. It then freezes the route
+`cx/gpt-5.6-sol-medium`, medium reasoning effort, one zero-shot prompt, the
+strict four-label JSON schema, the attempt limit, and the fixed delays in
+`gpt-blind-log.jsonl`. A later change returns `frozen-gpt-run-changed`.
+
+Each blind example gets one request. The request contains only the passage, the
+company, and the aspect. A candidate manifest that carries a label stops the run
+with `blind-label-exposed`.
+
+A timeout, a connection error, HTTP 429, or HTTP 5xx gets up to three total
+identical attempts. The delays are 5 seconds and 20 seconds. A refusal or a
+malformed answer gets no retry, no repair, and no replacement. Three failed
+transport attempts, a refusal, a malformed answer, a route mismatch, or a missing
+prediction makes the source run invalid. The operation writes one append-only
+record for each attempt.
+
+The operation also stops with `unsealed-annex`, `allocation-not-complete`, and
+`gpt-candidate-invalid` for an example that is not in the candidate manifest or
+is not in the blind split. `missing-prediction` stops a run that does not have one
+label for each scheduled example.
+
+A complete run writes one sealed prediction file with its own SHA-256 hash, the
+sealed software versions, and the projection. A later regression comparison reads
+the sealed file from the log. It does not make a new GPT call. A sealed file for a
+different candidate manifest returns `frozen-gpt-run-changed`.
+
 Record a cost commitment before the related action. Record the actual cost after
 the action:
 
