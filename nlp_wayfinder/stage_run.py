@@ -1,4 +1,4 @@
-"""Safe Stage 1 feasibility gate and append-only audit records."""
+"""Safe staged feasibility gate and append-only audit records."""
 
 from __future__ import annotations
 
@@ -74,10 +74,21 @@ EXAMPLE_CONSUMERS = (
 )
 CANDIDATE_ORDER_SALT = "20260905"
 CANDIDATE_SPLITS = ("training", "development", "blind")
-STAGE_1_ALLOCATION_TARGETS = {
-    "training": 4_000,
-    "development": 200,
-    "blind": 400,
+STAGE_SOURCES = {
+    1: ("financial-news",),
+    2: ("company-announcements", "regulatory-filings"),
+}
+# Stage 1 collects 4,000 silver examples. Each later source adds 2,000. The
+# total silver-candidate inspection limit of 20,000 divides in the same ratio.
+SOURCE_ALLOCATION_TARGETS = {
+    "financial-news": {"training": 4_000, "development": 200, "blind": 400},
+    "company-announcements": {"training": 2_000, "development": 200, "blind": 400},
+    "regulatory-filings": {"training": 2_000, "development": 200, "blind": 400},
+}
+SOURCE_SILVER_CANDIDATE_LIMITS = {
+    "financial-news": 6_668,
+    "company-announcements": 3_333,
+    "regulatory-filings": 3_333,
 }
 BLIND_CELL_TARGET = 25
 BLIND_RELABEL_SEED = "20260905"
@@ -379,6 +390,79 @@ def confirm_manifest(
     return confirmed
 
 
+def _prediction_file_stage(record: Mapping[str, object]) -> int:
+    """Give the stage of one sealed prediction file. Stage 1 wrote no stage."""
+    prediction_file = record.get("prediction_file")
+    if not isinstance(prediction_file, Mapping):
+        return 0
+    return int(cast(int, prediction_file.get("stage", 1)))
+
+
+def _prediction_file_sha256s(prediction_file: Mapping[str, object]) -> list[str]:
+    """Give the candidate manifests of one sealed file, earlier form included."""
+    sha256s = prediction_file.get("candidate_manifest_sha256s")
+    if isinstance(sha256s, list):
+        return [str(value) for value in sha256s]
+    return [str(prediction_file["candidate_manifest_sha256"])]
+
+
+def record_source(record: Mapping[str, object]) -> str:
+    """Give the source of one audit record.
+
+    A record from before the Stage 2 control has no `source` field. Only Stage 1
+    could write it, and Stage 1 has one source.
+    """
+    return str(record.get("source", STAGE_SOURCES[1][0]))
+
+
+def read_source_bundles(
+    sources: Sequence[Mapping[str, object]], stage: int
+) -> tuple[list[str], dict[str, Mapping[str, object]], dict[str, str]] | str:
+    """Order the cumulative source bundles of one stage, or give one stop reason.
+
+    Each bundle holds the sealed `candidate_manifest` and the complete
+    `allocation` of one source.
+    """
+    bundles: dict[str, Mapping[str, object]] = {}
+    sha256_by_source: dict[str, str] = {}
+    for bundle in sources:
+        candidate_manifest = bundle.get("candidate_manifest")
+        if not isinstance(
+            candidate_manifest, Mapping
+        ) or not _is_valid_sealed_candidate_manifest(candidate_manifest):
+            return "unsealed-annex"
+        source = str(candidate_manifest["source"])
+        if source in bundles:
+            return "cumulative-sources-incomplete"
+        seal = candidate_manifest["seal"]
+        assert isinstance(seal, Mapping)
+        bundles[source] = bundle
+        sha256_by_source[source] = str(seal["semantic_sha256"])
+    ordered = list(cumulative_sources(stage))
+    if sorted(bundles) != sorted(ordered):
+        return "cumulative-sources-incomplete"
+    for source in ordered:
+        allocation = bundles[source].get("allocation")
+        if (
+            not isinstance(allocation, Mapping)
+            or allocation.get("allocation") != "complete"
+            or allocation.get("candidate_manifest_sha256")
+            != sha256_by_source[source]
+        ):
+            return "allocation-not-complete"
+    return ordered, bundles, sha256_by_source
+
+
+def cumulative_sources(stage: int) -> tuple[str, ...]:
+    """Give every source of this stage and of each earlier stage."""
+    return tuple(
+        source
+        for earlier in sorted(STAGE_SOURCES)
+        if earlier <= stage
+        for source in STAGE_SOURCES[earlier]
+    )
+
+
 def candidate_order_sha256(
     stage: int,
     source: str,
@@ -453,7 +537,7 @@ def seal_candidate_manifest(
     *,
     sealed_at: str | None = None,
 ) -> dict[str, object]:
-    """Validate, order, and seal one Stage 1 candidate manifest."""
+    """Validate, order, and seal one staged source candidate manifest."""
     if not sealed_by.strip():
         raise ValueError("The sealed-by value must contain text.")
     sealed = copy.deepcopy(dict(manifest))
@@ -462,12 +546,13 @@ def seal_candidate_manifest(
     candidates = sealed.get("candidates")
     if (
         sealed.get("schema_version") != 1
-        or stage != 1
-        or source != "financial-news"
+        or stage not in STAGE_SOURCES
+        or source not in STAGE_SOURCES[stage]
         or not isinstance(candidates, list)
         or not candidates
     ):
-        raise ValueError("The candidate manifest is not valid for Stage 1.")
+        raise ValueError("The candidate manifest is not valid for a staged source.")
+    source = str(source)
     annex = sealed.get("annex")
     if not isinstance(annex, Mapping) or any(
         field not in annex for field in SOURCE_ANNEX_FIELDS
@@ -494,10 +579,11 @@ def seal_candidate_manifest(
         "limits",
         ("silver_candidate_limit", "development_target", "blind_target"),
     )
+    targets = SOURCE_ALLOCATION_TARGETS[source]
     if (
-        limits["silver_candidate_limit"] != 6_668
-        or limits["development_target"] != 200
-        or limits["blind_target"] != 400
+        limits["silver_candidate_limit"] != SOURCE_SILVER_CANDIDATE_LIMITS[source]
+        or limits["development_target"] != targets["development"]
+        or limits["blind_target"] != targets["blind"]
     ):
         raise ValueError("source-annex-incomplete")
     software_versions = annex.get("software_versions")
@@ -885,12 +971,12 @@ def _select_balanced_blind(
     return first_candidates, reason
 
 
-def allocate_stage_1(
+def allocate_source(
     manifest: Mapping[str, object],
     reviews: Sequence[Mapping[str, object]],
     inspection_records: Sequence[Mapping[str, object]],
 ) -> dict[str, object]:
-    """Select the complete deterministic Stage 1 data allocation."""
+    """Select the complete deterministic allocation of one staged source."""
     if not _is_valid_sealed_candidate_manifest(manifest):
         return _allocation_stop("unsealed-annex")
     candidates_value = manifest.get("candidates")
@@ -899,6 +985,8 @@ def allocate_stage_1(
     assert isinstance(annex, Mapping)
     limits = annex.get("limits")
     assert isinstance(limits, Mapping)
+    source = str(manifest["source"])
+    targets = SOURCE_ALLOCATION_TARGETS[source]
 
     candidates: list[Mapping[str, object]] = []
     candidate_by_id: dict[str, Mapping[str, object]] = {}
@@ -970,7 +1058,7 @@ def allocate_stage_1(
         review_by_id,
         inspected_ids,
         "training",
-        STAGE_1_ALLOCATION_TARGETS["training"],
+        targets["training"],
     )
     silver_limit = int(limits["silver_candidate_limit"])
     if silver_inspected > silver_limit:
@@ -979,7 +1067,7 @@ def allocate_stage_1(
             inspected_silver=silver_inspected,
             selected=selected,
         )
-    if len(selected["training"]) < STAGE_1_ALLOCATION_TARGETS["training"]:
+    if len(selected["training"]) < targets["training"]:
         reason = (
             "silver-candidate-limit-exhausted"
             if silver_inspected == silver_limit
@@ -994,9 +1082,9 @@ def allocate_stage_1(
         review_by_id,
         inspected_ids,
         "development",
-        STAGE_1_ALLOCATION_TARGETS["development"],
+        targets["development"],
     )
-    if len(selected["development"]) < STAGE_1_ALLOCATION_TARGETS["development"]:
+    if len(selected["development"]) < targets["development"]:
         return _allocation_stop(
             "development-quota-unfilled",
             inspected_silver=silver_inspected,
@@ -1028,6 +1116,8 @@ def allocate_stage_1(
     result: dict[str, object] = {
         "allocation": "complete",
         "stop_reason": None,
+        "stage": manifest["stage"],
+        "source": source,
         "candidate_manifest_sha256": manifest["seal"]["semantic_sha256"],  # type: ignore[index]
         "silver_candidates_inspected": silver_inspected,
         "silver_candidate_limit": silver_limit,
@@ -1979,7 +2069,7 @@ def _dawid_skene_posterior(
 
 
 class StageRun:
-    """Evaluate Stage 1 gates and own its append-only audit logs."""
+    """Evaluate the staged gates and own the append-only audit logs."""
 
     def __init__(
         self,
@@ -2235,9 +2325,11 @@ class StageRun:
         route_ids_value = route_evidence["eligible_route_ids"]
         assert isinstance(route_ids_value, list)
         route_ids = [str(route_id) for route_id in route_ids_value]
+        source = str(candidate_manifest["source"])
         freeze = {
             "event": "vote-collection-frozen",
             "run_id": stage_manifest["run_id"],
+            "source": source,
             "stage_manifest_sha256": semantic_manifest_sha256(stage_manifest),
             "candidate_manifest_sha256": candidate_manifest_sha256,
             "route_ids": sorted(route_ids),
@@ -2259,6 +2351,7 @@ class StageRun:
             record
             for record in self.vote_collection_records()
             if record.get("event") == "vote-collection-frozen"
+            and record_source(record) == source
         ]
         if freeze_records:
             prior = freeze_records[0]
@@ -2493,9 +2586,11 @@ class StageRun:
                 }
             )
 
+        source = str(candidate_manifest["source"])
         fit_artifact: dict[str, object] = {
             "event": "silver-fit-sealed",
             "run_id": stage_manifest["run_id"],
+            "source": source,
             "stage_manifest_sha256": semantic_manifest_sha256(stage_manifest),
             "candidate_manifest_sha256": candidate_manifest_sha256,
             "crowd_kit_version": CROWD_KIT_VERSION,
@@ -2513,6 +2608,7 @@ class StageRun:
         }
         posterior_artifact: dict[str, object] = {
             "event": "silver-posteriors-sealed",
+            "source": source,
             "candidate_manifest_sha256": candidate_manifest_sha256,
             "development_out_of_fold": out_of_fold,
             "training_posteriors": posterior_records,
@@ -2522,7 +2618,10 @@ class StageRun:
         unsealed: list[dict[str, object]] = []
         for artifact in artifacts:
             prior_records = [
-                record for record in sealed if record.get("event") == artifact["event"]
+                record
+                for record in sealed
+                if record.get("event") == artifact["event"]
+                and record_source(record) == source
             ]
             if not prior_records:
                 unsealed.append(artifact)
@@ -2538,6 +2637,7 @@ class StageRun:
         result: dict[str, object] = {
             "aggregation": "complete",
             "stop_reason": None,
+            "source": source,
             "candidate_manifest_sha256": candidate_manifest_sha256,
             "accepted_silver_count": len(accepted),
             "rejected_counts": dict(sorted(rejected_counts.items())),
@@ -2590,12 +2690,14 @@ class StageRun:
         ):
             return self._gpt_stop("allocation-not-complete")
 
+        source = str(candidate_manifest["source"])
         records = self.gpt_blind_records()
         # A sealed file serves each later regression test. Do not call GPT again.
         sealed = [
             record
             for record in records
             if record.get("event") == "gpt-blind-predictions-sealed"
+            and record_source(record) == source
         ]
         if sealed:
             prior = cast(dict[str, object], sealed[0]["prediction_file"])
@@ -2633,6 +2735,7 @@ class StageRun:
         freeze = {
             "event": "gpt-blind-run-frozen",
             "run_id": stage_manifest["run_id"],
+            "source": source,
             "stage_manifest_sha256": semantic_manifest_sha256(stage_manifest),
             "candidate_manifest_sha256": candidate_manifest_sha256,
             "route_id": GPT_ROUTE_ID,
@@ -2659,7 +2762,10 @@ class StageRun:
             "reserve_attempts": projection["reserve_attempts"],
         }
         freeze_records = [
-            record for record in records if record.get("event") == "gpt-blind-run-frozen"
+            record
+            for record in records
+            if record.get("event") == "gpt-blind-run-frozen"
+            and record_source(record) == source
         ]
         if freeze_records:
             if any(freeze_records[0].get(field) != freeze[field] for field in freeze):
@@ -2733,6 +2839,7 @@ class StageRun:
                 self._gpt_blind_log.append(
                     {
                         "event": "gpt-blind-attempt",
+                        "source": source,
                         "candidate_id": candidate["candidate_id"],
                         "attempt": attempt,
                         "status_code": response.status_code,
@@ -2792,6 +2899,7 @@ class StageRun:
         prediction_file: dict[str, object] = {
             "gpt_predictions": "sealed",
             "stop_reason": None,
+            "source": source,
             "route_id": GPT_ROUTE_ID,
             "reasoning_effort": GPT_REASONING_EFFORT,
             "candidate_manifest_sha256": candidate_manifest_sha256,
@@ -2809,6 +2917,7 @@ class StageRun:
             {
                 "event": "gpt-blind-predictions-sealed",
                 "run_id": stage_manifest["run_id"],
+                "source": source,
                 "prediction_file": prediction_file,
             }
         )
@@ -2827,27 +2936,29 @@ class StageRun:
     def train_specialist(
         self,
         stage_manifest: Mapping[str, object],
-        candidate_manifest: Mapping[str, object],
-        allocation: Mapping[str, object],
-        aggregation: Mapping[str, object],
+        sources: Sequence[Mapping[str, object]],
         backend: TrainingBackend,
         *,
         device_checks: Mapping[str, object],
     ) -> dict[str, object]:
-        """Train the pinned specialist and seal its local blind prediction file."""
+        """Train one cumulative specialist and seal its local blind file.
+
+        Each item of `sources` holds the sealed `candidate_manifest`, the
+        complete `allocation`, and the complete `aggregation` of one source.
+        The stage trains one checkpoint on all of them together.
+        """
         decision = self.evaluate(stage_manifest)
         if decision["decision"] != "build-eligible":
             return self._specialist_stop(str(decision["stop_reason"]))
-        if not _is_valid_sealed_candidate_manifest(candidate_manifest):
-            return self._specialist_stop("unsealed-annex")
-        seal = candidate_manifest["seal"]
-        assert isinstance(seal, Mapping)
-        candidate_manifest_sha256 = str(seal["semantic_sha256"])
-        if (
-            allocation.get("allocation") != "complete"
-            or allocation.get("candidate_manifest_sha256") != candidate_manifest_sha256
-        ):
-            return self._specialist_stop("allocation-not-complete")
+        stage = cast(int, stage_manifest["stage"])
+
+        read = read_source_bundles(sources, stage)
+        if isinstance(read, str):
+            return self._specialist_stop(read)
+        ordered_sources, bundles, manifest_sha256_by_source = read
+        manifest_sha256s = [
+            manifest_sha256_by_source[source] for source in ordered_sources
+        ]
 
         records = self.specialist_records()
         # A sealed file serves each later regression test. Do not train again.
@@ -2855,27 +2966,42 @@ class StageRun:
             record
             for record in records
             if record.get("event") == "specialist-predictions-sealed"
+            and _prediction_file_stage(record) == stage
         ]
         if sealed:
             prior = cast(dict[str, object], sealed[0]["prediction_file"])
-            if prior.get("candidate_manifest_sha256") != candidate_manifest_sha256:
+            if _prediction_file_sha256s(prior) != manifest_sha256s:
                 return self._specialist_stop("frozen-specialist-run-changed")
             return prior
 
-        if (
-            aggregation.get("aggregation") != "complete"
-            or aggregation.get("candidate_manifest_sha256") != candidate_manifest_sha256
-        ):
-            return self._specialist_stop("silver-labels-not-accepted")
-        accepted_silver = aggregation.get("accepted_silver")
-        if not isinstance(accepted_silver, list) or not accepted_silver:
-            return self._specialist_stop("silver-labels-not-accepted")
+        silver_labels: dict[str, str] = {}
+        for source in ordered_sources:
+            aggregation = bundles[source].get("aggregation")
+            if (
+                not isinstance(aggregation, Mapping)
+                or aggregation.get("aggregation") != "complete"
+                or aggregation.get("candidate_manifest_sha256")
+                != manifest_sha256_by_source[source]
+            ):
+                return self._specialist_stop("silver-labels-not-accepted")
+            accepted_silver = aggregation.get("accepted_silver")
+            if not isinstance(accepted_silver, list) or not accepted_silver:
+                return self._specialist_stop("silver-labels-not-accepted")
+            for item in accepted_silver:
+                if (
+                    not isinstance(item, Mapping)
+                    or item.get("label") not in RESULT_LABELS
+                ):
+                    return self._specialist_stop("silver-labels-not-accepted")
+                silver_labels[str(item["candidate_id"])] = str(item["label"])
+
         # GPT supplies no training, development, calibration, or selection input.
-        if any(
-            _contains_gpt_artifact(value)
-            # The stage manifest is not in this list. Its budget has one
-            # permitted `gpt` category for the separate blind comparison.
-            for value in (aggregation, allocation, device_checks, candidate_manifest)
+        # The stage manifest is not in this list. Its budget has one permitted
+        # `gpt` category for the separate blind comparison.
+        if _contains_gpt_artifact(device_checks) or any(
+            _contains_gpt_artifact(bundles[source][field])
+            for source in ordered_sources
+            for field in ("aggregation", "allocation", "candidate_manifest")
         ):
             return self._specialist_stop("gpt-artifact-present")
 
@@ -2905,66 +3031,91 @@ class StageRun:
         if projection["forecast"] != "within-budget":
             return self._specialist_stop(str(projection["stop_reason"]))
 
-        candidates_value = candidate_manifest["candidates"]
-        assert isinstance(candidates_value, list)
-        candidate_by_id = {
-            str(candidate["candidate_id"]): candidate
-            for candidate in candidates_value
-            if isinstance(candidate, Mapping)
-        }
-
-        def rows(split: str) -> list[Mapping[str, object]] | str:
-            """Give the split candidates, or one stop reason."""
-            items = allocation.get(split)
-            if not isinstance(items, list) or not items:
-                return "specialist-candidate-invalid"
-            selected: list[Mapping[str, object]] = []
-            for item in items:
-                candidate_id = (
-                    item.get("candidate_id") if isinstance(item, Mapping) else None
-                )
-                candidate = candidate_by_id.get(str(candidate_id))
-                if candidate is None or candidate.get("split") != split:
-                    return "specialist-candidate-invalid"
-                if any(field in candidate for field in BLIND_LABEL_FIELDS):
-                    return "blind-label-exposed"
-                selected.append(candidate)
-            return selected
-
-        splits = [rows(split) for split in ("training", "development", "blind")]
-        for split_rows in splits:
-            if isinstance(split_rows, str):
-                return self._specialist_stop(split_rows)
-        training_candidates, development_candidates, blind_candidates = cast(
-            list[list[Mapping[str, object]]], splits
-        )
-
-        silver_labels: dict[str, str] = {}
-        for item in accepted_silver:
-            if not isinstance(item, Mapping) or item.get("label") not in RESULT_LABELS:
-                return self._specialist_stop("silver-labels-not-accepted")
-            silver_labels[str(item["candidate_id"])] = str(item["label"])
-        training_rows = [
-            {
-                **_specialist_input(candidate),
-                "label": silver_labels[str(candidate["candidate_id"])],
+        training_rows: list[dict[str, object]] = []
+        development_rows: list[dict[str, object]] = []
+        blind_rows: list[dict[str, object]] = []
+        development_labels: dict[str, str] = {}
+        development_source_of: dict[str, str] = {}
+        source_of_blind: dict[str, str] = {}
+        seen_candidate_ids: set[str] = set()
+        for source in ordered_sources:
+            candidate_manifest = cast(
+                Mapping[str, object], bundles[source]["candidate_manifest"]
+            )
+            allocation = cast(Mapping[str, object], bundles[source]["allocation"])
+            candidates_value = candidate_manifest["candidates"]
+            assert isinstance(candidates_value, list)
+            candidate_by_id = {
+                str(candidate["candidate_id"]): candidate
+                for candidate in candidates_value
+                if isinstance(candidate, Mapping)
             }
-            for candidate in training_candidates
-            if str(candidate["candidate_id"]) in silver_labels
-        ]
+
+            def rows(split: str) -> list[Mapping[str, object]] | str:
+                """Give the split candidates of this source, or one stop reason."""
+                items = allocation.get(split)
+                if not isinstance(items, list) or not items:
+                    return "specialist-candidate-invalid"
+                selected: list[Mapping[str, object]] = []
+                for item in items:
+                    candidate_id = (
+                        item.get("candidate_id") if isinstance(item, Mapping) else None
+                    )
+                    candidate = candidate_by_id.get(str(candidate_id))
+                    if candidate is None or candidate.get("split") != split:
+                        return "specialist-candidate-invalid"
+                    if any(field in candidate for field in BLIND_LABEL_FIELDS):
+                        return "blind-label-exposed"
+                    selected.append(candidate)
+                return selected
+
+            splits = [rows(split) for split in CANDIDATE_SPLITS]
+            for split_rows in splits:
+                if isinstance(split_rows, str):
+                    return self._specialist_stop(split_rows)
+            source_training, source_development, source_blind = cast(
+                list[list[Mapping[str, object]]], splits
+            )
+
+            # One candidate ID must name one row. A repeat between two sources
+            # would give a row the silver label of the other source.
+            if any(
+                str(candidate["candidate_id"]) in seen_candidate_ids
+                for split_rows in (source_training, source_development, source_blind)
+                for candidate in split_rows
+            ):
+                return self._specialist_stop("duplicate-candidate-id")
+            seen_candidate_ids.update(
+                str(candidate["candidate_id"])
+                for split_rows in (source_training, source_development, source_blind)
+                for candidate in split_rows
+            )
+
+            training_rows.extend(
+                {
+                    **_specialist_input(candidate),
+                    "label": silver_labels[str(candidate["candidate_id"])],
+                }
+                for candidate in source_training
+                if str(candidate["candidate_id"]) in silver_labels
+            )
+            # The development labels stay with the selection code. Only inputs
+            # go to the backend.
+            development_rows.extend(
+                _specialist_input(candidate) for candidate in source_development
+            )
+            for candidate in source_blind:
+                blind_rows.append(_specialist_input(candidate))
+                source_of_blind[str(candidate["candidate_id"])] = source
+
+            for item in cast(list[Mapping[str, object]], allocation["development"]):
+                if item.get("label") not in RESULT_LABELS:
+                    return self._specialist_stop("development-label-invalid")
+                development_labels[str(item["candidate_id"])] = str(item["label"])
+                development_source_of[str(item["candidate_id"])] = source
+
         if not training_rows:
             return self._specialist_stop("silver-labels-not-accepted")
-        # The development labels stay with the selection code. Only inputs go out.
-        development_rows = [
-            _specialist_input(candidate) for candidate in development_candidates
-        ]
-        blind_rows = [_specialist_input(candidate) for candidate in blind_candidates]
-
-        development_labels: dict[str, str] = {}
-        for item in cast(list[Mapping[str, object]], allocation["development"]):
-            if item.get("label") not in RESULT_LABELS:
-                return self._specialist_stop("development-label-invalid")
-            development_labels[str(item["candidate_id"])] = str(item["label"])
 
         base_config: dict[str, object] = {
             "model_id": MODERNBERT_MODEL_ID,
@@ -2977,8 +3128,10 @@ class StageRun:
         freeze = {
             "event": "specialist-run-frozen",
             "run_id": stage_manifest["run_id"],
+            "stage": stage,
+            "sources": ordered_sources,
             "stage_manifest_sha256": semantic_manifest_sha256(stage_manifest),
-            "candidate_manifest_sha256": candidate_manifest_sha256,
+            "candidate_manifest_sha256s": manifest_sha256s,
             "training_config_sha256": hashlib.sha256(
                 _canonical_json(base_config).encode("utf-8")
             ).hexdigest(),
@@ -2994,6 +3147,7 @@ class StageRun:
             record
             for record in records
             if record.get("event") == "specialist-run-frozen"
+            and int(cast(int, record.get("stage", 1))) == stage
         ]
         if freeze_records:
             if any(freeze_records[0].get(field) != freeze[field] for field in freeze):
@@ -3022,23 +3176,41 @@ class StageRun:
                 or any(label not in RESULT_LABELS for label in predictions.values())
             ):
                 return self._specialist_stop("specialist-training-invalid")
-            macro_f1 = _macro_f1(
-                {str(key): str(value) for key, value in predictions.items()},
-                development_labels,
-            )
+            predicted = {str(key): str(value) for key, value in predictions.items()}
+            # The cumulative development set selects the checkpoint. The record
+            # also keeps the result of each source, so an audit can see it.
+            macro_f1 = _macro_f1(predicted, development_labels)
+            macro_f1_by_source = {
+                source: _macro_f1(
+                    {
+                        key: value
+                        for key, value in predicted.items()
+                        if development_source_of[key] == source
+                    },
+                    {
+                        key: value
+                        for key, value in development_labels.items()
+                        if development_source_of[key] == source
+                    },
+                )
+                for source in ordered_sources
+            }
             checkpoints.append(
                 {
                     "seed": seed,
                     "checkpoint_id": str(result["checkpoint_id"]),
                     "development_macro_f1": macro_f1,
+                    "development_macro_f1_by_source": macro_f1_by_source,
                 }
             )
             self._specialist_log.append(
                 {
                     "event": "specialist-training-run",
+                    "stage": stage,
                     "seed": seed,
                     "checkpoint_id": str(result["checkpoint_id"]),
                     "development_macro_f1": macro_f1,
+                    "development_macro_f1_by_source": macro_f1_by_source,
                     "training_example_count": len(training_rows),
                 }
             )
@@ -3061,19 +3233,26 @@ class StageRun:
             return self._specialist_stop("specialist-inference-invalid")
         predictions_out: list[dict[str, object]] = []
         for row in blind_rows:
-            label = labels.get(str(row["candidate_id"]))
+            candidate_id = str(row["candidate_id"])
+            label = labels.get(candidate_id)
             if label not in RESULT_LABELS:
                 return self._specialist_stop("missing-prediction")
             predictions_out.append(
-                {"candidate_id": row["candidate_id"], "label": label}
+                {
+                    "candidate_id": row["candidate_id"],
+                    "source": source_of_blind[candidate_id],
+                    "label": label,
+                }
             )
 
         prediction_file: dict[str, object] = {
             "specialist_predictions": "sealed",
             "stop_reason": None,
+            "stage": stage,
+            "sources": ordered_sources,
             "model_id": MODERNBERT_MODEL_ID,
             "revision": MODERNBERT_REVISION,
-            "candidate_manifest_sha256": candidate_manifest_sha256,
+            "candidate_manifest_sha256s": manifest_sha256s,
             "training_config_sha256": freeze["training_config_sha256"],
             "checkpoint_id": selected["checkpoint_id"],
             "selected_seed": selected["seed"],
@@ -3091,6 +3270,7 @@ class StageRun:
             {
                 "event": "specialist-predictions-sealed",
                 "run_id": stage_manifest["run_id"],
+                "stage": stage,
                 "prediction_file": prediction_file,
             }
         )
@@ -3099,7 +3279,7 @@ class StageRun:
     def _report_stop(self, run_id: str, reason: str) -> dict[str, object]:
         self._decision_log.append(
             {
-                "event": "stage-1-report",
+                "event": "stage-report",
                 "run_id": run_id,
                 "report": "invalid",
                 "stop_reason": reason,
@@ -3107,117 +3287,218 @@ class StageRun:
         )
         return {"report": "invalid", "stop_reason": reason, "run_id": run_id}
 
-    def report_stage_1(
+    def report_stage(
         self,
         stage_manifest: Mapping[str, object],
-        candidate_manifest: Mapping[str, object],
-        allocation: Mapping[str, object],
-        relabels: Sequence[Mapping[str, object]],
+        sources: Sequence[Mapping[str, object]],
     ) -> dict[str, object]:
-        """Score the sealed blind comparison and give the complete audit report."""
+        """Score the sealed blind comparison of each source of one stage.
+
+        Each item of `sources` holds the sealed `candidate_manifest`, the
+        complete `allocation`, and the delayed `relabels` of one source. Each
+        source gets its own decision. The pooled score is diagnostic only.
+        """
         run_id = str(stage_manifest.get("run_id", "unknown-run"))
         decision = self.evaluate(stage_manifest)
         if decision["decision"] != "build-eligible":
             return self._report_stop(run_id, str(decision["stop_reason"]))
-        if not _is_valid_sealed_candidate_manifest(candidate_manifest):
-            return self._report_stop(run_id, "unsealed-annex")
-        seal = candidate_manifest["seal"]
-        assert isinstance(seal, Mapping)
-        candidate_manifest_sha256 = str(seal["semantic_sha256"])
-        blind = allocation.get("blind")
-        if (
-            allocation.get("allocation") != "complete"
-            or allocation.get("candidate_manifest_sha256") != candidate_manifest_sha256
-            or not isinstance(blind, list)
-            or not blind
-        ):
-            return self._report_stop(run_id, "allocation-not-complete")
+        stage = cast(int, stage_manifest["stage"])
+
+        read = read_source_bundles(sources, stage)
+        if isinstance(read, str):
+            return self._report_stop(run_id, read)
+        ordered_sources, bundles, manifest_sha256_by_source = read
+
+        reference: dict[str, dict[str, str]] = {}
+        event_group_of: dict[str, dict[str, str]] = {}
+        blind_by_source: dict[str, list[Mapping[str, object]]] = {}
+        for source in ordered_sources:
+            allocation = cast(Mapping[str, object], bundles[source]["allocation"])
+            blind = allocation.get("blind")
+            if not isinstance(blind, list) or not blind:
+                return self._report_stop(run_id, "allocation-not-complete")
+            blind_by_source[source] = cast(list[Mapping[str, object]], blind)
+            reference[source] = {}
+            event_group_of[source] = {}
+            for item in blind:
+                if (
+                    not isinstance(item, Mapping)
+                    or item.get("label") not in RESULT_LABELS
+                    or not isinstance(item.get("event_group_id"), str)
+                ):
+                    return self._report_stop(run_id, "blind-label-invalid")
+                candidate_id = str(item["candidate_id"])
+                reference[source][candidate_id] = str(item["label"])
+                event_group_of[source][candidate_id] = str(item["event_group_id"])
+
+        # One candidate ID must name one blind example. A repeat between two
+        # sources would score one source with the prediction of the other.
+        blind_ids = [
+            candidate_id
+            for source in ordered_sources
+            for candidate_id in reference[source]
+        ]
+        if len(set(blind_ids)) != len(blind_ids):
+            return self._report_stop(run_id, "duplicate-candidate-id")
 
         # Both prediction files come from the sealed logs. A file that a caller
         # supplies has no place in the comparison.
-        specialist_file = self._sealed_prediction_file(
-            self.specialist_records(),
-            "specialist-predictions-sealed",
-            candidate_manifest_sha256,
-        )
-        if specialist_file is None:
-            return self._report_stop(run_id, "specialist-predictions-missing")
-        gpt_file = self._sealed_prediction_file(
-            self.gpt_blind_records(),
-            "gpt-blind-predictions-sealed",
-            candidate_manifest_sha256,
-        )
-        if gpt_file is None:
-            return self._report_stop(run_id, "gpt-predictions-missing")
-
-        reference: dict[str, str] = {}
-        event_group_of: dict[str, str] = {}
-        for item in blind:
-            if (
-                not isinstance(item, Mapping)
-                or item.get("label") not in RESULT_LABELS
-                or not isinstance(item.get("event_group_id"), str)
-            ):
-                return self._report_stop(run_id, "blind-label-invalid")
-            candidate_id = str(item["candidate_id"])
-            reference[candidate_id] = str(item["label"])
-            event_group_of[candidate_id] = str(item["event_group_id"])
-
-        predictions: dict[str, dict[str, str]] = {}
-        for system, prediction_file in (
-            ("specialist", specialist_file),
-            ("gpt", gpt_file),
-        ):
-            labels: dict[str, str] = {}
-            for item in cast(list[Mapping[str, object]], prediction_file["predictions"]):
-                label = item.get("label")
-                if label not in RESULT_LABELS:
-                    return self._report_stop(run_id, "incomplete-paired-predictions")
-                labels[str(item["candidate_id"])] = str(label)
-            if set(labels) != set(reference):
-                return self._report_stop(run_id, "incomplete-paired-predictions")
-            predictions[system] = labels
-
-        relabel_stop, self_consistency = self._score_relabels(allocation, relabels)
-        if relabel_stop is not None:
-            return self._report_stop(run_id, relabel_stop)
-
-        counts_by_system = {
-            system: _f1_counts(
-                [(reference[key], labels[key]) for key in sorted(reference)]
-            )
-            for system, labels in predictions.items()
-        }
-        macro_f1 = {
-            system: _macro_f1_from_counts(counts)
-            for system, counts in counts_by_system.items()
-        }
-        difference = macro_f1["specialist"] - macro_f1["gpt"]
-
-        grouped: dict[str, list[str]] = {}
-        for candidate_id, group_id in event_group_of.items():
-            grouped.setdefault(group_id, []).append(candidate_id)
-        group_counts = [
+        specialist_file = next(
             (
-                _f1_counts(
-                    [
-                        (reference[key], predictions["specialist"][key])
-                        for key in sorted(members)
-                    ]
-                ),
-                _f1_counts(
-                    [
-                        (reference[key], predictions["gpt"][key])
-                        for key in sorted(members)
-                    ]
-                ),
+                cast(dict[str, object], record["prediction_file"])
+                for record in self.specialist_records()
+                if record.get("event") == "specialist-predictions-sealed"
+                and _prediction_file_stage(record) == stage
+            ),
+            None,
+        )
+        if specialist_file is None or _prediction_file_sha256s(specialist_file) != [
+            manifest_sha256_by_source[source] for source in ordered_sources
+        ]:
+            return self._report_stop(run_id, "specialist-predictions-missing")
+        specialist_labels: dict[str, str] = {}
+        for item in cast(list[Mapping[str, object]], specialist_file["predictions"]):
+            if item.get("label") not in RESULT_LABELS:
+                return self._report_stop(run_id, "incomplete-paired-predictions")
+            specialist_labels[str(item["candidate_id"])] = str(item["label"])
+
+        # The earlier source reuses its own sealed GPT file. It makes no new call.
+        gpt_files: dict[str, dict[str, object]] = {}
+        gpt_labels: dict[str, dict[str, str]] = {}
+        for source in ordered_sources:
+            gpt_file = self._sealed_gpt_file(
+                self.gpt_blind_records(), manifest_sha256_by_source[source]
             )
-            for _, members in sorted(grouped.items())
+            if gpt_file is None:
+                return self._report_stop(run_id, "gpt-predictions-missing")
+            gpt_files[source] = gpt_file
+            labels: dict[str, str] = {}
+            for item in cast(list[Mapping[str, object]], gpt_file["predictions"]):
+                if item.get("label") not in RESULT_LABELS:
+                    return self._report_stop(run_id, "incomplete-paired-predictions")
+                labels[str(item["candidate_id"])] = str(item["label"])
+            if set(labels) != set(reference[source]):
+                return self._report_stop(run_id, "incomplete-paired-predictions")
+            gpt_labels[source] = labels
+            if not set(reference[source]).issubset(specialist_labels):
+                return self._report_stop(run_id, "incomplete-paired-predictions")
+        if set(specialist_labels) != set(blind_ids):
+            return self._report_stop(run_id, "incomplete-paired-predictions")
+
+        self_consistency: dict[str, object] = {}
+        for source in ordered_sources:
+            relabels = bundles[source].get("relabels")
+            relabel_stop, scored = self._score_relabels(
+                cast(Mapping[str, object], bundles[source]["allocation"]),
+                cast(Sequence[Mapping[str, object]], relabels or ()),
+            )
+            if relabel_stop is not None:
+                return self._report_stop(run_id, relabel_stop)
+            self_consistency[source] = scored
+
+        def scored_source(source: str) -> dict[str, object]:
+            """Give the complete paired score of one source."""
+            keys = sorted(reference[source])
+            counts = {
+                "specialist": _f1_counts(
+                    [(reference[source][key], specialist_labels[key]) for key in keys]
+                ),
+                "gpt": _f1_counts(
+                    [(reference[source][key], gpt_labels[source][key]) for key in keys]
+                ),
+            }
+            grouped: dict[str, list[str]] = {}
+            for candidate_id, group_id in event_group_of[source].items():
+                grouped.setdefault(group_id, []).append(candidate_id)
+            bootstrap = _paired_event_group_bootstrap(
+                [
+                    (
+                        _f1_counts(
+                            [
+                                (reference[source][key], specialist_labels[key])
+                                for key in sorted(members)
+                            ]
+                        ),
+                        _f1_counts(
+                            [
+                                (reference[source][key], gpt_labels[source][key])
+                                for key in sorted(members)
+                            ]
+                        ),
+                    )
+                    for _, members in sorted(grouped.items())
+                ]
+            )
+            macro_f1 = {
+                system: _macro_f1_from_counts(value)
+                for system, value in counts.items()
+            }
+            lower_limit = cast(float, bootstrap["lower_limit"])
+            return {
+                "source_guardrail": (
+                    "pass" if lower_limit >= NON_INFERIORITY_MARGIN else "fail"
+                ),
+                "superiority": lower_limit > 0.0,
+                "blind_examples": len(keys),
+                "blind_event_groups": len(grouped),
+                "unseen_issuers": sum(
+                    1 for item in blind_by_source[source] if item.get("unseen_issuer")
+                ),
+                "specialist": {
+                    "class_f1": {
+                        label: _class_f1(counts["specialist"], label)
+                        for label in RESULT_LABELS
+                    },
+                    "macro_f1": macro_f1["specialist"],
+                },
+                "gpt": {
+                    "class_f1": {
+                        label: _class_f1(counts["gpt"], label)
+                        for label in RESULT_LABELS
+                    },
+                    "macro_f1": macro_f1["gpt"],
+                },
+                "reference_support": {
+                    label: sum(
+                        1 for value in reference[source].values() if value == label
+                    )
+                    for label in RESULT_LABELS
+                },
+                "macro_f1_difference": macro_f1["specialist"] - macro_f1["gpt"],
+                "bootstrap": bootstrap,
+                "self_consistency": self_consistency[source],
+            }
+
+        by_source = {source: scored_source(source) for source in ordered_sources}
+
+        # The pooled score cannot offset a source that fails its own guardrail.
+        pooled_pairs = [
+            (reference[source][key], key, source)
+            for source in ordered_sources
+            for key in sorted(reference[source])
         ]
-        bootstrap = _paired_event_group_bootstrap(group_counts)
-        lower_limit = cast(float, bootstrap["lower_limit"])
-        guardrail = "pass" if lower_limit >= NON_INFERIORITY_MARGIN else "fail"
-        superiority = lower_limit > 0.0
+        pooled_counts = {
+            "specialist": _f1_counts(
+                [(label, specialist_labels[key]) for label, key, _ in pooled_pairs]
+            ),
+            "gpt": _f1_counts(
+                [
+                    (label, gpt_labels[source][key])
+                    for label, key, source in pooled_pairs
+                ]
+            ),
+        }
+        pooled_macro_f1 = {
+            system: _macro_f1_from_counts(value)
+            for system, value in pooled_counts.items()
+        }
+        stage_guardrail = (
+            "pass"
+            if all(
+                value["source_guardrail"] == "pass" for value in by_source.values()
+            )
+            else "fail"
+        )
 
         attempts = [
             record
@@ -3228,12 +3509,14 @@ class StageRun:
             record
             for record in self.specialist_records()
             if record.get("event") == "specialist-training-run"
+            and int(cast(int, record.get("stage", 1))) == stage
         ]
         frozen = next(
             (
                 record
                 for record in self.specialist_records()
                 if record.get("event") == "specialist-run-frozen"
+                and record.get("stage") == stage
             ),
             {},
         )
@@ -3242,29 +3525,42 @@ class StageRun:
             "report": "complete",
             "stop_reason": None,
             "run_id": run_id,
-            "stage": 1,
-            "source": "financial-news",
+            "stage": stage,
+            "sources": ordered_sources,
+            "new_sources": list(STAGE_SOURCES[stage]),
+            "regression_sources": [
+                source
+                for source in ordered_sources
+                if source not in STAGE_SOURCES[stage]
+            ],
             "decision": {
                 "blind_comparison": "valid",
-                "source_guardrail": guardrail,
                 "non_inferiority_margin": NON_INFERIORITY_MARGIN,
-                "superiority": superiority,
                 "reference_label": "first-human-label",
+                "stage_guardrail": stage_guardrail,
+                "source_guardrail": {
+                    source: value["source_guardrail"]
+                    for source, value in by_source.items()
+                },
+                "superiority": {
+                    source: value["superiority"]
+                    for source, value in by_source.items()
+                },
             },
             "counts": {
-                "blind_examples": len(reference),
-                "blind_event_groups": len(grouped),
-                "unseen_issuers": sum(
-                    1
-                    for item in cast(list[Mapping[str, object]], blind)
-                    if item.get("unseen_issuer")
-                ),
+                "blind_examples": len(specialist_labels),
+                "blind_examples_by_source": {
+                    source: value["blind_examples"]
+                    for source, value in by_source.items()
+                },
                 "training_examples": frozen.get("training_example_count"),
                 "development_examples": frozen.get("development_example_count"),
-                "silver_candidates_inspected": allocation.get(
-                    "silver_candidates_inspected"
-                ),
-                "relabel_examples": self_consistency["example_count"],
+                "silver_candidates_inspected": {
+                    source: cast(
+                        Mapping[str, object], bundles[source]["allocation"]
+                    ).get("silver_candidates_inspected")
+                    for source in ordered_sources
+                },
                 "gpt_attempts": len(attempts),
             },
             "identities": {
@@ -3273,8 +3569,14 @@ class StageRun:
                 "checkpoint_id": specialist_file["checkpoint_id"],
                 "selected_seed": specialist_file["selected_seed"],
                 "inference_device_id": specialist_file["inference_device_id"],
-                "gpt_route_id": gpt_file["route_id"],
-                "gpt_reasoning_effort": gpt_file["reasoning_effort"],
+                "gpt_route_id": {
+                    source: gpt_file["route_id"]
+                    for source, gpt_file in gpt_files.items()
+                },
+                "gpt_reasoning_effort": {
+                    source: gpt_file["reasoning_effort"]
+                    for source, gpt_file in gpt_files.items()
+                },
                 "labeling_route_ids": list(EXPECTED_ROUTE_IDS),
             },
             "attempts": {
@@ -3283,6 +3585,7 @@ class StageRun:
                 ),
                 "gpt_retried_examples": sum(
                     1
+                    for gpt_file in gpt_files.values()
                     for item in cast(
                         list[Mapping[str, object]], gpt_file["predictions"]
                     )
@@ -3292,60 +3595,73 @@ class StageRun:
             },
             "hashes": {
                 "stage_manifest_sha256": semantic_manifest_sha256(stage_manifest),
-                "candidate_manifest_sha256": candidate_manifest_sha256,
-                "allocation_sha256": allocation.get("allocation_sha256"),
+                "candidate_manifest_sha256": manifest_sha256_by_source,
+                "allocation_sha256": {
+                    source: cast(
+                        Mapping[str, object], bundles[source]["allocation"]
+                    ).get("allocation_sha256")
+                    for source in ordered_sources
+                },
                 "specialist_prediction_file_sha256": specialist_file[
                     "prediction_file_sha256"
                 ],
-                "gpt_prediction_file_sha256": gpt_file["prediction_file_sha256"],
+                "gpt_prediction_file_sha256": {
+                    source: gpt_file["prediction_file_sha256"]
+                    for source, gpt_file in gpt_files.items()
+                },
                 "training_config_sha256": specialist_file["training_config_sha256"],
-                "gpt_prompt_sha256": gpt_file["prompt_sha256"],
+                "gpt_prompt_sha256": {
+                    source: gpt_file["prompt_sha256"]
+                    for source, gpt_file in gpt_files.items()
+                },
             },
             "versions": {
                 "report": _software_versions(),
                 "specialist": specialist_file["software_versions"],
-                "gpt": gpt_file["software_versions"],
+                "gpt": {
+                    source: gpt_file["software_versions"]
+                    for source, gpt_file in gpt_files.items()
+                },
             },
             "prediction_files": {
                 "specialist": specialist_file,
-                "gpt": gpt_file,
+                "gpt": gpt_files,
             },
             "metrics": {
-                "specialist": {
-                    "class_f1": {
-                        label: _class_f1(counts_by_system["specialist"], label)
-                        for label in RESULT_LABELS
-                    },
-                    "macro_f1": macro_f1["specialist"],
+                "by_source": by_source,
+                "pooled": {
+                    "diagnostic_only": True,
+                    "specialist_macro_f1": pooled_macro_f1["specialist"],
+                    "gpt_macro_f1": pooled_macro_f1["gpt"],
+                    "macro_f1_difference": (
+                        pooled_macro_f1["specialist"] - pooled_macro_f1["gpt"]
+                    ),
                 },
-                "gpt": {
-                    "class_f1": {
-                        label: _class_f1(counts_by_system["gpt"], label)
-                        for label in RESULT_LABELS
-                    },
-                    "macro_f1": macro_f1["gpt"],
-                },
-                "reference_support": {
-                    label: sum(1 for value in reference.values() if value == label)
-                    for label in RESULT_LABELS
-                },
-                "macro_f1_difference": difference,
-                "bootstrap": bootstrap,
-                "self_consistency": self_consistency,
             },
             "ledger_entries": self.cost_records(),
         }
         self._decision_log.append(
             {
-                "event": "stage-1-report",
+                "event": "stage-report",
                 "run_id": run_id,
+                "stage": stage,
                 "report": "complete",
                 "stop_reason": None,
-                "source_guardrail": guardrail,
-                "superiority": superiority,
-                "macro_f1_difference": difference,
-                "lower_limit": lower_limit,
-                "upper_limit": bootstrap["upper_limit"],
+                "stage_guardrail": stage_guardrail,
+                "source_decisions": {
+                    source: {
+                        "source_guardrail": value["source_guardrail"],
+                        "superiority": value["superiority"],
+                        "macro_f1_difference": value["macro_f1_difference"],
+                        "lower_limit": cast(
+                            Mapping[str, object], value["bootstrap"]
+                        )["lower_limit"],
+                        "upper_limit": cast(
+                            Mapping[str, object], value["bootstrap"]
+                        )["upper_limit"],
+                    }
+                    for source, value in by_source.items()
+                },
             }
         )
         report["decision_records"] = self.decision_records()
@@ -3355,14 +3671,13 @@ class StageRun:
         return report
 
     @staticmethod
-    def _sealed_prediction_file(
+    def _sealed_gpt_file(
         records: Sequence[Mapping[str, object]],
-        event: str,
         candidate_manifest_sha256: str,
     ) -> dict[str, object] | None:
-        """Read the one sealed prediction file for this candidate manifest."""
+        """Read the one sealed GPT file for this candidate manifest."""
         for record in records:
-            if record.get("event") != event:
+            if record.get("event") != "gpt-blind-predictions-sealed":
                 continue
             prediction_file = record.get("prediction_file")
             if (
@@ -3481,13 +3796,13 @@ class StageRun:
             "record": record,
         }
 
-    def allocate_stage_1(
+    def allocate_source(
         self,
         manifest: Mapping[str, object],
         reviews: Sequence[Mapping[str, object]],
     ) -> dict[str, object]:
-        """Allocate Stage 1 from recorded candidate inspections."""
-        return allocate_stage_1(
+        """Allocate one staged source from recorded candidate inspections."""
+        return allocate_source(
             manifest, reviews, self.candidate_inspection_records()
         )
 
@@ -3591,15 +3906,16 @@ class StageRun:
         stop_reason: str | None,
         evidence: Mapping[str, object] | None = None,
         *,
+        stage: int = 1,
         record: bool = True,
     ) -> dict[str, object]:
         result: dict[str, object] = {
             "run_id": run_id,
-            "stage": 1,
+            "stage": stage,
             "decision": decision,
             "stop_reason": stop_reason,
             "permitted_external_actions": (
-                ["stage-1-build"] if decision == "build-eligible" else []
+                [f"stage-{stage}-build"] if decision == "build-eligible" else []
             ),
             "external_actions_started": False,
             "evidence": dict(evidence or {}),
@@ -3615,18 +3931,19 @@ class StageRun:
             )
         return result
 
-    def _stop(self, run_id: str, reason: str) -> dict[str, object]:
-        return self._decision(run_id, "no-build", reason)
+    def _stop(self, run_id: str, reason: str, stage: int) -> dict[str, object]:
+        return self._decision(run_id, "no-build", reason, stage=stage)
 
     def evaluate(self, manifest: Mapping[str, object]) -> dict[str, object]:
-        """Return the first Stage 1 stop or a complete build decision."""
+        """Return the first staged stop or a complete build decision."""
         run_id = str(manifest.get("run_id", "unknown-run"))
+        stage = manifest.get("stage")
         if (
             manifest.get("schema_version") != 1
-            or manifest.get("stage") != 1
+            or stage not in STAGE_SOURCES
             or not run_id.strip()
         ):
-            return self._stop(run_id, "invalid-manifest")
+            return self._stop(run_id, "invalid-manifest", 1)
 
         confirmation = manifest.get("confirmation")
         actual_hash = semantic_manifest_sha256(manifest)
@@ -3661,6 +3978,7 @@ class StageRun:
                 run_id,
                 "no-build",
                 "semantic-manifest-change",
+                stage=stage,
                 record=False,
             )
 
@@ -3682,12 +4000,13 @@ class StageRun:
                     run_id,
                     "no-build",
                     "confirmation-evidence-changed",
+                    stage=stage,
                     record=False,
                 )
 
         if isinstance(confirmation, Mapping) and not prior_confirmations:
             if not confirmation.get("confirmed_by") or not confirmation.get("confirmed_at"):
-                return self._stop(run_id, "manifest-not-confirmed")
+                return self._stop(run_id, "manifest-not-confirmed", stage)
             self._decision_log.append(
                 {
                     "event": "manifest-confirmed",
@@ -3698,29 +4017,54 @@ class StageRun:
                 }
             )
 
-        source = manifest.get("source")
-        if not isinstance(source, Mapping):
-            return self._stop(run_id, "source-rights-failed")
-        source_evidence = source.get("evidence")
-        source_passes = (
-            source.get("source_type") == "financial-news"
-            and bool(source.get("source_id"))
-            and all(source.get(field) is True for field in RIGHTS_FIELDS)
-            and isinstance(source_evidence, Mapping)
-            and all(
-                bool(source_evidence.get(field))
-                for field in ("checked_at", "terms_url", "reviewer")
-            )
+        # Each source of the stage passes its own access and rights gate.
+        staged_form = isinstance(manifest.get("sources"), list)
+        sources = (
+            cast(list[object], manifest["sources"])
+            if staged_form
+            else [manifest.get("source")]
         )
-        if not source_passes:
-            return self._stop(run_id, "source-rights-failed")
+        source_records: list[Mapping[str, object]] = []
+        for item in sources:
+            if not isinstance(item, Mapping):
+                return self._stop(run_id, "source-rights-failed", stage)
+            item_evidence = item.get("evidence")
+            if not (
+                item.get("source_type") in STAGE_SOURCES[stage]
+                and bool(item.get("source_id"))
+                and all(item.get(field) is True for field in RIGHTS_FIELDS)
+                and isinstance(item_evidence, Mapping)
+                and all(
+                    bool(item_evidence.get(field))
+                    for field in ("checked_at", "terms_url", "reviewer")
+                )
+            ):
+                return self._stop(run_id, "source-rights-failed", stage)
+            source_records.append(item)
+        source_types = [str(item["source_type"]) for item in source_records]
+        if sorted(source_types) != sorted(STAGE_SOURCES[stage]):
+            return self._stop(run_id, "stage-source-incomplete", stage)
+
+        # The data gate holds each source to its own fixed quota plan.
+        for item in source_records:
+            plan = item.get("data_plan")
+            if plan is None and not staged_form:
+                continue
+            targets = SOURCE_ALLOCATION_TARGETS[str(item["source_type"])]
+            limit = SOURCE_SILVER_CANDIDATE_LIMITS[str(item["source_type"])]
+            if (
+                not isinstance(plan, Mapping)
+                or plan.get("silver_candidate_limit") != limit
+                or any(plan.get(split) != count for split, count in targets.items())
+            ):
+                return self._stop(run_id, "source-data-plan-invalid", stage)
 
         panel = manifest.get("route_panel")
         if not isinstance(panel, Mapping) or panel.get("inspection_complete") is not True:
-            return self._stop(run_id, "route-panel-incomplete")
+            return self._stop(run_id, "route-panel-incomplete", stage)
         routes = panel.get("routes")
         if not isinstance(routes, list):
-            return self._stop(run_id, "route-panel-incomplete")
+            return self._stop(run_id, "route-panel-incomplete", stage)
         route_ids = [
             route.get("route_id") for route in routes if isinstance(route, Mapping)
         ]
@@ -3730,7 +4074,7 @@ class StageRun:
             or not set(EXPECTED_ROUTE_IDS).issubset(route_ids)
             or any(not _is_fixed_route_id(route_id) for route_id in route_ids)
         ):
-            return self._stop(run_id, "route-panel-incomplete")
+            return self._stop(run_id, "route-panel-incomplete", stage)
         eligible_routes = [
             route
             for route in routes
@@ -3744,23 +4088,21 @@ class StageRun:
             )
         ]
         if len(eligible_routes) < 3:
-            return self._stop(run_id, "insufficient-eligible-routes")
+            return self._stop(run_id, "insufficient-eligible-routes", stage)
 
-        required_days = 0
+        # The free capacity of an account does not belong to one source.
         try:
             for route in eligible_routes:
                 remaining_experiment_requests = int(
                     route["remaining_experiment_requests"]
                 )
                 free_requests_remaining = int(route["free_requests_remaining"])
-                current_stage_requests = int(route["current_stage_requests"])
                 requests_per_day = int(route["requests_per_day"])
                 available_days = int(route["available_days"])
                 if (
                     min(
                         remaining_experiment_requests,
                         free_requests_remaining,
-                        current_stage_requests,
                         requests_per_day,
                         available_days,
                     )
@@ -3769,45 +4111,86 @@ class StageRun:
                 ):
                     raise ValueError
                 if free_requests_remaining < remaining_experiment_requests:
-                    return self._stop(run_id, "route-demand-exceeds-free-capacity")
-                route_days = math.ceil(current_stage_requests / requests_per_day)
-                required_days = max(required_days, route_days)
-                if route_days > available_days:
-                    return self._stop(run_id, "route-schedule-infeasible")
+                    return self._stop(run_id, "route-demand-exceeds-free-capacity", stage)
         except (KeyError, TypeError, ValueError):
-            return self._stop(run_id, "invalid-route-demand")
+            return self._stop(run_id, "invalid-route-demand", stage)
 
-        schedule = manifest.get("schedule")
-        if not isinstance(schedule, Mapping) or not all(
-            schedule.get(field) for field in ("starts_on", "must_finish_by", "evidence")
-        ):
-            return self._stop(run_id, "route-schedule-infeasible")
-        try:
-            starts_on = date.fromisoformat(str(schedule["starts_on"]))
-            must_finish_by = date.fromisoformat(str(schedule["must_finish_by"]))
-        except (ValueError, TypeError):
-            return self._stop(run_id, "route-schedule-infeasible")
-        schedule_days = (must_finish_by - starts_on).days + 1
-        if schedule_days < required_days:
-            return self._stop(run_id, "route-schedule-infeasible")
+        # Each source passes its own route-demand and schedule gate.
+        schedule_evidence: dict[str, dict[str, object]] = {}
+        for item in source_records:
+            requested = item.get("route_requests")
+            required_days = 0
+            try:
+                for route in eligible_routes:
+                    current_stage_requests = int(
+                        requested[str(route["route_id"])]
+                        if isinstance(requested, Mapping)
+                        else route["current_stage_requests"]
+                    )
+                    requests_per_day = int(route["requests_per_day"])
+                    available_days = int(route["available_days"])
+                    if current_stage_requests < 0:
+                        raise ValueError
+                    route_days = math.ceil(current_stage_requests / requests_per_day)
+                    required_days = max(required_days, route_days)
+                    if route_days > available_days:
+                        return self._stop(run_id, "route-schedule-infeasible", stage)
+            except (KeyError, TypeError, ValueError):
+                return self._stop(run_id, "invalid-route-demand", stage)
+
+            schedule = item.get("schedule") or manifest.get("schedule")
+            if not isinstance(schedule, Mapping) or not all(
+                schedule.get(field)
+                for field in ("starts_on", "must_finish_by", "evidence")
+            ):
+                return self._stop(run_id, "route-schedule-infeasible", stage)
+            try:
+                starts_on = date.fromisoformat(str(schedule["starts_on"]))
+                must_finish_by = date.fromisoformat(str(schedule["must_finish_by"]))
+            except (ValueError, TypeError):
+                return self._stop(run_id, "route-schedule-infeasible", stage)
+            schedule_days = (must_finish_by - starts_on).days + 1
+            if schedule_days < required_days:
+                return self._stop(run_id, "route-schedule-infeasible", stage)
+            schedule_evidence[str(item["source_type"])] = {
+                **dict(schedule),
+                "required_days": required_days,
+                "available_days": schedule_days,
+            }
 
         if not isinstance(confirmation, Mapping):
-            return self._stop(run_id, "manifest-not-confirmed")
+            return self._stop(run_id, "manifest-not-confirmed", stage)
 
         budget = manifest.get("budget")
         if not isinstance(budget, Mapping) or not budget.get("evidence"):
-            return self._stop(run_id, "invalid-budget-evidence")
-        planned_input = budget.get("planned_commitments_usd")
-        if not isinstance(planned_input, Mapping) or set(planned_input) != set(BUDGET_LIMITS):
-            return self._stop(run_id, "invalid-budget-evidence")
-        try:
-            planned = {
-                category: _money(planned_input[category]) for category in BUDGET_LIMITS
-            }
-        except ValueError:
-            return self._stop(run_id, "invalid-budget-evidence")
-        if planned["contingency"] != 0:
-            return self._stop(run_id, "contingency-not-authorized")
+            return self._stop(run_id, "invalid-budget-evidence", stage)
+        # Each source passes its own budget gate. The stage adds them together.
+        planned_by_source: dict[str, dict[str, Decimal]] = {}
+        for item in source_records:
+            planned_input = item.get("planned_commitments_usd")
+            if planned_input is None and not staged_form:
+                planned_input = budget.get("planned_commitments_usd")
+            if not isinstance(planned_input, Mapping) or set(planned_input) != set(
+                BUDGET_LIMITS
+            ):
+                return self._stop(run_id, "invalid-budget-evidence", stage)
+            try:
+                source_planned = {
+                    category: _money(planned_input[category])
+                    for category in BUDGET_LIMITS
+                }
+            except ValueError:
+                return self._stop(run_id, "invalid-budget-evidence", stage)
+            if source_planned["contingency"] != 0:
+                return self._stop(run_id, "contingency-not-authorized", stage)
+            planned_by_source[str(item["source_type"])] = source_planned
+        planned = {
+            category: sum(
+                (value[category] for value in planned_by_source.values()),
+                start=Decimal("0.00"),
+            )
+            for category in BUDGET_LIMITS
+        }
 
         exposure = self.budget_exposure()
         combined = {
@@ -3816,15 +4199,25 @@ class StageRun:
         }
         for category, amount in combined.items():
             if amount > BUDGET_LIMITS[category]:
-                return self._stop(run_id, "category-budget-exceeded")
+                return self._stop(run_id, "category-budget-exceeded", stage)
         if sum(combined.values()) > TOTAL_BUDGET_LIMIT:
-            return self._stop(run_id, "total-budget-exceeded")
+            return self._stop(run_id, "total-budget-exceeded", stage)
 
         evidence = {
-            "source": {
-                "source_id": source["source_id"],
-                "rights": {field: source[field] for field in RIGHTS_FIELDS},
-                "evidence": source_evidence,
+            "sources": {
+                str(item["source_type"]): {
+                    "source_id": item["source_id"],
+                    "rights": {field: item[field] for field in RIGHTS_FIELDS},
+                    "evidence": item["evidence"],
+                    "planned_commitments_usd": {
+                        category: _usd(amount)
+                        for category, amount in planned_by_source[
+                            str(item["source_type"])
+                        ].items()
+                    },
+                    "schedule": schedule_evidence[str(item["source_type"])],
+                }
+                for item in source_records
             },
             "routes": {
                 "inspection_complete": True,
@@ -3834,11 +4227,7 @@ class StageRun:
                     for route in eligible_routes
                 },
             },
-            "schedule": {
-                **dict(schedule),
-                "required_days": required_days,
-                "available_days": schedule_days,
-            },
+            "schedule": schedule_evidence,
             "confirmation": dict(confirmation),
             "budget": {
                 "category_limits_usd": {
@@ -3857,7 +4246,7 @@ class StageRun:
                 "evidence": budget["evidence"],
             },
         }
-        return self._decision(run_id, "build-eligible", None, evidence)
+        return self._decision(run_id, "build-eligible", None, evidence, stage=stage)
 
 
 def _read_manifest(path: str) -> dict[str, object]:
@@ -3876,17 +4265,30 @@ def _read_reviews(path: str) -> list[Mapping[str, object]]:
     return value
 
 
+def _read_report_sources(path: str) -> list[dict[str, object]]:
+    """Read the per-source file list of one staged report."""
+    items = _read_reviews(path)
+    return [
+        {
+            "candidate_manifest": _read_manifest(str(item["candidate_manifest"])),
+            "allocation": _read_manifest(str(item["allocation"])),
+            "relabels": _read_reviews(str(item["relabels"])),
+        }
+        for item in items
+    ]
+
+
 def _write_json(value: object) -> None:
     json.dump(value, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Control a safe Stage 1 run.")
+    parser = argparse.ArgumentParser(description="Control a safe staged run.")
     commands = parser.add_subparsers(dest="command", required=True)
 
     check = commands.add_parser(
-        "check", help="Apply the Stage 1 staged feasibility gate."
+        "check", help="Apply the staged feasibility gate."
     )
     check.add_argument("manifest")
     check.add_argument("--state-dir", required=True)
@@ -3924,7 +4326,7 @@ def main(argv: list[str] | None = None) -> int:
     inspect.add_argument("--state-dir", required=True)
 
     allocate = commands.add_parser(
-        "allocate-stage-1", help="Create the fixed Stage 1 data allocation."
+        "allocate-source", help="Create the fixed data allocation of one source."
     )
     allocate.add_argument("manifest")
     allocate.add_argument("reviews")
@@ -3932,7 +4334,7 @@ def main(argv: list[str] | None = None) -> int:
     allocate.add_argument("--state-dir", required=True)
 
     collect = commands.add_parser(
-        "collect-votes", help="Collect fixed-route Stage 1 model votes."
+        "collect-votes", help="Collect fixed-route model votes for one source."
     )
     collect.add_argument("stage_manifest")
     collect.add_argument("candidate_manifest")
@@ -3969,12 +4371,10 @@ def main(argv: list[str] | None = None) -> int:
     gpt.add_argument("--timeout-seconds", type=float, default=120)
 
     report = commands.add_parser(
-        "report-stage-1", help="Decide and report the sealed Stage 1 result."
+        "report-stage", help="Decide and report the sealed staged result."
     )
     report.add_argument("stage_manifest")
-    report.add_argument("candidate_manifest")
-    report.add_argument("allocation")
-    report.add_argument("relabels")
+    report.add_argument("sources")
     report.add_argument("--output", required=True)
     report.add_argument("--state-dir", required=True)
 
@@ -3998,8 +4398,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             _write_json({"sealed_candidate_manifest": str(output_path)})
             return 0
-        if args.command == "allocate-stage-1":
-            allocation = StageRun(args.state_dir).allocate_stage_1(
+        if args.command == "allocate-source":
+            allocation = StageRun(args.state_dir).allocate_source(
                 _read_manifest(args.manifest), _read_reviews(args.reviews)
             )
             output_path = Path(args.output)
@@ -4010,7 +4410,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             _write_json(
                 {
-                    "stage_1_allocation": str(output_path),
+                    "source_allocation": str(output_path),
                     "allocation": allocation["allocation"],
                     "stop_reason": allocation["stop_reason"],
                 }
@@ -4062,12 +4462,10 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             return 0 if complete else 2
-        if args.command == "report-stage-1":
-            result = StageRun(args.state_dir).report_stage_1(
+        if args.command == "report-stage":
+            result = StageRun(args.state_dir).report_stage(
                 _read_manifest(args.stage_manifest),
-                _read_manifest(args.candidate_manifest),
-                _read_manifest(args.allocation),
-                _read_reviews(args.relabels),
+                _read_report_sources(args.sources),
             )
             complete = result["report"] == "complete"
             if complete:
@@ -4079,7 +4477,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             _write_json(
                 {
-                    "stage_1_report": args.output if complete else None,
+                    "stage_report": args.output if complete else None,
                     "report": result["report"],
                     "stop_reason": result["stop_reason"],
                     "decision": result.get("decision"),

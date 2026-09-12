@@ -34,6 +34,12 @@ python3 -m nlp_wayfinder.stage_run check confirmed.json \
 A valid result is `build-eligible`. This result does not start work. Get separate
 approval before you use an external service.
 
+A Stage 1 manifest gives its one financial-news source in a `source` object. It
+gives the route demand in `route_panel`, the schedule in `schedule`, and the
+planned cost in `budget.planned_commitments_usd`. A later stage gives a `sources`
+array instead, and each record in that array holds its own data plan, route
+demand, schedule, and planned cost. `docs/stage-2-run.md` gives that form.
+
 Admit one target–aspect example before you send it to a person or a model:
 
 ```sh
@@ -126,7 +132,7 @@ labels. `labeled_at` is a UTC time that ends in `Z`.
 Create the complete Stage 1 allocation:
 
 ```sh
-python3 -m nlp_wayfinder.stage_run allocate-stage-1 \
+python3 -m nlp_wayfinder.stage_run allocate-source \
   sealed-candidates.json reviews.json --state-dir .wayfinder-state \
   --output stage-1-allocation.json
 ```
@@ -333,6 +339,13 @@ training backend runs on the rented GPU and on the M3 computer. The operator
 calls the method from the run script. The operator also supplies one backend
 object with a `train` method and a `predict` method.
 
+The `sources` input is a list. Each item holds the sealed `candidate_manifest`,
+the complete `allocation`, and the complete `aggregation` of one source. The list
+must hold each source of this stage and of each earlier stage, or the operation
+returns `cumulative-sources-incomplete`. One stage trains one cumulative
+checkpoint on all of them. A candidate ID that occurs in two sources returns
+`duplicate-candidate-id`.
+
 The `device_checks` input must contain `m3` and `gpu_pilot`. The `m3` check must
 contain `device_id`, `unified_memory_gb`, `max_sequence_tokens`, which must be
 512, `compatibility_verified`, `local_inference_verified`, and `evidence`. An
@@ -386,12 +399,18 @@ returns `frozen-specialist-run-changed`.
 Decide and report the Stage 1 result after both prediction files are sealed:
 
 ```sh
-python3 -m nlp_wayfinder.stage_run report-stage-1 confirmed.json \
-  sealed-candidates.json allocation.json relabels.json \
+python3 -m nlp_wayfinder.stage_run report-stage confirmed.json \
+  report-sources.json \
   --output stage-1-report.json --state-dir .wayfinder-state
 ```
 
-The relabels file is a JSON array. Each item contains `candidate_id`, `label`,
+The sources file is a JSON array. Each item gives the file path of the
+`candidate_manifest`, the `allocation`, and the `relabels` of one source. Stage 1
+has one item for financial news. A later stage has one item for each source of
+that stage and of each earlier stage. A missing source returns
+`cumulative-sources-incomplete`.
+
+Each relabels file is a JSON array. Each item contains `candidate_id`, `label`,
 and `labeled_at`. The array must contain one second label for each of the 60
 examples in `blind_relabel_sample`. A second label before `relabel_not_before`
 returns `relabel-washout-not-met`. Another candidate set returns
@@ -409,13 +428,15 @@ another candidate manifest, returns `allocation-not-complete`. A blind example
 without a valid label or event group returns `blind-label-invalid`. A second
 label that is not one of the four classes returns `relabel-label-invalid`.
 
-The report gives each class F1, the four-class macro-F1 for the specialist model
-and for the GPT-5.6-sol baseline, and the specialist-minus-GPT difference. The
-paired bootstrap resamples the blind event groups 10,000 times with seed
-`20260905`. It gives the two-sided 95% percentile interval of the difference.
-Financial news passes the source guardrail only when the lower limit is
-`-0.03` or more. The report records superiority only when the lower limit is
-more than zero.
+The report gives one decision for each source. For each source it gives each
+class F1, the four-class macro-F1 for the specialist model and for the
+GPT-5.6-sol baseline, and the specialist-minus-GPT difference. The paired
+bootstrap resamples the blind event groups of that source 10,000 times with seed
+`20260905`. It gives the two-sided 95% percentile interval of the difference. A
+source passes its guardrail only when the lower limit is `-0.03` or more. The
+report records superiority only when the lower limit is more than zero. The
+stage guardrail passes only when each source passes. The pooled score under
+`metrics.pooled` is diagnostic only. It cannot make a failed source pass.
 
 The report also gives the raw agreement and the Cohen kappa of the delayed
 60-example relabel. The first human label stays as the reference label. The
@@ -423,7 +444,7 @@ second label does not change the benchmark result.
 
 The report contains the decisions, the counts, the model and route identities,
 the GPT attempt counts, the manifest and prediction-file hashes, the software
-versions, both prediction files, the metrics, the decision records, and the
+versions, each prediction file, the metrics, the decision records, and the
 spend-ledger entries. It carries its own SHA-256 hash. The command returns exit
 code `2` and writes no file when the report is not complete.
 

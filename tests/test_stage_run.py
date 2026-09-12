@@ -23,8 +23,12 @@ from nlp_wayfinder.stage_run import (
     MODERNBERT_REVISION,
     SILVER_CALIBRATION_FOLDS,
     SILVER_MIN_PROBABILITY,
+    SOURCE_ALLOCATION_TARGETS,
+    SOURCE_SILVER_CANDIDATE_LIMITS,
+    STAGE_SOURCES,
     OmniRouteHttpTransport,
     RESULT_LABELS,
+    RIGHTS_FIELDS,
     STAGE_1_ASPECTS,
     VOTE_CONFIDENCE_BANDS,
     VOTE_FIELDS,
@@ -34,13 +38,14 @@ from nlp_wayfinder.stage_run import (
     OmniRouteResponse,
     StageRun,
     admit_example,
-    allocate_stage_1,
+    allocate_source,
     main as stage_run_main,
     project_gpt_blind_cost,
     project_specialist_training_cost,
     _calibration_fold,
     _silver_rejection,
     candidate_order_sha256,
+    cumulative_sources,
     seal_candidate_manifest,
     confirm_manifest,
 )
@@ -286,11 +291,13 @@ def company_record(company_id: str) -> dict[str, object]:
     }
 
 
-def candidate_manifest() -> dict[str, object]:
+def candidate_manifest(
+    stage: int = 1, source: str = "financial-news"
+) -> dict[str, object]:
     return {
         "schema_version": 1,
-        "stage": 1,
-        "source": "financial-news",
+        "stage": stage,
+        "source": source,
         "annex": {
             "acquisition": {
                 "method": "Fixed export from the approved source.",
@@ -324,7 +331,7 @@ def candidate_manifest() -> dict[str, object]:
                 "blind_ends_on": "2026-12-31",
             },
             "limits": {
-                "silver_candidate_limit": 6668,
+                "silver_candidate_limit": SOURCE_SILVER_CANDIDATE_LIMITS[source],
                 "development_target": 200,
                 "blind_target": 400,
             },
@@ -353,8 +360,12 @@ def candidate_manifest() -> dict[str, object]:
     }
 
 
-def allocation_manifest() -> tuple[dict[str, object], list[dict[str, object]]]:
-    manifest = candidate_manifest()
+def allocation_manifest(
+    stage: int = 1, source: str = "financial-news"
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    manifest = candidate_manifest(stage, source)
+    targets = SOURCE_ALLOCATION_TARGETS[source]
+    prefix = "" if source == "financial-news" else f"{source}-"
     candidates: list[dict[str, object]] = []
     reviews: list[dict[str, object]] = []
 
@@ -371,7 +382,7 @@ def allocation_manifest() -> tuple[dict[str, object], list[dict[str, object]]]:
             "development": "2026-07-10T09:00:00Z",
             "blind": "2026-09-10T09:00:00Z",
         }[split]
-        candidate_id = f"{split}-{index:04d}"
+        candidate_id = f"{prefix}{split}-{index:04d}"
         candidates.append(
             {
                 "candidate_id": candidate_id,
@@ -393,23 +404,23 @@ def allocation_manifest() -> tuple[dict[str, object], list[dict[str, object]]]:
             }
         )
 
-    for index in range(4_000):
+    for index in range(targets["training"]):
         add_candidate(
             "training",
             index,
-            f"seen-{index // 5:04d}",
+            f"{prefix}seen-{index // 5:04d}",
             STAGE_1_ASPECTS[index % 4],
             RESULT_LABELS[index % 4],
-            f"training-event-{index:04d}",
+            f"{prefix}training-event-{index:04d}",
         )
     for index in range(200):
         add_candidate(
             "development",
             index,
-            f"development-{index // 5:04d}",
+            f"{prefix}development-{index // 5:04d}",
             STAGE_1_ASPECTS[index % 4],
             RESULT_LABELS[index % 4],
-            f"development-event-{index:04d}",
+            f"{prefix}development-event-{index:04d}",
         )
     blind_index = 0
     for aspect in STAGE_1_ASPECTS:
@@ -418,10 +429,10 @@ def allocation_manifest() -> tuple[dict[str, object], list[dict[str, object]]]:
                 add_candidate(
                     "blind",
                     blind_index,
-                    f"unseen-{blind_index // 4:03d}",
+                    f"{prefix}unseen-{blind_index // 4:03d}",
                     aspect,
                     label,
-                    f"blind-event-{blind_index:04d}",
+                    f"{prefix}blind-event-{blind_index:04d}",
                 )
                 blind_index += 1
     manifest["candidates"] = candidates
@@ -496,9 +507,12 @@ class StageRunTests(unittest.TestCase):
         self.assertIsNone(decision["stop_reason"])
         self.assertEqual(["stage-1-build"], decision["permitted_external_actions"])
         evidence = cast(dict[str, Any], decision["evidence"])
-        self.assertEqual("financial-news-fixture", evidence["source"]["source_id"])
+        self.assertEqual(
+            "financial-news-fixture",
+            evidence["sources"]["financial-news"]["source_id"],
+        )
         self.assertEqual(list(ROUTE_IDS), evidence["routes"]["eligible_route_ids"])
-        self.assertEqual(7, evidence["schedule"]["required_days"])
+        self.assertEqual(7, evidence["schedule"]["financial-news"]["required_days"])
         self.assertEqual("fixture-owner", evidence["confirmation"]["confirmed_by"])
         self.assertEqual("100.00", evidence["budget"]["total_limit_usd"])
         self.assertEqual("75.00", evidence["budget"]["planned_total_usd"])
@@ -918,7 +932,7 @@ class StageOneAllocationTests(unittest.TestCase):
         sealed = seal_candidate_manifest(manifest, "fixture-owner")
 
         with self.assertRaisesRegex(ValueError, "allocation-review-not-inspected"):
-            allocate_stage_1(sealed, reviews, [])
+            allocate_source(sealed, reviews, [])
 
     def test_complete_allocation_has_fixed_quotas_balance_and_relabel_sample(
         self,
@@ -930,7 +944,7 @@ class StageOneAllocationTests(unittest.TestCase):
             sealed_at="2026-09-10T00:00:00Z",
         )
 
-        result = allocate_stage_1(sealed, reviews, inspection_records(sealed, reviews))
+        result = allocate_source(sealed, reviews, inspection_records(sealed, reviews))
 
         self.assertEqual("complete", result["allocation"])
         self.assertIsNone(result["stop_reason"])
@@ -1016,7 +1030,7 @@ class StageOneAllocationTests(unittest.TestCase):
                 "labeled_at": "2026-09-11T00:00:00Z",
             }
         sealed = seal_candidate_manifest(manifest, "fixture-owner")
-        result = allocate_stage_1(
+        result = allocate_source(
             sealed, [], inspection_records(sealed, list(reviews_by_id.values()))
         )
 
@@ -1069,7 +1083,7 @@ class StageOneAllocationTests(unittest.TestCase):
             review for review in reviews if review["candidate_id"] == excluded_id
         )["disposition"] = "excluded"
 
-        result = allocate_stage_1(sealed, reviews, inspection_records(sealed, reviews))
+        result = allocate_source(sealed, reviews, inspection_records(sealed, reviews))
 
         selected_ids = {
             item["candidate_id"]
@@ -1122,7 +1136,7 @@ class StageOneAllocationTests(unittest.TestCase):
         )
         sealed = seal_candidate_manifest(manifest, "fixture-owner")
 
-        result = allocate_stage_1(
+        result = allocate_source(
             sealed, reviews, inspection_records(sealed, reviews)
         )
 
@@ -1240,7 +1254,7 @@ class StageOneAllocationTests(unittest.TestCase):
         )
         sealed = seal_candidate_manifest(manifest, "fixture-owner")
 
-        result = allocate_stage_1(
+        result = allocate_source(
             sealed, reviews, inspection_records(sealed, reviews)
         )
 
@@ -1294,7 +1308,7 @@ class StageOneAllocationTests(unittest.TestCase):
             )
         sealed = seal_candidate_manifest(manifest, "fixture-owner")
 
-        result = allocate_stage_1(
+        result = allocate_source(
             sealed, reviews, inspection_records(sealed, reviews)
         )
 
@@ -1304,7 +1318,7 @@ class StageOneAllocationTests(unittest.TestCase):
     def test_allocation_is_repeatable_for_the_same_review_records(self) -> None:
         manifest, reviews = allocation_manifest()
         sealed = seal_candidate_manifest(manifest, "fixture-owner")
-        result = allocate_stage_1(
+        result = allocate_source(
             sealed, reviews, inspection_records(sealed, reviews)
         )
 
@@ -1362,7 +1376,7 @@ class StageOneAllocationTests(unittest.TestCase):
                 change(blind_candidates)
                 sealed = seal_candidate_manifest(manifest, "fixture-owner")
 
-                result = allocate_stage_1(
+                result = allocate_source(
                     sealed, reviews, inspection_records(sealed, reviews)
                 )
 
@@ -3120,9 +3134,13 @@ class SpecialistTrainingTests(unittest.TestCase):
         )
         return self.runner.train_specialist(
             stage_manifest,
-            candidates,
-            allocation,
-            aggregation,
+            [
+                {
+                    "candidate_manifest": candidates,
+                    "allocation": allocation,
+                    "aggregation": aggregation,
+                }
+            ],
             backend,
             device_checks={
                 "m3": self.m3_check() if m3 is None else m3,
@@ -3419,9 +3437,13 @@ class SpecialistTrainingTests(unittest.TestCase):
 
         result = self.runner.train_specialist(
             stage_manifest,
-            changed,
-            allocation,
-            aggregation,
+            [
+                {
+                    "candidate_manifest": changed,
+                    "allocation": allocation,
+                    "aggregation": aggregation,
+                }
+            ],
             FakeTrainingBackend(),
             device_checks={"m3": self.m3_check(), "gpu_pilot": self.pilot()},
         )
@@ -3448,8 +3470,115 @@ class LabelledGptTransport:
 BLIND_REPORT_SIZE = 64
 
 
-def blind_passage(index: int) -> str:
-    return f"Coast Metal blind passage {index}."
+def blind_passage(index: int, source: str = "financial-news") -> str:
+    return f"{source} Coast Metal blind passage {index}."
+
+
+def report_source_fixture(
+    reference: Mapping[str, str],
+    *,
+    stage: int = 1,
+    source: str = "financial-news",
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    """Build one sealed manifest, allocation, and aggregation of one source."""
+    prefix = "" if source == "financial-news" else f"{source}-"
+    candidates = candidate_manifest(stage, source)
+    rows: list[dict[str, object]] = [
+        {
+            "candidate_id": f"{prefix}training-{index}",
+            "event_group_id": f"{prefix}event-training-{index}",
+            "company_id": f"{prefix}Harbor Grid Ltd",
+            "company": company_record(f"{prefix}Harbor Grid Ltd"),
+            "aspect": STAGE_1_ASPECTS[index % 4],
+            "published_at": "2026-03-10T09:00:00Z",
+            "normalized_passage": f"{prefix}Harbor Grid training passage {index}.",
+            "near_duplicate_reviewed": True,
+        }
+        for index in range(2)
+    ]
+    rows.extend(
+        {
+            "candidate_id": f"{prefix}development-{index}",
+            "event_group_id": f"{prefix}event-development-{index}",
+            "company_id": f"{prefix}Bay Rail Plc",
+            "company": company_record(f"{prefix}Bay Rail Plc"),
+            "aspect": STAGE_1_ASPECTS[index % 4],
+            "published_at": "2026-07-10T09:00:00Z",
+            "normalized_passage": f"{prefix}Bay Rail development passage {index}.",
+            "near_duplicate_reviewed": True,
+        }
+        for index in range(4)
+    )
+    rows.extend(
+        {
+            "candidate_id": f"{prefix}blind-{index:02d}",
+            # Two blind examples share one event group, so the bootstrap
+            # resamples fewer units than examples.
+            "event_group_id": f"{prefix}event-blind-{index // 2:02d}",
+            "company_id": f"{prefix}Coast Metal {index // 8} Plc",
+            "company": company_record(f"{prefix}Coast Metal {index // 8} Plc"),
+            "aspect": STAGE_1_ASPECTS[index % 4],
+            "published_at": "2026-09-10T09:00:00Z",
+            "normalized_passage": blind_passage(index, source),
+            "near_duplicate_reviewed": True,
+        }
+        for index in range(BLIND_REPORT_SIZE)
+    )
+    candidates["candidates"] = rows
+    sealed = seal_candidate_manifest(candidates, "fixture-owner")
+    manifest_sha256 = str(
+        cast(Mapping[str, object], sealed["seal"])["semantic_sha256"]
+    )
+    blind = [
+        {
+            "candidate_id": candidate_id,
+            "event_group_id": f"{prefix}event-blind-{index // 2:02d}",
+            "company_id": f"{prefix}Coast Metal {index // 8} Plc",
+            "company": company_record(f"{prefix}Coast Metal {index // 8} Plc"),
+            "aspect": STAGE_1_ASPECTS[index % 4],
+            "label": label,
+            "labeled_at": "2026-09-11T00:00:00Z",
+            "unseen_issuer": True,
+        }
+        for index, (candidate_id, label) in enumerate(reference.items())
+    ]
+    allocation: dict[str, object] = {
+        "allocation": "complete",
+        "stop_reason": None,
+        "candidate_manifest_sha256": manifest_sha256,
+        "silver_candidates_inspected": 70,
+        "training": [
+            {"candidate_id": f"{prefix}training-0"},
+            {"candidate_id": f"{prefix}training-1"},
+        ],
+        "development": [
+            {"candidate_id": f"{prefix}development-{index}", "label": RESULT_LABELS[index]}
+            for index in range(4)
+        ],
+        "blind": blind,
+        "blind_relabel_seed": BLIND_RELABEL_SEED,
+        "blind_relabel_sample": [
+            {
+                "candidate_id": item["candidate_id"],
+                "aspect": item["aspect"],
+                "label": item["label"],
+                "relabel_not_before": "2026-09-25T00:00:00Z",
+            }
+            for item in blind[:BLIND_RELABEL_TARGET]
+        ],
+        "allocation_sha256": "fixture-allocation-sha256",
+    }
+    aggregation: dict[str, object] = {
+        "aggregation": "complete",
+        "stop_reason": None,
+        "candidate_manifest_sha256": manifest_sha256,
+        "accepted_silver_count": 2,
+        "accepted_silver": [
+            {"candidate_id": f"{prefix}training-0", "label": "positive", "probability": 0.91},
+            {"candidate_id": f"{prefix}training-1", "label": "negative", "probability": 0.86},
+        ],
+    }
+    return sealed, allocation, aggregation
 
 
 class Stage1ReportTests(unittest.TestCase):
@@ -3482,103 +3611,29 @@ class Stage1ReportTests(unittest.TestCase):
         self,
     ) -> tuple[dict[str, object], dict[str, object], dict[str, object], dict[str, object]]:
         stage_manifest = confirm_manifest(draft_manifest(), "fixture-owner")
-        candidates = candidate_manifest()
-        rows: list[dict[str, object]] = [
-            {
-                "candidate_id": f"training-{index}",
-                "event_group_id": f"event-training-{index}",
-                "company_id": "Harbor Grid Ltd",
-                "company": company_record("Harbor Grid Ltd"),
-                "aspect": STAGE_1_ASPECTS[index % 4],
-                "published_at": "2026-03-10T09:00:00Z",
-                "normalized_passage": f"Harbor Grid training passage {index}.",
-                "near_duplicate_reviewed": True,
-            }
-            for index in range(2)
-        ]
-        rows.extend(
-            {
-                "candidate_id": f"development-{index}",
-                "event_group_id": f"event-development-{index}",
-                "company_id": "Bay Rail Plc",
-                "company": company_record("Bay Rail Plc"),
-                "aspect": STAGE_1_ASPECTS[index % 4],
-                "published_at": "2026-07-10T09:00:00Z",
-                "normalized_passage": f"Bay Rail development passage {index}.",
-                "near_duplicate_reviewed": True,
-            }
-            for index in range(4)
-        )
-        rows.extend(
-            {
-                "candidate_id": f"blind-{index:02d}",
-                # Two blind examples share one event group, so the bootstrap
-                # resamples fewer units than examples.
-                "event_group_id": f"event-blind-{index // 2:02d}",
-                "company_id": f"Coast Metal {index // 8} Plc",
-                "company": company_record(f"Coast Metal {index // 8} Plc"),
-                "aspect": STAGE_1_ASPECTS[index % 4],
-                "published_at": "2026-09-10T09:00:00Z",
-                "normalized_passage": blind_passage(index),
-                "near_duplicate_reviewed": True,
-            }
-            for index in range(BLIND_REPORT_SIZE)
-        )
-        candidates["candidates"] = rows
-        sealed = seal_candidate_manifest(candidates, "fixture-owner")
-        manifest_sha256 = str(
-            cast(Mapping[str, object], sealed["seal"])["semantic_sha256"]
-        )
-        blind = [
-            {
-                "candidate_id": candidate_id,
-                "event_group_id": f"event-blind-{index // 2:02d}",
-                "company_id": f"Coast Metal {index // 8} Plc",
-                "company": company_record(f"Coast Metal {index // 8} Plc"),
-                "aspect": STAGE_1_ASPECTS[index % 4],
-                "label": label,
-                "labeled_at": "2026-09-11T00:00:00Z",
-                "unseen_issuer": True,
-            }
-            for index, (candidate_id, label) in enumerate(self.reference.items())
-        ]
-        allocation: dict[str, object] = {
-            "allocation": "complete",
-            "stop_reason": None,
-            "candidate_manifest_sha256": manifest_sha256,
-            "silver_candidates_inspected": 70,
-            "training": [
-                {"candidate_id": "training-0"},
-                {"candidate_id": "training-1"},
-            ],
-            "development": [
-                {"candidate_id": f"development-{index}", "label": RESULT_LABELS[index]}
-                for index in range(4)
-            ],
-            "blind": blind,
-            "blind_relabel_seed": BLIND_RELABEL_SEED,
-            "blind_relabel_sample": [
-                {
-                    "candidate_id": item["candidate_id"],
-                    "aspect": item["aspect"],
-                    "label": item["label"],
-                    "relabel_not_before": "2026-09-25T00:00:00Z",
-                }
-                for item in blind[:BLIND_RELABEL_TARGET]
-            ],
-            "allocation_sha256": "fixture-allocation-sha256",
-        }
-        aggregation: dict[str, object] = {
-            "aggregation": "complete",
-            "stop_reason": None,
-            "candidate_manifest_sha256": manifest_sha256,
-            "accepted_silver_count": 2,
-            "accepted_silver": [
-                {"candidate_id": "training-0", "label": "positive", "probability": 0.91},
-                {"candidate_id": "training-1", "label": "negative", "probability": 0.86},
-            ],
-        }
+        sealed, allocation, aggregation = report_source_fixture(self.reference)
         return stage_manifest, sealed, allocation, aggregation
+
+
+    def source_metrics(
+        self, result: Mapping[str, object], source: str = "financial-news"
+    ) -> Mapping[str, Any]:
+        metrics = cast(Mapping[str, Any], result["metrics"])
+        return cast(Mapping[str, Any], metrics["by_source"][source])
+
+    def report_sources(
+        self,
+        candidates: Mapping[str, object],
+        allocation: Mapping[str, object],
+        relabels: Sequence[Mapping[str, object]] | None = None,
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                "candidate_manifest": candidates,
+                "allocation": allocation,
+                "relabels": self.relabels() if relabels is None else relabels,
+            }
+        ]
 
     def wrong(self, label: str) -> str:
         return RESULT_LABELS[(RESULT_LABELS.index(label) + 1) % 4]
@@ -3615,9 +3670,13 @@ class Stage1ReportTests(unittest.TestCase):
         backend = FakeTrainingBackend(blind_labels=self.labels(specialist_wrong))
         self.runner.train_specialist(
             stage_manifest,
-            candidates,
-            allocation,
-            aggregation,
+            [
+                {
+                    "candidate_manifest": candidates,
+                    "allocation": allocation,
+                    "aggregation": aggregation,
+                }
+            ],
             backend,
             device_checks={
                 "m3": {
@@ -3670,11 +3729,19 @@ class Stage1ReportTests(unittest.TestCase):
             },
             sleep=self.delays.append,
         )
-        return self.runner.report_stage_1(
+        return self.runner.report_stage(
             stage_manifest,
-            candidates,
-            allocation,
-            self.relabels(changed_relabels) if relabels is None else relabels,
+            [
+                {
+                    "candidate_manifest": candidates,
+                    "allocation": allocation,
+                    "relabels": (
+                        self.relabels(changed_relabels)
+                        if relabels is None
+                        else relabels
+                    ),
+                }
+            ],
         )
 
     def test_the_report_scores_the_sealed_paired_predictions(self) -> None:
@@ -3682,7 +3749,7 @@ class Stage1ReportTests(unittest.TestCase):
 
         self.assertEqual("complete", result["report"])
         self.assertIsNone(result["stop_reason"])
-        metrics = cast(Mapping[str, Any], result["metrics"])
+        metrics = self.source_metrics(result)
         self.assertEqual(1.0, metrics["specialist"]["macro_f1"])
         self.assertEqual(1.0, metrics["gpt"]["macro_f1"])
         self.assertEqual(0.0, metrics["macro_f1_difference"])
@@ -3690,11 +3757,14 @@ class Stage1ReportTests(unittest.TestCase):
             {label: 1.0 for label in RESULT_LABELS},
             metrics["specialist"]["class_f1"],
         )
+        pooled = cast(Mapping[str, Any], result["metrics"])["pooled"]
+        self.assertTrue(pooled["diagnostic_only"])
+        self.assertEqual(0.0, pooled["macro_f1_difference"])
 
     def test_the_paired_bootstrap_uses_the_fixed_seed_and_interval(self) -> None:
         result = self.report()
 
-        bootstrap = cast(Mapping[str, Any], result["metrics"])["bootstrap"]
+        bootstrap = self.source_metrics(result)["bootstrap"]
         self.assertEqual("20260905", bootstrap["seed"])
         self.assertEqual(10_000, bootstrap["samples"])
         self.assertEqual(0.95, bootstrap["interval"])
@@ -3706,18 +3776,21 @@ class Stage1ReportTests(unittest.TestCase):
     def test_an_equal_result_passes_the_guardrail_without_superiority(self) -> None:
         decision = cast(Mapping[str, Any], self.report()["decision"])
 
-        self.assertEqual("pass", decision["source_guardrail"])
+        self.assertEqual(
+            {"financial-news": "pass"}, decision["source_guardrail"]
+        )
+        self.assertEqual("pass", decision["stage_guardrail"])
         self.assertEqual(-0.03, decision["non_inferiority_margin"])
-        self.assertFalse(decision["superiority"])
+        self.assertEqual({"financial-news": False}, decision["superiority"])
         self.assertEqual("first-human-label", decision["reference_label"])
 
     def test_a_positive_lower_limit_records_superiority(self) -> None:
         result = self.report(gpt_wrong=24)
 
         decision = cast(Mapping[str, Any], result["decision"])
-        metrics = cast(Mapping[str, Any], result["metrics"])
-        self.assertEqual("pass", decision["source_guardrail"])
-        self.assertTrue(decision["superiority"])
+        metrics = self.source_metrics(result)
+        self.assertEqual("pass", decision["source_guardrail"]["financial-news"])
+        self.assertTrue(decision["superiority"]["financial-news"])
         self.assertGreater(metrics["bootstrap"]["lower_limit"], 0.0)
         self.assertGreater(metrics["macro_f1_difference"], 0.0)
         self.assertLess(metrics["gpt"]["macro_f1"], 1.0)
@@ -3726,15 +3799,16 @@ class Stage1ReportTests(unittest.TestCase):
         result = self.report(specialist_wrong=32)
 
         decision = cast(Mapping[str, Any], result["decision"])
-        metrics = cast(Mapping[str, Any], result["metrics"])
-        self.assertEqual("fail", decision["source_guardrail"])
-        self.assertFalse(decision["superiority"])
+        metrics = self.source_metrics(result)
+        self.assertEqual("fail", decision["source_guardrail"]["financial-news"])
+        self.assertEqual("fail", decision["stage_guardrail"])
+        self.assertFalse(decision["superiority"]["financial-news"])
         self.assertLess(metrics["bootstrap"]["lower_limit"], -0.03)
 
     def test_the_relabel_measures_repeatability_and_keeps_the_first_label(self) -> None:
         result = self.report(changed_relabels=6)
 
-        metrics = cast(Mapping[str, Any], result["metrics"])
+        metrics = self.source_metrics(result)
         self_consistency = metrics["self_consistency"]
         self.assertEqual(BLIND_RELABEL_TARGET, self_consistency["example_count"])
         self.assertEqual(54, self_consistency["agreed_count"])
@@ -3763,8 +3837,8 @@ class Stage1ReportTests(unittest.TestCase):
     def test_a_missing_prediction_file_stops_the_report(self) -> None:
         stage_manifest, candidates, allocation, _ = self.report_inputs()
 
-        result = self.runner.report_stage_1(
-            stage_manifest, candidates, allocation, self.relabels()
+        result = self.runner.report_stage(
+            stage_manifest, self.report_sources(candidates, allocation)
         )
 
         self.assertEqual("invalid", result["report"])
@@ -3775,8 +3849,8 @@ class Stage1ReportTests(unittest.TestCase):
         stage_manifest, candidates, allocation, _ = self.report_inputs()
         cast(list[Any], allocation["blind"]).pop()
 
-        result = self.runner.report_stage_1(
-            stage_manifest, candidates, allocation, self.relabels()
+        result = self.runner.report_stage(
+            stage_manifest, self.report_sources(candidates, allocation)
         )
 
         self.assertEqual("invalid", result["report"])
@@ -3789,29 +3863,41 @@ class Stage1ReportTests(unittest.TestCase):
         identities = cast(Mapping[str, Any], result["identities"])
         hashes = cast(Mapping[str, Any], result["hashes"])
         attempts = cast(Mapping[str, Any], result["attempts"])
+        source_metrics = self.source_metrics(result)
         self.assertEqual(BLIND_REPORT_SIZE, counts["blind_examples"])
-        self.assertEqual(BLIND_REPORT_SIZE // 2, counts["blind_event_groups"])
-        self.assertEqual(BLIND_REPORT_SIZE, counts["unseen_issuers"])
+        self.assertEqual(BLIND_REPORT_SIZE // 2, source_metrics["blind_event_groups"])
+        self.assertEqual(BLIND_REPORT_SIZE, source_metrics["unseen_issuers"])
         self.assertEqual(2, counts["training_examples"])
         self.assertEqual(4, counts["development_examples"])
-        self.assertEqual(70, counts["silver_candidates_inspected"])
-        self.assertEqual(BLIND_RELABEL_TARGET, counts["relabel_examples"])
+        self.assertEqual(
+            {"financial-news": 70}, counts["silver_candidates_inspected"]
+        )
+        self.assertEqual(
+            BLIND_RELABEL_TARGET,
+            source_metrics["self_consistency"]["example_count"],
+        )
         self.assertEqual(BLIND_REPORT_SIZE, counts["gpt_attempts"])
         self.assertEqual(MODERNBERT_MODEL_ID, identities["specialist_model_id"])
         self.assertEqual(MODERNBERT_REVISION, identities["specialist_revision"])
-        self.assertEqual("cx/gpt-5.6-sol-medium", identities["gpt_route_id"])
-        self.assertEqual("medium", identities["gpt_reasoning_effort"])
+        self.assertEqual(
+            {"financial-news": "cx/gpt-5.6-sol-medium"}, identities["gpt_route_id"]
+        )
+        self.assertEqual(
+            {"financial-news": "medium"}, identities["gpt_reasoning_effort"]
+        )
         self.assertEqual(list(ROUTE_IDS), identities["labeling_route_ids"])
-        self.assertEqual("fixture-allocation-sha256", hashes["allocation_sha256"])
-        for name in (
-            "stage_manifest_sha256",
-            "candidate_manifest_sha256",
-            "specialist_prediction_file_sha256",
-            "gpt_prediction_file_sha256",
-            "training_config_sha256",
-            "gpt_prompt_sha256",
-        ):
+        self.assertEqual(
+            {"financial-news": "fixture-allocation-sha256"},
+            hashes["allocation_sha256"],
+        )
+        for name in ("stage_manifest_sha256", "specialist_prediction_file_sha256",
+                     "training_config_sha256"):
             self.assertEqual(64, len(cast(str, hashes[name])), name)
+        for name in ("candidate_manifest_sha256", "gpt_prediction_file_sha256",
+                     "gpt_prompt_sha256"):
+            self.assertEqual(
+                64, len(cast(str, hashes[name]["financial-news"])), name
+            )
         self.assertEqual({"valid": BLIND_REPORT_SIZE}, attempts["gpt_by_outcome"])
         self.assertEqual(0, attempts["gpt_retried_examples"])
         self.assertEqual(3, len(cast(list[Any], attempts["specialist_training_runs"])))
@@ -3825,12 +3911,12 @@ class Stage1ReportTests(unittest.TestCase):
         self.assertIsInstance(result["ledger_entries"], list)
         self.assertEqual(64, len(cast(str, result["report_sha256"])))
         self.assertIn(
-            "stage-1-report",
+            "stage-report",
             [record["event"] for record in self.runner.decision_records()],
         )
 
-    def test_the_cli_writes_the_stage_1_report(self) -> None:
-        stage_manifest, candidates, allocation, aggregation = self.report_inputs()
+    def test_the_cli_writes_the_stage_report(self) -> None:
+        stage_manifest, candidates, allocation, _ = self.report_inputs()
         self.report()
         paths = {}
         for name, value in (
@@ -3842,15 +3928,26 @@ class Stage1ReportTests(unittest.TestCase):
             path = self.state_dir / name
             path.write_text(json.dumps(value), encoding="utf-8")
             paths[name] = str(path)
+        sources_path = self.state_dir / "sources.json"
+        sources_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "candidate_manifest": paths["candidates.json"],
+                        "allocation": paths["allocation.json"],
+                        "relabels": paths["relabels.json"],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
         output = self.state_dir / "stage-1-report.json"
 
         code = stage_run_main(
             [
-                "report-stage-1",
+                "report-stage",
                 paths["stage.json"],
-                paths["candidates.json"],
-                paths["allocation.json"],
-                paths["relabels.json"],
+                str(sources_path),
                 "--output",
                 str(output),
                 "--state-dir",
@@ -3861,4 +3958,529 @@ class Stage1ReportTests(unittest.TestCase):
         self.assertEqual(0, code)
         written = json.loads(output.read_text(encoding="utf-8"))
         self.assertEqual("complete", written["report"])
-        self.assertEqual("pass", written["decision"]["source_guardrail"])
+        self.assertEqual(
+            "pass", written["decision"]["source_guardrail"]["financial-news"]
+        )
+
+
+STAGE_2_RIGHTS = {field: True for field in RIGHTS_FIELDS}
+
+
+def stage_2_source(source_type: str) -> dict[str, object]:
+    """Give the complete gate record of one Stage 2 source."""
+    return {
+        "source_id": f"{source_type}-fixture",
+        "source_type": source_type,
+        **STAGE_2_RIGHTS,
+        "evidence": {
+            "checked_at": "2026-09-28T00:00:00Z",
+            "terms_url": f"https://example.test/{source_type}-terms",
+            "reviewer": "fixture-reviewer",
+        },
+        "data_plan": {
+            "silver_candidate_limit": SOURCE_SILVER_CANDIDATE_LIMITS[source_type],
+            **SOURCE_ALLOCATION_TARGETS[source_type],
+        },
+        "route_requests": {route_id: 3_400 for route_id in ROUTE_IDS},
+        "schedule": {
+            "starts_on": "2026-10-01",
+            "must_finish_by": "2026-10-07",
+            "evidence": f"fixture {source_type} schedule review",
+        },
+        "planned_commitments_usd": {
+            "paid-silver-labels": "0.00",
+            "specialist": "2.00",
+            "gpt": "5.00",
+            "data-and-storage": "5.00",
+            "contingency": "0.00",
+        },
+    }
+
+
+def draft_stage_2_manifest() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "run_id": "stage-2-fixture",
+        "stage": 2,
+        "sources": [stage_2_source(name) for name in STAGE_SOURCES[2]],
+        "route_panel": {
+            "inspection_complete": True,
+            "routes": [route(route_id) for route_id in ROUTE_IDS],
+        },
+        "budget": {"evidence": "fixture Stage 2 cost projection"},
+    }
+
+
+class StageTwoGateTests(unittest.TestCase):
+    """Stage 2 starts only after each new source passes its own gate."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.runner = StageRun(
+            Path(self.temp_dir.name), clock=lambda: "2026-09-28T00:00:00Z"
+        )
+
+    def evaluate(self, manifest: Mapping[str, object]) -> dict[str, object]:
+        return self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+
+    def test_both_new_sources_pass_their_own_gate(self) -> None:
+        decision = self.evaluate(draft_stage_2_manifest())
+
+        self.assertEqual("build-eligible", decision["decision"])
+        self.assertEqual(2, decision["stage"])
+        self.assertEqual(["stage-2-build"], decision["permitted_external_actions"])
+        evidence = cast(dict[str, Any], decision["evidence"])
+        self.assertEqual(set(STAGE_SOURCES[2]), set(evidence["sources"]))
+        self.assertEqual(
+            "company-announcements-fixture",
+            evidence["sources"]["company-announcements"]["source_id"],
+        )
+        self.assertEqual(
+            4, evidence["schedule"]["regulatory-filings"]["required_days"]
+        )
+        self.assertEqual("10.00", evidence["budget"]["planned_commitments_usd"]["gpt"])
+
+    def test_a_failed_right_of_one_source_stops_the_stage(self) -> None:
+        manifest = draft_stage_2_manifest()
+        cast(list[dict[str, object]], manifest["sources"])[1][
+            "training_permitted"
+        ] = False
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("no-build", decision["decision"])
+        self.assertEqual("source-rights-failed", decision["stop_reason"])
+
+    def test_one_new_source_alone_cannot_start_the_stage(self) -> None:
+        manifest = draft_stage_2_manifest()
+        manifest["sources"] = cast(list[object], manifest["sources"])[:1]
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("stage-source-incomplete", decision["stop_reason"])
+
+    def test_a_stage_1_source_cannot_enter_the_stage_2_gate(self) -> None:
+        manifest = draft_stage_2_manifest()
+        cast(list[dict[str, object]], manifest["sources"])[0][
+            "source_type"
+        ] = "financial-news"
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("source-rights-failed", decision["stop_reason"])
+
+    def test_a_wrong_data_plan_stops_the_stage(self) -> None:
+        manifest = draft_stage_2_manifest()
+        cast(list[dict[str, Any]], manifest["sources"])[0]["data_plan"][
+            "training"
+        ] = 4_000
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("source-data-plan-invalid", decision["stop_reason"])
+
+    def test_a_short_schedule_of_one_source_stops_the_stage(self) -> None:
+        manifest = draft_stage_2_manifest()
+        cast(list[dict[str, Any]], manifest["sources"])[1]["schedule"][
+            "must_finish_by"
+        ] = "2026-10-03"
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("route-schedule-infeasible", decision["stop_reason"])
+
+    def test_a_route_demand_above_the_daily_rate_stops_the_stage(self) -> None:
+        manifest = draft_stage_2_manifest()
+        cast(list[dict[str, Any]], manifest["sources"])[0]["route_requests"][
+            ROUTE_IDS[0]
+        ] = 9_000
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("route-schedule-infeasible", decision["stop_reason"])
+
+    def test_the_two_source_budgets_add_against_one_category_limit(self) -> None:
+        manifest = draft_stage_2_manifest()
+        for source in cast(list[dict[str, Any]], manifest["sources"]):
+            source["planned_commitments_usd"]["gpt"] = "20.00"
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("category-budget-exceeded", decision["stop_reason"])
+
+
+class StageTwoSourceDataTests(unittest.TestCase):
+    """Each Stage 2 source has its own smaller sealed annex and quota."""
+
+    def test_the_annex_uses_the_smaller_stage_2_limits(self) -> None:
+        sealed = seal_candidate_manifest(
+            candidate_manifest(2, "regulatory-filings"), "fixture-owner"
+        )
+
+        limits = cast(Mapping[str, Any], sealed["annex"])["limits"]
+        self.assertEqual(3_333, limits["silver_candidate_limit"])
+        self.assertEqual("regulatory-filings", sealed["source"])
+
+    def test_a_stage_1_limit_cannot_seal_a_stage_2_annex(self) -> None:
+        draft = candidate_manifest(2, "company-announcements")
+        cast(Mapping[str, Any], draft["annex"])["limits"][
+            "silver_candidate_limit"
+        ] = 6_668
+
+        with self.assertRaises(ValueError) as error:
+            seal_candidate_manifest(draft, "fixture-owner")
+
+        self.assertEqual("source-annex-incomplete", str(error.exception))
+
+    def test_a_source_outside_the_stage_cannot_seal(self) -> None:
+        with self.assertRaises(ValueError):
+            seal_candidate_manifest(
+                candidate_manifest(2, "financial-news"), "fixture-owner"
+            )
+
+    def test_the_source_adds_two_thousand_accepted_silver_examples(self) -> None:
+        manifest, reviews = allocation_manifest(2, "company-announcements")
+        sealed = seal_candidate_manifest(manifest, "fixture-owner")
+
+        result = allocate_source(sealed, reviews, inspection_records(sealed, reviews))
+
+        self.assertEqual("complete", result["allocation"])
+        self.assertEqual(
+            {"training": 2_000, "development": 200, "blind": 400},
+            result["selected_counts"],
+        )
+        self.assertEqual("company-announcements", result["source"])
+        self.assertEqual(3_333, result["silver_candidate_limit"])
+
+
+M3_CHECK: dict[str, object] = {
+    "device_id": "m3-fixture",
+    "unified_memory_gb": 8,
+    "max_sequence_tokens": 512,
+    "compatibility_verified": True,
+    "local_inference_verified": True,
+    "evidence": "fixture device record",
+}
+GPU_PILOT: dict[str, object] = {
+    "gpu_model": "A40",
+    "gpu_architecture": "Ampere",
+    "gpu_memory_gb": 48,
+    "peak_memory_gb": 31.5,
+    "max_sequence_tokens": MAX_EXAMPLE_TOKENS,
+    "pilot_usd": "4.20",
+    "initial_loss": 1.39,
+    "final_loss": 0.62,
+    "examples_per_second": 8.0,
+    "training_examples_per_seed": 12_000,
+    "hourly_usd": "0.80",
+    "storage_gb": 30,
+    "storage_usd_per_gb_month": "0.02",
+    "storage_months": 1,
+    "tax_rate": "0.00",
+}
+GPT_FORECAST: dict[str, object] = {
+    "measured_split": "development",
+    "measured_candidate_ids": ["development-0"],
+    "prompt_tokens_per_example": 1200,
+    "completion_tokens_per_example": 600,
+    "prompt_usd_per_1k_tokens": "0.0012",
+    "completion_usd_per_1k_tokens": "0.0060",
+    "charged_retry_reserve_attempts": 100,
+}
+
+
+class StageTwoCumulativeTests(unittest.TestCase):
+    """One cumulative checkpoint, one decision for each source, one pooled view."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.state_dir = Path(self.temp_dir.name)
+        self.runner = StageRun(self.state_dir, clock=lambda: "2026-10-02T00:00:00Z")
+        self.delays: list[float] = []
+        self.stage_manifests = {
+            1: confirm_manifest(draft_manifest(), "fixture-owner"),
+            2: confirm_manifest(draft_stage_2_manifest(), "fixture-owner"),
+        }
+        self.sources = list(cumulative_sources(2))
+        self.reference: dict[str, dict[str, str]] = {}
+        self.fixtures: dict[str, tuple[dict[str, object], ...]] = {}
+        for source in self.sources:
+            prefix = "" if source == "financial-news" else f"{source}-"
+            self.reference[source] = {
+                f"{prefix}blind-{index:02d}": RESULT_LABELS[index % 4]
+                for index in range(BLIND_REPORT_SIZE)
+            }
+            self.fixtures[source] = report_source_fixture(
+                self.reference[source],
+                stage=self.stage_of(source),
+                source=source,
+            )
+        self.gpt_requests: dict[str, int] = {}
+
+    def stage_of(self, source: str) -> int:
+        return 1 if source in STAGE_SOURCES[1] else 2
+
+    def relabels(self, source: str) -> list[dict[str, object]]:
+        return [
+            {
+                "candidate_id": candidate_id,
+                "label": label,
+                "labeled_at": "2026-10-02T00:00:00Z",
+            }
+            for candidate_id, label in list(self.reference[source].items())[
+                :BLIND_RELABEL_TARGET
+            ]
+        ]
+
+    def seal_gpt(self, source: str, *, wrong: int = 0) -> dict[str, object]:
+        """Seal the GPT blind file of one source under its own stage manifest."""
+        sealed, allocation, _ = self.fixtures[source]
+        labels = {
+            candidate_id: (
+                RESULT_LABELS[(RESULT_LABELS.index(label) + 1) % 4]
+                if index < wrong
+                else label
+            )
+            for index, (candidate_id, label) in enumerate(
+                self.reference[source].items()
+            )
+        }
+        transport = LabelledGptTransport(
+            {
+                blind_passage(index, source): labels[candidate_id]
+                for index, candidate_id in enumerate(self.reference[source])
+            }
+        )
+        result = self.runner.predict_blind_gpt(
+            self.stage_manifests[self.stage_of(source)],
+            sealed,
+            allocation,
+            transport,
+            forecast=GPT_FORECAST,
+            sleep=self.delays.append,
+        )
+        self.gpt_requests[source] = (
+            self.gpt_requests.get(source, 0) + len(transport.requests)
+        )
+        return result
+
+    def train(self, *, wrong: int = 0) -> dict[str, object]:
+        labels = {
+            candidate_id: (
+                RESULT_LABELS[(RESULT_LABELS.index(label) + 1) % 4]
+                if index < wrong
+                else label
+            )
+            for source in self.sources
+            for index, (candidate_id, label) in enumerate(
+                self.reference[source].items()
+            )
+        }
+        self.backend = FakeTrainingBackend(blind_labels=labels)
+        return self.runner.train_specialist(
+            self.stage_manifests[2],
+            [
+                {
+                    "candidate_manifest": self.fixtures[source][0],
+                    "allocation": self.fixtures[source][1],
+                    "aggregation": self.fixtures[source][2],
+                }
+                for source in self.sources
+            ],
+            self.backend,
+            device_checks={"m3": M3_CHECK, "gpu_pilot": GPU_PILOT},
+        )
+
+    def report(self) -> dict[str, object]:
+        return self.runner.report_stage(
+            self.stage_manifests[2],
+            [
+                {
+                    "candidate_manifest": self.fixtures[source][0],
+                    "allocation": self.fixtures[source][1],
+                    "relabels": self.relabels(source),
+                }
+                for source in self.sources
+            ],
+        )
+
+    def complete_run(self, *, wrong: int = 0) -> dict[str, object]:
+        for source in self.sources:
+            self.seal_gpt(source)
+        self.train(wrong=wrong)
+        return self.report()
+
+    def test_one_cumulative_checkpoint_trains_on_every_source(self) -> None:
+        for source in self.sources:
+            self.seal_gpt(source)
+
+        prediction_file = self.train()
+
+        self.assertEqual("sealed", prediction_file["specialist_predictions"])
+        self.assertEqual(2, prediction_file["stage"])
+        self.assertEqual(self.sources, prediction_file["sources"])
+        self.assertEqual(
+            BLIND_REPORT_SIZE * 3, prediction_file["prediction_count"]
+        )
+        config = self.backend.trainings[0]
+        self.assertEqual(2 * 3, len(cast(list[Any], config["training"])))
+        self.assertEqual(4 * 3, len(cast(list[Any], config["development"])))
+        self.assertEqual(3, len(self.backend.trainings))
+
+    def test_a_missing_earlier_source_stops_the_cumulative_run(self) -> None:
+        result = self.runner.train_specialist(
+            self.stage_manifests[2],
+            [
+                {
+                    "candidate_manifest": self.fixtures[source][0],
+                    "allocation": self.fixtures[source][1],
+                    "aggregation": self.fixtures[source][2],
+                }
+                for source in STAGE_SOURCES[2]
+            ],
+            FakeTrainingBackend(),
+            device_checks={"m3": M3_CHECK, "gpu_pilot": GPU_PILOT},
+        )
+
+        self.assertEqual("cumulative-sources-incomplete", result["stop_reason"])
+
+    def test_each_source_receives_its_own_decision(self) -> None:
+        report = self.complete_run()
+
+        decision = cast(Mapping[str, Any], report["decision"])
+        self.assertEqual("complete", report["report"])
+        self.assertEqual(2, report["stage"])
+        self.assertEqual(self.sources, report["sources"])
+        self.assertEqual(["financial-news"], report["regression_sources"])
+        self.assertEqual(
+            {source: "pass" for source in self.sources},
+            decision["source_guardrail"],
+        )
+        self.assertEqual("pass", decision["stage_guardrail"])
+        by_source = cast(Mapping[str, Any], report["metrics"])["by_source"]
+        self.assertEqual(set(self.sources), set(by_source))
+        for source in self.sources:
+            self.assertEqual(1.0, by_source[source]["specialist"]["macro_f1"])
+            self.assertEqual(
+                BLIND_RELABEL_TARGET,
+                by_source[source]["self_consistency"]["example_count"],
+            )
+
+    def test_the_pooled_score_cannot_hide_a_failed_source(self) -> None:
+        for source in self.sources:
+            # Only the regulatory-filings answers are wrong.
+            self.seal_gpt(source)
+        labels = {}
+        for source in self.sources:
+            for index, (candidate_id, label) in enumerate(
+                self.reference[source].items()
+            ):
+                labels[candidate_id] = (
+                    RESULT_LABELS[(RESULT_LABELS.index(label) + 1) % 4]
+                    if source == "regulatory-filings" and index < 32
+                    else label
+                )
+        self.runner.train_specialist(
+            self.stage_manifests[2],
+            [
+                {
+                    "candidate_manifest": self.fixtures[source][0],
+                    "allocation": self.fixtures[source][1],
+                    "aggregation": self.fixtures[source][2],
+                }
+                for source in self.sources
+            ],
+            FakeTrainingBackend(blind_labels=labels),
+            device_checks={"m3": M3_CHECK, "gpu_pilot": GPU_PILOT},
+        )
+
+        report = self.report()
+
+        decision = cast(Mapping[str, Any], report["decision"])
+        pooled = cast(Mapping[str, Any], report["metrics"])["pooled"]
+        self.assertEqual("fail", decision["source_guardrail"]["regulatory-filings"])
+        self.assertEqual("pass", decision["source_guardrail"]["financial-news"])
+        self.assertEqual("fail", decision["stage_guardrail"])
+        self.assertTrue(pooled["diagnostic_only"])
+        # The pooled number looks better than the source that failed, and it
+        # still cannot make the stage pass.
+        by_source = cast(Mapping[str, Any], report["metrics"])["by_source"]
+        self.assertGreater(
+            pooled["macro_f1_difference"],
+            by_source["regulatory-filings"]["macro_f1_difference"],
+        )
+
+    def test_the_regression_source_reuses_its_sealed_gpt_file(self) -> None:
+        first = self.seal_gpt("financial-news")
+        self.assertEqual(BLIND_REPORT_SIZE, self.gpt_requests["financial-news"])
+
+        # The Stage 2 run asks again under the Stage 2 manifest.
+        again = self.seal_gpt("financial-news")
+
+        self.assertEqual(first, again)
+        self.assertEqual(BLIND_REPORT_SIZE, self.gpt_requests["financial-news"])
+        self.assertEqual(
+            1,
+            sum(
+                1
+                for record in self.runner.gpt_blind_records()
+                if record.get("event") == "gpt-blind-predictions-sealed"
+                and record.get("source") == "financial-news"
+            ),
+        )
+
+    def bundle(self, source: str, field: str = "aggregation") -> dict[str, object]:
+        return {
+            "candidate_manifest": self.fixtures[source][0],
+            "allocation": self.fixtures[source][1],
+            field: self.fixtures[source][2],
+        }
+
+    def test_a_repeated_candidate_id_stops_the_cumulative_training(self) -> None:
+        bundles = [self.bundle(source) for source in self.sources]
+        # The second source repeats the manifest and allocation of the first.
+        bundles[1] = {
+            **bundles[1],
+            "candidate_manifest": self.fixtures["financial-news"][0],
+            "allocation": self.fixtures["financial-news"][1],
+        }
+
+        result = self.runner.train_specialist(
+            self.stage_manifests[2],
+            bundles,
+            FakeTrainingBackend(),
+            device_checks={"m3": M3_CHECK, "gpu_pilot": GPU_PILOT},
+        )
+
+        self.assertEqual("cumulative-sources-incomplete", result["stop_reason"])
+
+    def test_a_repeated_blind_candidate_id_stops_the_report(self) -> None:
+        self.complete_run()
+        sources = [
+            {
+                "candidate_manifest": self.fixtures[source][0],
+                "allocation": self.fixtures[source][1],
+                "relabels": self.relabels(source),
+            }
+            for source in self.sources
+        ]
+        # The regulatory-filings allocation now names a financial-news example.
+        allocation = cast(Mapping[str, Any], sources[2]["allocation"])
+        allocation["blind"][0]["candidate_id"] = "blind-00"
+
+        result = self.runner.report_stage(self.stage_manifests[2], sources)
+
+        self.assertEqual("duplicate-candidate-id", result["stop_reason"])
+
+    def test_the_checkpoint_record_keeps_each_source_development_result(self) -> None:
+        for source in self.sources:
+            self.seal_gpt(source)
+
+        prediction_file = self.train()
+
+        checkpoint = cast(list[Mapping[str, Any]], prediction_file["checkpoints"])[0]
+        self.assertEqual(
+            set(self.sources), set(checkpoint["development_macro_f1_by_source"])
+        )
