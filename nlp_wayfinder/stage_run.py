@@ -1960,6 +1960,143 @@ class StageRun:
             "frozen_route_ids": list(route_ids),
         }
 
+    def _vote_attempt(
+        self,
+        candidate: Mapping[str, object],
+        route_id: str,
+        retry_ordinal: int,
+        transport: VoteTransport,
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        """Make one attempt at one vote and return its raw-vote record."""
+        request = _vote_request(route_id, candidate)
+        started_at = self._clock()
+        forced_abstention_reason: str | None = None
+        try:
+            response = transport.complete(request, timeout_seconds)
+        except (TimeoutError, OSError) as error:
+            forced_abstention_reason = (
+                "timeout" if isinstance(error, TimeoutError) else "transport-error"
+            )
+            response = OmniRouteResponse(
+                status_code=0,
+                headers={},
+                body={
+                    "error": {
+                        "type": forced_abstention_reason,
+                        "message": str(error),
+                    }
+                },
+            )
+        completed_at = self._clock()
+        headers = {key.lower(): value for key, value in response.headers.items()}
+        returned_provider = headers.get("x-omniroute-provider")
+        returned_model = headers.get("x-omniroute-model")
+        returned_route_id = (
+            f"{returned_provider}/{returned_model}"
+            if returned_provider and returned_model
+            else None
+        )
+        label = _response_label(response)
+        fallback_attempts = _int_header(
+            headers, "x-omniroute-fallback-attempts"
+        )
+        outcome = "valid"
+        abstention_reason: str | None = None
+        if forced_abstention_reason is not None:
+            outcome, abstention_reason, label = (
+                "abstention",
+                forced_abstention_reason,
+                None,
+            )
+        elif _is_free_limit(response):
+            outcome, abstention_reason, label = "abstention", "free-limit", None
+        elif response.status_code != 200:
+            outcome, abstention_reason, label = "abstention", "transport-error", None
+        elif (
+            returned_route_id != route_id
+            or fallback_attempts != 0
+            or "strategy=single"
+            not in str(headers.get("x-omniroute-decision", ""))
+        ):
+            outcome, abstention_reason, label = "abstention", "route-substitution", None
+        elif str(headers.get("x-omniroute-cache-hit", "")).lower() == "true":
+            outcome, abstention_reason, label = "abstention", "cache-hit", None
+        elif _response_is_refusal(response):
+            outcome, abstention_reason, label = "abstention", "refusal", None
+        elif label is None:
+            outcome, abstention_reason = "abstention", "malformed-answer"
+        response_cost = headers.get("x-omniroute-response-cost")
+        try:
+            paid_overflow = (
+                response_cost is not None and Decimal(response_cost) > 0
+            )
+        except InvalidOperation:
+            paid_overflow = True
+        if paid_overflow:
+            outcome, abstention_reason, label = (
+                "abstention",
+                "paid-overflow",
+                None,
+            )
+        usage = response.body.get("usage")
+        if not isinstance(usage, Mapping):
+            usage = {}
+        prompt = request["messages"]
+        record = {
+            "event": "raw-vote",
+            "candidate_id": candidate["candidate_id"],
+            "split": candidate["split"],
+            "requested_route_id": route_id,
+            "retry_ordinal": retry_ordinal,
+            "status_code": response.status_code,
+            "returned_route_id": returned_route_id,
+            "returned_provider": returned_provider,
+            "returned_model": returned_model,
+            "prompt": prompt,
+            "prompt_sha256": hashlib.sha256(
+                _canonical_json(prompt).encode("utf-8")
+            ).hexdigest(),
+            "request_sha256": hashlib.sha256(
+                _canonical_json(request).encode("utf-8")
+            ).hexdigest(),
+            "response_sha256": hashlib.sha256(
+                _canonical_json(response.body).encode("utf-8")
+            ).hexdigest(),
+            "outcome": outcome,
+            "abstention_reason": abstention_reason,
+            "label": label,
+            "token_use": {
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+                "omniroute_tokens_in": headers.get(
+                    "x-omniroute-tokens-in"
+                ),
+                "omniroute_tokens_out": headers.get(
+                    "x-omniroute-tokens-out"
+                ),
+            },
+            "time": {
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "latency_ms": headers.get("x-omniroute-latency-ms"),
+            },
+            "cost": {
+                "response_cost_usd": headers.get(
+                    "x-omniroute-response-cost"
+                ),
+                "cache_hit": headers.get("x-omniroute-cache-hit"),
+            },
+            "transport": {
+                "request_id": headers.get("x-omniroute-request-id"),
+                "omniroute_version": headers.get("x-omniroute-version"),
+                "decision": headers.get("x-omniroute-decision"),
+                "fallback_attempts": fallback_attempts,
+            },
+        }
+        return record
+
     def collect_votes(
         self,
         stage_manifest: Mapping[str, object],
@@ -2049,147 +2186,44 @@ class StageRun:
                 scheduled.append(candidate)
 
         # A spent free quota resets. That attempt must not block the later vote.
-        collected = {
-            (record.get("candidate_id"), record.get("requested_route_id"))
-            for record in self.raw_vote_records()
-            if record.get("abstention_reason") != "free-limit"
-        }
+        attempts: dict[tuple[object, object], list[Mapping[str, Any]]] = {}
+        for record in self.raw_vote_records():
+            if record.get("abstention_reason") == "free-limit":
+                continue
+            attempts.setdefault(
+                (record.get("candidate_id"), record.get("requested_route_id")), []
+            ).append(record)
         for candidate in scheduled:
             for route_id in route_ids:
                 key = (candidate["candidate_id"], route_id)
-                if key in collected:
-                    continue
-                request = _vote_request(route_id, candidate)
-                started_at = self._clock()
-                forced_abstention_reason: str | None = None
-                try:
-                    response = transport.complete(request, timeout_seconds)
-                except (TimeoutError, OSError) as error:
-                    forced_abstention_reason = (
-                        "timeout" if isinstance(error, TimeoutError) else "transport-error"
-                    )
-                    response = OmniRouteResponse(
-                        status_code=0,
-                        headers={},
-                        body={
-                            "error": {
-                                "type": forced_abstention_reason,
-                                "message": str(error),
-                            }
-                        },
-                    )
-                completed_at = self._clock()
-                headers = {key.lower(): value for key, value in response.headers.items()}
-                returned_provider = headers.get("x-omniroute-provider")
-                returned_model = headers.get("x-omniroute-model")
-                returned_route_id = (
-                    f"{returned_provider}/{returned_model}"
-                    if returned_provider and returned_model
-                    else None
-                )
-                label = _response_label(response)
-                fallback_attempts = _int_header(
-                    headers, "x-omniroute-fallback-attempts"
-                )
-                outcome = "valid"
-                abstention_reason: str | None = None
-                if forced_abstention_reason is not None:
-                    outcome, abstention_reason, label = (
-                        "abstention",
-                        forced_abstention_reason,
-                        None,
-                    )
-                elif _is_free_limit(response):
-                    outcome, abstention_reason, label = "abstention", "free-limit", None
-                elif response.status_code != 200:
-                    outcome, abstention_reason, label = "abstention", "transport-error", None
-                elif (
-                    returned_route_id != route_id
-                    or fallback_attempts != 0
-                    or "strategy=single"
-                    not in str(headers.get("x-omniroute-decision", ""))
+                logged = attempts.get(key, [])
+                # One malformed answer earns one repair, even across runs.
+                if logged and not (
+                    len(logged) == 1
+                    and logged[0].get("abstention_reason") == "malformed-answer"
                 ):
-                    outcome, abstention_reason, label = "abstention", "route-substitution", None
-                elif str(headers.get("x-omniroute-cache-hit", "")).lower() == "true":
-                    outcome, abstention_reason, label = "abstention", "cache-hit", None
-                elif _response_is_refusal(response):
-                    outcome, abstention_reason, label = "abstention", "refusal", None
-                elif label is None:
-                    outcome, abstention_reason = "abstention", "malformed-answer"
-                response_cost = headers.get("x-omniroute-response-cost")
-                try:
-                    paid_overflow = (
-                        response_cost is not None and Decimal(response_cost) > 0
+                    continue
+                retry_ordinal = len(logged)
+                while True:
+                    record = self._vote_attempt(
+                        candidate,
+                        route_id,
+                        retry_ordinal,
+                        transport,
+                        timeout_seconds,
                     )
-                except InvalidOperation:
-                    paid_overflow = True
-                if paid_overflow:
-                    outcome, abstention_reason, label = (
-                        "abstention",
-                        "paid-overflow",
-                        None,
-                    )
-                usage = response.body.get("usage")
-                if not isinstance(usage, Mapping):
-                    usage = {}
-                prompt = request["messages"]
-                record = {
-                    "event": "raw-vote",
-                    "candidate_id": candidate["candidate_id"],
-                    "split": candidate["split"],
-                    "requested_route_id": route_id,
-                    "status_code": response.status_code,
-                    "returned_route_id": returned_route_id,
-                    "returned_provider": returned_provider,
-                    "returned_model": returned_model,
-                    "prompt": prompt,
-                    "prompt_sha256": hashlib.sha256(
-                        _canonical_json(prompt).encode("utf-8")
-                    ).hexdigest(),
-                    "request_sha256": hashlib.sha256(
-                        _canonical_json(request).encode("utf-8")
-                    ).hexdigest(),
-                    "response_sha256": hashlib.sha256(
-                        _canonical_json(response.body).encode("utf-8")
-                    ).hexdigest(),
-                    "outcome": outcome,
-                    "abstention_reason": abstention_reason,
-                    "label": label,
-                    "token_use": {
-                        "prompt_tokens": usage.get("prompt_tokens"),
-                        "completion_tokens": usage.get("completion_tokens"),
-                        "total_tokens": usage.get("total_tokens"),
-                        "omniroute_tokens_in": headers.get(
-                            "x-omniroute-tokens-in"
-                        ),
-                        "omniroute_tokens_out": headers.get(
-                            "x-omniroute-tokens-out"
-                        ),
-                    },
-                    "time": {
-                        "started_at": started_at,
-                        "completed_at": completed_at,
-                        "latency_ms": headers.get("x-omniroute-latency-ms"),
-                    },
-                    "cost": {
-                        "response_cost_usd": headers.get(
-                            "x-omniroute-response-cost"
-                        ),
-                        "cache_hit": headers.get("x-omniroute-cache-hit"),
-                    },
-                    "transport": {
-                        "request_id": headers.get("x-omniroute-request-id"),
-                        "omniroute_version": headers.get("x-omniroute-version"),
-                        "decision": headers.get("x-omniroute-decision"),
-                        "fallback_attempts": fallback_attempts,
-                    },
-                }
-                self._raw_vote_log.append(record)
-                collected.add(key)
-                if abstention_reason == "free-limit":
-                    return self._collection_stop("free-limit-failure", route_ids)
-                if abstention_reason == "paid-overflow":
-                    return self._collection_stop("paid-overflow-detected", route_ids)
+                    self._raw_vote_log.append(record)
+                    reason = record["abstention_reason"]
+                    if reason == "free-limit":
+                        return self._collection_stop("free-limit-failure", route_ids)
+                    if reason == "paid-overflow":
+                        return self._collection_stop(
+                            "paid-overflow-detected", route_ids
+                        )
+                    # The repair repeats the identical request to the same route.
+                    if reason != "malformed-answer" or retry_ordinal > 0:
+                        break
+                    retry_ordinal += 1
 
         return {
             "collection": "complete",

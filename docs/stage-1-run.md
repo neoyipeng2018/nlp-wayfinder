@@ -179,6 +179,12 @@ cost metadata.
 A refusal, a malformed answer, a timeout, a route substitution, or a cache hit is
 an abstention. An abstention has no label. It is not `insufficient evidence`.
 
+A malformed answer earns one repair request to the same route with an identical
+request. No other abstention earns one. Both attempts stay in `raw-votes.jsonl`
+with their `retry_ordinal`, and the second attempt counts against the route free
+limit. Only the final attempt gives the vote, so each route and item still
+contributes one vote to aggregation.
+
 A free-limit failure or a paid response stops collection. The command returns
 exit code `2` with stop reason `free-limit-failure` or `paid-overflow-detected`.
 Run the command again after the free quota resets. Collection does not repeat a

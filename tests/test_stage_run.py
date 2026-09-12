@@ -120,6 +120,18 @@ class SequenceVoteTransport(FixedVoteTransport):
         return super().complete(request, timeout_seconds)
 
 
+class MalformedVoteTransport(FixedVoteTransport):
+    """Answer every fixed route with a bare label that no schema accepts."""
+
+    def complete(
+        self, request: Mapping[str, object], timeout_seconds: float
+    ) -> OmniRouteResponse:
+        response = super().complete(request, timeout_seconds)
+        body = copy.deepcopy(dict(response.body))
+        body["choices"] = [{"message": {"content": "positive"}}]
+        return response._replace(body=body)
+
+
 def example(
     passage: str,
     *,
@@ -1443,6 +1455,86 @@ class VoteCollectionTests(unittest.TestCase):
                     self.assertEqual("abstention", first_vote["outcome"])
                     self.assertEqual(expected_reason, first_vote["abstention_reason"])
                     self.assertIsNone(first_vote["label"])
+
+    def test_a_malformed_answer_earns_one_identical_repair_attempt(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+        transport = SequenceVoteTransport(self.response(content="positive"))
+
+        result = self.runner.collect_votes(
+            stage_manifest, candidates, allocation, transport
+        )
+
+        self.assertEqual("complete", result["collection"])
+        self.assertEqual(7, len(transport.requests))
+        self.assertEqual(transport.requests[0][0], transport.requests[1][0])
+        records = self.runner.raw_vote_records()
+        self.assertEqual(7, len(records))
+        first, repair = records[0], records[1]
+        self.assertEqual(0, first["retry_ordinal"])
+        self.assertEqual("malformed-answer", first["abstention_reason"])
+        self.assertEqual(1, repair["retry_ordinal"])
+        self.assertEqual(first["requested_route_id"], repair["requested_route_id"])
+        self.assertEqual(first["candidate_id"], repair["candidate_id"])
+        self.assertEqual(first["request_sha256"], repair["request_sha256"])
+        self.assertEqual("valid", repair["outcome"])
+        # Only the final attempt votes, so each route still counts once.
+        votes = self.runner._valid_votes()[str(first["candidate_id"])]
+        self.assertEqual(sorted(ROUTE_IDS), sorted(votes))
+
+    def test_one_repair_attempt_is_the_limit_across_runs(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+
+        self.runner.collect_votes(
+            stage_manifest, candidates, allocation, MalformedVoteTransport()
+        )
+        again = self.runner.collect_votes(
+            stage_manifest, candidates, allocation, FixedVoteTransport()
+        )
+
+        self.assertEqual("complete", again["collection"])
+        # The repaired route keeps its two attempts and earns no third one.
+        counted = Counter(
+            (record["candidate_id"], record["requested_route_id"])
+            for record in self.runner.raw_vote_records()
+        )
+        self.assertEqual({2}, set(counted.values()))
+        repaired = [
+            record
+            for record in self.runner.raw_vote_records()
+            if record["abstention_reason"] == "malformed-answer"
+        ]
+        self.assertEqual(
+            [0, 1] * 6, [record["retry_ordinal"] for record in repaired]
+        )
+
+    def test_other_abstentions_earn_no_repair_attempt(self) -> None:
+        cases: dict[str, OmniRouteResponse | BaseException] = {
+            "refusal": self.response(refusal="I cannot classify this passage."),
+            "timeout": TimeoutError("The route timed out."),
+            "route-substitution": self.response(model="substituted-model"),
+            "cache-hit": self.response()._replace(
+                headers={
+                    **self.response().headers,
+                    "x-omniroute-cache-hit": "true",
+                }
+            ),
+        }
+        for expected_reason, first_response in cases.items():
+            with self.subTest(reason=expected_reason):
+                with tempfile.TemporaryDirectory() as state_dir:
+                    runner = StageRun(state_dir, clock=lambda: "2026-09-12T00:00:00Z")
+                    stage_manifest, candidates, allocation = self.vote_inputs()
+                    transport = SequenceVoteTransport(first_response)
+
+                    runner.collect_votes(
+                        stage_manifest, candidates, allocation, transport
+                    )
+
+                    records = runner.raw_vote_records()
+                    self.assertEqual(6, len(records))
+                    self.assertEqual(6, len(transport.requests))
+                    self.assertEqual(expected_reason, records[0]["abstention_reason"])
+                    self.assertEqual(0, records[0]["retry_ordinal"])
 
     def test_free_limit_failure_is_recorded_and_stops_collection(self) -> None:
         stage_manifest, candidates, allocation = self.vote_inputs()
