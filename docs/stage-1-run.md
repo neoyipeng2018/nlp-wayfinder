@@ -84,6 +84,8 @@ these fields:
 
 - `candidate_id`
 - `event_group_id`
+- `company_id`, for the same publicly traded company in related records
+- `aspect`, from the Stage 1 aspect set
 - `published_at`
 - `normalized_passage`
 - `near_duplicate_reviewed`, with the value `true`
@@ -115,6 +117,39 @@ python3 -m nlp_wayfinder.stage_run inspect-candidate \
 The command writes an append-only inspection record. It rejects an absent or
 changed seal and an out-of-order candidate. It also validates duplicate and
 event-group split controls again before inspection.
+
+After candidate review and labeling, make one JSON array of review records. Each
+record must contain `candidate_id`, `disposition`, `label`, and `labeled_at`.
+`disposition` is `accepted` or `excluded`. `label` is one of the four fixed result
+labels. `labeled_at` is a UTC time that ends in `Z`.
+
+Create the complete Stage 1 allocation:
+
+```sh
+python3 -m nlp_wayfinder.stage_run allocate-stage-1 \
+  sealed-candidates.json reviews.json --state-dir .wayfinder-state \
+  --output stage-1-allocation.json
+```
+
+The operation reads the append-only inspection log. Each inspected training
+candidate counts against the limit of 6,668, even if it has no review record. The source
+stops if it does not produce 4,000 accepted silver examples before this limit. It
+also stops if it cannot select 200 accepted development examples and 400 accepted
+blind examples.
+
+For the blind set, the operation selects the next eligible candidate in each
+required aspect-and-label cell. It selects exactly 25 candidates in each of the 16
+cells. If one selection breaks a balance rule, the operation searches later
+candidates in the same cell in sealed order. The result stops only when no valid
+complete selection exists. The result must have at least 320 event groups. An event
+group can have no more than two examples. A company can have no more than five
+examples. The result must have at least 100 unseen companies.
+
+The result uses seed `20260905` to select 60 blind examples for a second label.
+Each cell has three or four examples in this sample. Each sample record gives the
+first permitted relabel time, which is 14 days after its first human label. The
+first label stays unchanged. The allocation contains the sealed candidate-manifest
+hash and its own SHA-256 hash.
 
 Record a cost commitment before the related action. Record the actual cost after
 the action:

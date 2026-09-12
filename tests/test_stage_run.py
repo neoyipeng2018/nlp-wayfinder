@@ -8,17 +8,21 @@ import sys
 import tempfile
 import threading
 import unittest
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Mapping, cast
 
 from nlp_wayfinder.stage_run import (
     MAX_EXAMPLE_TOKENS,
     RESULT_LABELS,
+    STAGE_1_ASPECTS,
     CostLimitError,
     StageRun,
     admit_example,
+    allocate_stage_1,
+    candidate_order_sha256,
     seal_candidate_manifest,
     confirm_manifest,
 )
@@ -192,6 +196,96 @@ def candidate_manifest() -> dict[str, object]:
             },
         ],
     }
+
+
+def allocation_manifest() -> tuple[dict[str, object], list[dict[str, object]]]:
+    manifest = candidate_manifest()
+    candidates: list[dict[str, object]] = []
+    reviews: list[dict[str, object]] = []
+
+    def add_candidate(
+        split: str,
+        index: int,
+        company_id: str,
+        aspect: str,
+        label: str,
+        event_group_id: str,
+    ) -> None:
+        published_at = {
+            "training": "2026-03-10T09:00:00Z",
+            "development": "2026-07-10T09:00:00Z",
+            "blind": "2026-09-10T09:00:00Z",
+        }[split]
+        candidate_id = f"{split}-{index:04d}"
+        candidates.append(
+            {
+                "candidate_id": candidate_id,
+                "event_group_id": event_group_id,
+                "published_at": published_at,
+                "normalized_passage": f"Unique passage for {candidate_id}.",
+                "near_duplicate_reviewed": True,
+                "company_id": company_id,
+                "aspect": aspect,
+            }
+        )
+        reviews.append(
+            {
+                "candidate_id": candidate_id,
+                "disposition": "accepted",
+                "label": label,
+                "labeled_at": "2026-09-11T00:00:00Z",
+            }
+        )
+
+    for index in range(4_000):
+        add_candidate(
+            "training",
+            index,
+            f"seen-{index // 5:04d}",
+            STAGE_1_ASPECTS[index % 4],
+            RESULT_LABELS[index % 4],
+            f"training-event-{index:04d}",
+        )
+    for index in range(200):
+        add_candidate(
+            "development",
+            index,
+            f"development-{index // 5:04d}",
+            STAGE_1_ASPECTS[index % 4],
+            RESULT_LABELS[index % 4],
+            f"development-event-{index:04d}",
+        )
+    blind_index = 0
+    for aspect in STAGE_1_ASPECTS:
+        for label in RESULT_LABELS:
+            for _ in range(25):
+                add_candidate(
+                    "blind",
+                    blind_index,
+                    f"unseen-{blind_index // 4:03d}",
+                    aspect,
+                    label,
+                    f"blind-event-{blind_index:04d}",
+                )
+                blind_index += 1
+    manifest["candidates"] = candidates
+    return manifest, reviews
+
+
+def inspection_records(
+    sealed: Mapping[str, object], reviews: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    manifest_sha256 = str(cast(Mapping[str, object], sealed["seal"])["semantic_sha256"])
+    reviewed_ids = {str(review["candidate_id"]) for review in reviews}
+    return [
+        {
+            "event": "candidate-inspected",
+            "manifest_sha256": manifest_sha256,
+            "candidate_id": candidate["candidate_id"],
+        }
+        for candidate in cast(list[dict[str, object]], sealed["candidates"])
+        if str(candidate["candidate_id"]) in reviewed_ids
+    ]
 
 
 class StageRunTests(unittest.TestCase):
@@ -660,6 +754,450 @@ class CandidateManifestTests(unittest.TestCase):
         self.assertEqual(0, sealed_result.returncode, sealed_result.stdout)
         self.assertEqual(0, inspection_result.returncode, inspection_result.stdout)
         self.assertEqual("accepted", json.loads(inspection_result.stdout)["inspection"])
+
+
+class StageOneAllocationTests(unittest.TestCase):
+    def test_review_cannot_replace_an_append_only_inspection_record(self) -> None:
+        manifest, reviews = allocation_manifest()
+        sealed = seal_candidate_manifest(manifest, "fixture-owner")
+
+        with self.assertRaisesRegex(ValueError, "allocation-review-not-inspected"):
+            allocate_stage_1(sealed, reviews, [])
+
+    def test_complete_allocation_has_fixed_quotas_balance_and_relabel_sample(
+        self,
+    ) -> None:
+        manifest, reviews = allocation_manifest()
+        sealed = seal_candidate_manifest(
+            manifest,
+            "fixture-owner",
+            sealed_at="2026-09-10T00:00:00Z",
+        )
+
+        result = allocate_stage_1(sealed, reviews, inspection_records(sealed, reviews))
+
+        self.assertEqual("complete", result["allocation"])
+        self.assertIsNone(result["stop_reason"])
+        self.assertEqual(
+            {"training": 4_000, "development": 200, "blind": 400},
+            result["selected_counts"],
+        )
+        self.assertEqual(4_000, result["silver_candidates_inspected"])
+        blind = cast(list[dict[str, object]], result["blind"])
+        cells = {
+            (aspect, label): sum(
+                item["aspect"] == aspect and item["label"] == label
+                for item in blind
+            )
+            for aspect in STAGE_1_ASPECTS
+            for label in RESULT_LABELS
+        }
+        self.assertEqual({25}, set(cells.values()))
+        self.assertEqual(400, len({item["event_group_id"] for item in blind}))
+        self.assertGreaterEqual(
+            sum(item["unseen_issuer"] is True for item in blind), 100
+        )
+        relabel = cast(list[dict[str, object]], result["blind_relabel_sample"])
+        self.assertEqual(60, len(relabel))
+        self.assertEqual(60, len({item["candidate_id"] for item in relabel}))
+        self.assertEqual(
+            {3, 4},
+            {
+                sum(
+                    item["aspect"] == aspect and item["label"] == label
+                    for item in relabel
+                )
+                for aspect in STAGE_1_ASPECTS
+                for label in RESULT_LABELS
+            },
+        )
+        self.assertEqual(
+            {"2026-09-25T00:00:00Z"},
+            {item["relabel_not_before"] for item in relabel},
+        )
+        allocation_hash = str(result.pop("allocation_sha256"))
+        self.assertEqual(
+            hashlib.sha256(
+                json.dumps(
+                    result,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest(),
+            allocation_hash,
+        )
+
+    def test_silver_source_stops_when_its_inspection_limit_cannot_fill_quota(
+        self,
+    ) -> None:
+        manifest, reviews = allocation_manifest()
+        candidates = cast(list[dict[str, object]], manifest["candidates"])
+        reviews_by_id = {
+            str(review["candidate_id"]): review for review in reviews
+        }
+        for review in reviews:
+            if str(review["candidate_id"]).startswith("training-"):
+                review["disposition"] = "excluded"
+        for index in range(4_000, 6_668):
+            candidate_id = f"training-{index:04d}"
+            candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "event_group_id": f"training-event-{index:04d}",
+                    "published_at": "2026-03-10T09:00:00Z",
+                    "normalized_passage": f"Unique passage for {candidate_id}.",
+                    "near_duplicate_reviewed": True,
+                    "company_id": f"seen-{index // 5:04d}",
+                    "aspect": STAGE_1_ASPECTS[index % 4],
+                }
+            )
+            reviews_by_id[candidate_id] = {
+                "candidate_id": candidate_id,
+                "disposition": "excluded",
+                "label": RESULT_LABELS[index % 4],
+                "labeled_at": "2026-09-11T00:00:00Z",
+            }
+        sealed = seal_candidate_manifest(manifest, "fixture-owner")
+        result = allocate_stage_1(
+            sealed, [], inspection_records(sealed, list(reviews_by_id.values()))
+        )
+
+        self.assertEqual("stopped", result["allocation"])
+        self.assertEqual("silver-candidate-limit-exhausted", result["stop_reason"])
+        self.assertEqual(6_668, result["silver_candidates_inspected"])
+        self.assertEqual(0, result["selected_counts"]["training"])  # type: ignore[index]
+
+    def test_blind_replacement_is_the_next_eligible_item_in_the_same_cell(
+        self,
+    ) -> None:
+        manifest, reviews = allocation_manifest()
+        candidates = cast(list[dict[str, object]], manifest["candidates"])
+        replacement_id = "blind-replacement"
+        candidates.append(
+            {
+                "candidate_id": replacement_id,
+                "event_group_id": "blind-event-replacement",
+                "published_at": "2026-09-10T09:00:00Z",
+                "normalized_passage": "Unique passage for the blind replacement.",
+                "near_duplicate_reviewed": True,
+                "company_id": "unseen-replacement",
+                "aspect": STAGE_1_ASPECTS[0],
+            }
+        )
+        reviews.append(
+            {
+                "candidate_id": replacement_id,
+                "disposition": "accepted",
+                "label": RESULT_LABELS[0],
+                "labeled_at": "2026-09-11T00:00:00Z",
+            }
+        )
+        sealed = seal_candidate_manifest(manifest, "fixture-owner")
+        ordered_cell = [
+            candidate
+            for candidate in cast(list[dict[str, object]], sealed["candidates"])
+            if candidate["split"] == "blind"
+            and candidate["aspect"] == STAGE_1_ASPECTS[0]
+            and next(
+                review["label"]
+                for review in reviews
+                if review["candidate_id"] == candidate["candidate_id"]
+            )
+            == RESULT_LABELS[0]
+        ]
+        excluded_id = str(ordered_cell[0]["candidate_id"])
+        next(
+            review for review in reviews if review["candidate_id"] == excluded_id
+        )["disposition"] = "excluded"
+
+        result = allocate_stage_1(sealed, reviews, inspection_records(sealed, reviews))
+
+        selected_ids = {
+            item["candidate_id"]
+            for item in cast(list[dict[str, object]], result["blind"])
+        }
+        expected_ids = {
+            candidate["candidate_id"] for candidate in ordered_cell[1:26]
+        }
+        self.assertEqual("complete", result["allocation"])
+        self.assertEqual(expected_ids, selected_ids.intersection(expected_ids))
+        self.assertNotIn(excluded_id, selected_ids)
+
+    def test_blind_balance_uses_the_next_eligible_same_cell_replacement(self) -> None:
+        manifest, reviews = allocation_manifest()
+        candidates = cast(list[dict[str, object]], manifest["candidates"])
+        first_cell = [
+            candidate
+            for candidate in candidates
+            if candidate["aspect"] == STAGE_1_ASPECTS[0]
+            and str(candidate["candidate_id"]).startswith("blind-")
+            and next(
+                review["label"]
+                for review in reviews
+                if review["candidate_id"] == candidate["candidate_id"]
+            )
+            == RESULT_LABELS[0]
+        ]
+        for candidate in first_cell[:6]:
+            candidate["company_id"] = "unseen-shared"
+        candidates.append(
+            {
+                "candidate_id": "blind-balance-replacement",
+                "event_group_id": "blind-balance-replacement-event",
+                "published_at": "2026-09-10T09:00:00Z",
+                "normalized_passage": "Unique balance replacement passage.",
+                "near_duplicate_reviewed": True,
+                "company_id": "unseen-balance-replacement",
+                "aspect": STAGE_1_ASPECTS[0],
+            }
+        )
+        reviews.append(
+            {
+                "candidate_id": "blind-balance-replacement",
+                "disposition": "accepted",
+                "label": RESULT_LABELS[0],
+                "labeled_at": "2026-09-11T00:00:00Z",
+            }
+        )
+        sealed = seal_candidate_manifest(manifest, "fixture-owner")
+
+        result = allocate_stage_1(
+            sealed, reviews, inspection_records(sealed, reviews)
+        )
+
+        blind = cast(list[dict[str, object]], result["blind"])
+        self.assertEqual("complete", result["allocation"])
+        self.assertLessEqual(
+            max(Counter(item["company_id"] for item in blind).values()), 5
+        )
+        self.assertIn(
+            "blind-balance-replacement",
+            {item["candidate_id"] for item in blind},
+        )
+
+    def test_blind_search_can_coordinate_replacements_between_cells(self) -> None:
+        manifest, reviews = allocation_manifest()
+        candidates = cast(list[dict[str, object]], manifest["candidates"])
+        reviews_by_id = {
+            str(review["candidate_id"]): review for review in reviews
+        }
+        blind_candidates = [
+            candidate
+            for candidate in candidates
+            if str(candidate["candidate_id"]).startswith("blind-")
+        ]
+        ordered_blind = sorted(
+            blind_candidates,
+            key=lambda candidate: candidate_order_sha256(
+                1, "financial-news", "blind", str(candidate["candidate_id"])
+            ),
+        )
+        first_cell = [
+            candidate
+            for candidate in ordered_blind
+            if candidate["aspect"] == STAGE_1_ASPECTS[0]
+            and reviews_by_id[str(candidate["candidate_id"])]["label"]
+            == RESULT_LABELS[0]
+        ]
+        for candidate in first_cell[:3]:
+            candidate["event_group_id"] = "shared-event"
+        event_candidate_ids = {
+            str(candidate["candidate_id"]) for candidate in first_cell[:3]
+        }
+        other_blind = [
+            candidate
+            for candidate in ordered_blind
+            if str(candidate["candidate_id"]) not in event_candidate_ids
+        ]
+        for index, candidate in enumerate(first_cell[:3]):
+            candidate["company_id"] = f"single-{index}"
+        for index, candidate in enumerate(other_blind):
+            candidate["company_id"] = f"unseen-{index % 97}"
+
+        def tail_id(prefix: str, cell_candidates: list[dict[str, object]]) -> str:
+            largest = max(
+                candidate_order_sha256(
+                    1, "financial-news", "blind", str(candidate["candidate_id"])
+                )
+                for candidate in cell_candidates
+            )
+            suffix = 0
+            while True:
+                candidate_id = f"{prefix}-{suffix}"
+                if (
+                    candidate_order_sha256(1, "financial-news", "blind", candidate_id)
+                    > largest
+                ):
+                    return candidate_id
+                suffix += 1
+
+        def add_replacement(
+            candidate_id: str, company_id: str, aspect: str, label: str
+        ) -> None:
+            candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "event_group_id": f"event-{candidate_id}",
+                    "published_at": "2026-09-10T09:00:00Z",
+                    "normalized_passage": f"Unique passage for {candidate_id}.",
+                    "near_duplicate_reviewed": True,
+                    "company_id": company_id,
+                    "aspect": aspect,
+                }
+            )
+            reviews.append(
+                {
+                    "candidate_id": candidate_id,
+                    "disposition": "accepted",
+                    "label": label,
+                    "labeled_at": "2026-09-11T00:00:00Z",
+                }
+            )
+
+        add_replacement(
+            tail_id("seen-replacement", first_cell),
+            "seen-0000",
+            STAGE_1_ASPECTS[0],
+            RESULT_LABELS[0],
+        )
+        last_cell = [
+            candidate
+            for candidate in ordered_blind
+            if candidate["aspect"] == STAGE_1_ASPECTS[-1]
+            and reviews_by_id[str(candidate["candidate_id"])]["label"]
+            == RESULT_LABELS[-1]
+        ]
+        unseen_replacement_id = tail_id("unseen-replacement", last_cell)
+        add_replacement(
+            unseen_replacement_id,
+            "new-unseen-issuer",
+            STAGE_1_ASPECTS[-1],
+            RESULT_LABELS[-1],
+        )
+        sealed = seal_candidate_manifest(manifest, "fixture-owner")
+
+        result = allocate_stage_1(
+            sealed, reviews, inspection_records(sealed, reviews)
+        )
+
+        self.assertEqual("complete", result["allocation"])
+        self.assertIn(
+            unseen_replacement_id,
+            {
+                item["candidate_id"]
+                for item in cast(list[dict[str, object]], result["blind"])
+            },
+        )
+
+    def test_large_invalid_blind_cell_stops_without_a_call_stack_failure(self) -> None:
+        manifest, reviews = allocation_manifest()
+        candidates = cast(list[dict[str, object]], manifest["candidates"])
+        first_cell_ids = {
+            str(review["candidate_id"])
+            for review in reviews
+            if str(review["candidate_id"]).startswith("blind-")
+            and review["label"] == RESULT_LABELS[0]
+        }
+        first_cell = [
+            candidate
+            for candidate in candidates
+            if candidate["candidate_id"] in first_cell_ids
+            and candidate["aspect"] == STAGE_1_ASPECTS[0]
+        ]
+        for candidate in first_cell:
+            candidate["event_group_id"] = "one-large-event"
+        for index in range(25, 1_100):
+            candidate_id = f"large-cell-{index:04d}"
+            candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "event_group_id": "one-large-event",
+                    "published_at": "2026-09-10T09:00:00Z",
+                    "normalized_passage": f"Unique large-cell passage {index}.",
+                    "near_duplicate_reviewed": True,
+                    "company_id": f"large-cell-company-{index:04d}",
+                    "aspect": STAGE_1_ASPECTS[0],
+                }
+            )
+            reviews.append(
+                {
+                    "candidate_id": candidate_id,
+                    "disposition": "accepted",
+                    "label": RESULT_LABELS[0],
+                    "labeled_at": "2026-09-11T00:00:00Z",
+                }
+            )
+        sealed = seal_candidate_manifest(manifest, "fixture-owner")
+
+        result = allocate_stage_1(
+            sealed, reviews, inspection_records(sealed, reviews)
+        )
+
+        self.assertEqual("stopped", result["allocation"])
+        self.assertEqual("blind-event-group-balance-failed", result["stop_reason"])
+
+    def test_allocation_is_repeatable_for_the_same_review_records(self) -> None:
+        manifest, reviews = allocation_manifest()
+        sealed = seal_candidate_manifest(manifest, "fixture-owner")
+        result = allocate_stage_1(
+            sealed, reviews, inspection_records(sealed, reviews)
+        )
+
+        self.assertEqual("complete", result["allocation"])
+
+    def test_blind_diversity_rules_stop_an_invalid_allocation(self) -> None:
+        cases = {
+            "too-few-event-groups": (
+                lambda candidates: [
+                    candidate.update(
+                        event_group_id=f"blind-pair-{index // 2:03d}"
+                    )
+                    for index, candidate in enumerate(candidates)
+                ],
+                "blind-event-group-balance-failed",
+            ),
+            "too-many-for-event": (
+                lambda candidates: [
+                    candidate.update(event_group_id="blind-event-shared")
+                    for candidate in candidates[:3]
+                ],
+                "blind-event-group-balance-failed",
+            ),
+            "too-many-for-company": (
+                lambda candidates: [
+                    candidate.update(company_id="unseen-shared")
+                    for candidate in candidates[:6]
+                ],
+                "blind-company-balance-failed",
+            ),
+            "too-few-unseen-issuers": (
+                lambda candidates: [
+                    candidate.update(company_id=f"unseen-{index // 5:03d}")
+                    for index, candidate in enumerate(candidates)
+                ],
+                "blind-unseen-issuer-balance-failed",
+            ),
+        }
+        for name, (change, expected_reason) in cases.items():
+            with self.subTest(name=name):
+                manifest, reviews = allocation_manifest()
+                blind_candidates = [
+                    candidate
+                    for candidate in cast(
+                        list[dict[str, object]], manifest["candidates"]
+                    )
+                    if str(candidate["candidate_id"]).startswith("blind-")
+                ]
+                change(blind_candidates)
+                sealed = seal_candidate_manifest(manifest, "fixture-owner")
+
+                result = allocate_stage_1(
+                    sealed, reviews, inspection_records(sealed, reviews)
+                )
+
+                self.assertEqual("stopped", result["allocation"])
+                self.assertEqual(expected_reason, result["stop_reason"])
 
 
 if __name__ == "__main__":

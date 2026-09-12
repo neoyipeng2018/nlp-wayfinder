@@ -10,11 +10,12 @@ import json
 import math
 import os
 import sys
-from collections.abc import Callable, Mapping
-from datetime import date, datetime, timezone
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 
 EXPECTED_ROUTE_IDS = (
@@ -46,6 +47,15 @@ EXAMPLE_CONSUMERS = (
 )
 CANDIDATE_ORDER_SALT = "20260905"
 CANDIDATE_SPLITS = ("training", "development", "blind")
+STAGE_1_ALLOCATION_TARGETS = {
+    "training": 4_000,
+    "development": 200,
+    "blind": 400,
+}
+BLIND_CELL_TARGET = 25
+BLIND_RELABEL_SEED = "20260905"
+BLIND_RELABEL_TARGET = 60
+BLIND_WASHOUT_DAYS = 14
 SOURCE_ANNEX_FIELDS = (
     "acquisition",
     "rights",
@@ -255,7 +265,11 @@ def seal_candidate_manifest(
         "limits",
         ("silver_candidate_limit", "development_target", "blind_target"),
     )
-    if limits["silver_candidate_limit"] != 6_668:
+    if (
+        limits["silver_candidate_limit"] != 6_668
+        or limits["development_target"] != 200
+        or limits["blind_target"] != 400
+    ):
         raise ValueError("source-annex-incomplete")
     software_versions = annex.get("software_versions")
     if not isinstance(software_versions, Mapping) or not software_versions:
@@ -346,6 +360,459 @@ def _is_valid_sealed_candidate_manifest(manifest: Mapping[str, object]) -> bool:
     return _canonical_json(rebuilt.get("candidates")) == _canonical_json(
         manifest.get("candidates")
     )
+
+
+def _allocation_stop(
+    reason: str,
+    *,
+    inspected_silver: int = 0,
+    selected: Mapping[str, Sequence[Mapping[str, object]]] | None = None,
+) -> dict[str, object]:
+    selected = selected or {}
+    return {
+        "allocation": "stopped",
+        "stop_reason": reason,
+        "silver_candidates_inspected": inspected_silver,
+        "selected_counts": {
+            split: len(selected.get(split, ())) for split in CANDIDATE_SPLITS
+        },
+    }
+
+
+def _parse_utc_timestamp(value: object) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise ValueError("allocation-review-invalid")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise ValueError("allocation-review-invalid") from error
+    if parsed.utcoffset() != timedelta(0):
+        raise ValueError("allocation-review-invalid")
+    return parsed
+
+
+def _selected_record(
+    candidate: Mapping[str, object], review: Mapping[str, object]
+) -> dict[str, object]:
+    return {
+        "candidate_id": candidate["candidate_id"],
+        "event_group_id": candidate["event_group_id"],
+        "company_id": candidate["company_id"],
+        "aspect": candidate["aspect"],
+        "label": review["label"],
+        "labeled_at": review["labeled_at"],
+    }
+
+
+def _relabel_sample(blind: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    cells = [(aspect, label) for aspect in STAGE_1_ASPECTS for label in RESULT_LABELS]
+
+    def rank(item: Mapping[str, object]) -> str:
+        rank_input = (
+            "nlp-wayfinder1financial-newsblind-relabel"
+            f"{item['candidate_id']}{BLIND_RELABEL_SEED}"
+        )
+        return hashlib.sha256(rank_input.encode("utf-8")).hexdigest()
+
+    ranked_cells = {
+        cell: sorted(
+            (
+                item
+                for item in blind
+                if (item["aspect"], item["label"]) == cell
+            ),
+            key=rank,
+        )
+        for cell in cells
+    }
+    chosen: list[Mapping[str, object]] = []
+    fourth_candidates: list[Mapping[str, object]] = []
+    for cell in cells:
+        chosen.extend(ranked_cells[cell][:3])
+        fourth_candidates.append(ranked_cells[cell][3])
+    chosen.extend(
+        sorted(fourth_candidates, key=rank)[: BLIND_RELABEL_TARGET - len(chosen)]
+    )
+    chosen.sort(key=rank)
+
+    sample: list[dict[str, object]] = []
+    for item in chosen:
+        relabel_not_before = _parse_utc_timestamp(item["labeled_at"]) + timedelta(
+            days=BLIND_WASHOUT_DAYS
+        )
+        sample.append(
+            {
+                "candidate_id": item["candidate_id"],
+                "aspect": item["aspect"],
+                "label": item["label"],
+                "relabel_not_before": relabel_not_before.isoformat().replace(
+                    "+00:00", "Z"
+                ),
+            }
+        )
+    return sample
+
+
+def _select_ordered_split(
+    candidates: Sequence[Mapping[str, object]],
+    review_by_id: Mapping[str, Mapping[str, object]],
+    inspected_ids: set[str],
+    split: str,
+    target: int,
+) -> tuple[list[dict[str, object]], int]:
+    inspected = [
+        candidate
+        for candidate in candidates
+        if candidate["split"] == split
+        and str(candidate["candidate_id"]) in inspected_ids
+    ]
+    selected: list[dict[str, object]] = []
+    reached_target_at: int | None = None
+    for index, candidate in enumerate(inspected):
+        review = review_by_id.get(str(candidate["candidate_id"]))
+        if review is not None and review["disposition"] == "accepted":
+            selected.append(_selected_record(candidate, review))
+            if len(selected) == target:
+                reached_target_at = index
+                break
+    if reached_target_at is not None and reached_target_at + 1 < len(inspected):
+        raise ValueError("allocation-inspection-after-quota")
+    return selected, len(inspected)
+
+
+class _BlindBalanceScore(NamedTuple):
+    event_excess: int
+    company_excess: int
+    unseen_issuer_deficit: int
+    event_group_deficit: int
+
+
+class _BlindVisitFrame(NamedTuple):
+    cell_index: int
+    position: int
+    cell_count: int
+
+
+class _BlindUndoFrame(NamedTuple):
+    candidate: dict[str, object]
+
+
+def _blind_balance_score(
+    selected: Sequence[Mapping[str, object]], seen_issuers: set[object]
+) -> _BlindBalanceScore:
+    event_counts = Counter(item["event_group_id"] for item in selected)
+    company_counts = Counter(item["company_id"] for item in selected)
+    unseen_issuers = {
+        item["company_id"]
+        for item in selected
+        if item["company_id"] not in seen_issuers
+    }
+    return _BlindBalanceScore(
+        event_excess=sum(max(0, count - 2) for count in event_counts.values()),
+        company_excess=sum(max(0, count - 5) for count in company_counts.values()),
+        unseen_issuer_deficit=max(0, 100 - len(unseen_issuers)),
+        event_group_deficit=max(0, 320 - len(event_counts)),
+    )
+
+
+def _select_balanced_blind(
+    candidates: Sequence[Mapping[str, object]],
+    review_by_id: Mapping[str, Mapping[str, object]],
+    inspected_ids: set[str],
+    seen_issuers: set[object],
+) -> tuple[list[dict[str, object]], str | None]:
+    cells = [(aspect, label) for aspect in STAGE_1_ASPECTS for label in RESULT_LABELS]
+    pools: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for cell in cells:
+        pool = [
+            _selected_record(candidate, review_by_id[str(candidate["candidate_id"])])
+            for candidate in candidates
+            if candidate["split"] == "blind"
+            and str(candidate["candidate_id"]) in inspected_ids
+            and candidate["aspect"] == cell[0]
+            and (review := review_by_id.get(str(candidate["candidate_id"])))
+            is not None
+            and review["label"] == cell[1]
+            and review["disposition"] == "accepted"
+        ]
+        pools[cell] = pool
+        if len(pool) < BLIND_CELL_TARGET:
+            return [], "blind-cell-quota-unfilled"
+
+    selected: list[dict[str, object]] = []
+    event_counts: Counter[object] = Counter()
+    company_counts: Counter[object] = Counter()
+    unseen_counts: Counter[object] = Counter()
+
+    def remaining_candidates(cell_index: int, position: int) -> list[dict[str, object]]:
+        current_cell = cells[cell_index]
+        return [
+            *pools[current_cell][position:],
+            *(
+                candidate
+                for later_cell in cells[cell_index + 1 :]
+                for candidate in pools[later_cell]
+            ),
+        ]
+
+    def can_still_meet_coverage(cell_index: int, position: int) -> bool:
+        remaining = remaining_candidates(cell_index, position)
+        possible_events = set(event_counts) | {
+            candidate["event_group_id"] for candidate in remaining
+        }
+        possible_unseen = set(unseen_counts) | {
+            candidate["company_id"]
+            for candidate in remaining
+            if candidate["company_id"] not in seen_issuers
+        }
+        return len(possible_events) >= 320 and len(possible_unseen) >= 100
+
+    def cell_capacity(pool: Sequence[Mapping[str, object]], position: int) -> int:
+        remaining_events = Counter(
+            candidate["event_group_id"] for candidate in pool[position:]
+        )
+        remaining_companies = Counter(
+            candidate["company_id"] for candidate in pool[position:]
+        )
+        event_capacity = sum(
+            min(count, max(0, 2 - event_counts[event_group_id]))
+            for event_group_id, count in remaining_events.items()
+        )
+        company_capacity = sum(
+            min(count, max(0, 5 - company_counts[company_id]))
+            for company_id, count in remaining_companies.items()
+        )
+        return min(event_capacity, company_capacity)
+
+    frames: list[_BlindVisitFrame | _BlindUndoFrame] = [_BlindVisitFrame(0, 0, 0)]
+    solution: list[dict[str, object]] | None = None
+    while frames:
+        frame = frames.pop()
+        if isinstance(frame, _BlindUndoFrame):
+            frame_candidate = frame.candidate
+            selected.pop()
+            event_group_id = frame_candidate["event_group_id"]
+            company_id = frame_candidate["company_id"]
+            event_counts[event_group_id] -= 1
+            company_counts[company_id] -= 1
+            if not event_counts[event_group_id]:
+                del event_counts[event_group_id]
+            if not company_counts[company_id]:
+                del company_counts[company_id]
+            if company_id not in seen_issuers:
+                unseen_counts[company_id] -= 1
+                if not unseen_counts[company_id]:
+                    del unseen_counts[company_id]
+            continue
+        cell_index, position, cell_count = frame
+        if cell_index == len(cells):
+            if len(event_counts) >= 320 and len(unseen_counts) >= 100:
+                solution = list(selected)
+                break
+            continue
+        pool = pools[cells[cell_index]]
+        if cell_count == BLIND_CELL_TARGET:
+            frames.append(_BlindVisitFrame(cell_index + 1, 0, 0))
+            continue
+        needed = BLIND_CELL_TARGET - cell_count
+        if (
+            len(pool) - position < needed
+            or cell_capacity(pool, position) < needed
+            or not can_still_meet_coverage(cell_index, position)
+        ):
+            continue
+
+        candidate = pool[position]
+        if len(pool) - (position + 1) >= needed:
+            frames.append(_BlindVisitFrame(cell_index, position + 1, cell_count))
+        event_group_id = candidate["event_group_id"]
+        company_id = candidate["company_id"]
+        if event_counts[event_group_id] < 2 and company_counts[company_id] < 5:
+            selected.append(candidate)
+            event_counts[event_group_id] += 1
+            company_counts[company_id] += 1
+            if company_id not in seen_issuers:
+                unseen_counts[company_id] += 1
+            frames.append(_BlindUndoFrame(candidate))
+            frames.append(
+                _BlindVisitFrame(cell_index, position + 1, cell_count + 1)
+            )
+
+    if solution is not None:
+        return solution, None
+
+    first_candidates = [
+        candidate
+        for cell in cells
+        for candidate in pools[cell][:BLIND_CELL_TARGET]
+    ]
+    score = _blind_balance_score(first_candidates, seen_issuers)
+    if score.event_excess or score.event_group_deficit:
+        reason = "blind-event-group-balance-failed"
+    elif score.company_excess:
+        reason = "blind-company-balance-failed"
+    else:
+        reason = "blind-unseen-issuer-balance-failed"
+    return first_candidates, reason
+
+
+def allocate_stage_1(
+    manifest: Mapping[str, object],
+    reviews: Sequence[Mapping[str, object]],
+    inspection_records: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Select the complete deterministic Stage 1 data allocation."""
+    if not _is_valid_sealed_candidate_manifest(manifest):
+        return _allocation_stop("unsealed-annex")
+    candidates_value = manifest.get("candidates")
+    annex = manifest.get("annex")
+    assert isinstance(candidates_value, list)
+    assert isinstance(annex, Mapping)
+    limits = annex.get("limits")
+    assert isinstance(limits, Mapping)
+
+    candidates: list[Mapping[str, object]] = []
+    candidate_by_id: dict[str, Mapping[str, object]] = {}
+    for candidate in candidates_value:
+        if not isinstance(candidate, Mapping):
+            raise ValueError("allocation-candidate-invalid")
+        candidate_id = candidate.get("candidate_id")
+        if (
+            not isinstance(candidate_id, str)
+            or not isinstance(candidate.get("company_id"), str)
+            or not str(candidate["company_id"]).strip()
+            or candidate.get("aspect") not in STAGE_1_ASPECTS
+        ):
+            raise ValueError("allocation-candidate-invalid")
+        candidates.append(candidate)
+        candidate_by_id[candidate_id] = candidate
+
+    seal = manifest["seal"]
+    assert isinstance(seal, Mapping)
+    manifest_sha256 = str(seal["semantic_sha256"])
+    matching_inspections = [
+        record
+        for record in inspection_records
+        if record.get("manifest_sha256") == manifest_sha256
+    ]
+    inspected_candidate_ids: list[str] = []
+    for record in matching_inspections:
+        candidate_id = record.get("candidate_id")
+        if (
+            record.get("event") != "candidate-inspected"
+            or not isinstance(candidate_id, str)
+            or candidate_id not in candidate_by_id
+            or candidate_id in inspected_candidate_ids
+        ):
+            raise ValueError("allocation-inspection-invalid")
+        inspected_candidate_ids.append(candidate_id)
+    expected_inspection_ids = [
+        str(candidate["candidate_id"])
+        for candidate in candidates[: len(inspected_candidate_ids)]
+    ]
+    if inspected_candidate_ids != expected_inspection_ids:
+        raise ValueError("out-of-order-allocation-inspection")
+    inspected_ids = set(inspected_candidate_ids)
+
+    review_by_id: dict[str, Mapping[str, object]] = {}
+    for review in reviews:
+        if not isinstance(review, Mapping):
+            raise ValueError("allocation-review-invalid")
+        candidate_id = review.get("candidate_id")
+        if (
+            not isinstance(candidate_id, str)
+            or candidate_id not in candidate_by_id
+            or candidate_id in review_by_id
+            or review.get("disposition") not in {"accepted", "excluded"}
+            or review.get("label") not in RESULT_LABELS
+        ):
+            raise ValueError("allocation-review-invalid")
+        _parse_utc_timestamp(review.get("labeled_at"))
+        if candidate_id not in inspected_ids:
+            raise ValueError("allocation-review-not-inspected")
+        review_by_id[candidate_id] = review
+
+    selected: dict[str, list[dict[str, object]]] = {
+        split: [] for split in CANDIDATE_SPLITS
+    }
+
+    selected["training"], silver_inspected = _select_ordered_split(
+        candidates,
+        review_by_id,
+        inspected_ids,
+        "training",
+        STAGE_1_ALLOCATION_TARGETS["training"],
+    )
+    silver_limit = int(limits["silver_candidate_limit"])
+    if silver_inspected > silver_limit:
+        return _allocation_stop(
+            "silver-candidate-limit-exceeded",
+            inspected_silver=silver_inspected,
+            selected=selected,
+        )
+    if len(selected["training"]) < STAGE_1_ALLOCATION_TARGETS["training"]:
+        reason = (
+            "silver-candidate-limit-exhausted"
+            if silver_inspected == silver_limit
+            else "silver-quota-unfilled"
+        )
+        return _allocation_stop(
+            reason, inspected_silver=silver_inspected, selected=selected
+        )
+
+    selected["development"], _ = _select_ordered_split(
+        candidates,
+        review_by_id,
+        inspected_ids,
+        "development",
+        STAGE_1_ALLOCATION_TARGETS["development"],
+    )
+    if len(selected["development"]) < STAGE_1_ALLOCATION_TARGETS["development"]:
+        return _allocation_stop(
+            "development-quota-unfilled",
+            inspected_silver=silver_inspected,
+            selected=selected,
+        )
+
+    seen_issuers = {
+        item["company_id"]
+        for split in ("training", "development")
+        for item in selected[split]
+    }
+    selected["blind"], blind_stop_reason = _select_balanced_blind(
+        candidates, review_by_id, inspected_ids, seen_issuers
+    )
+    if blind_stop_reason is not None:
+        return _allocation_stop(
+            blind_stop_reason,
+            inspected_silver=silver_inspected,
+            selected=selected,
+        )
+    unseen_issuers = {
+        item["company_id"]
+        for item in selected["blind"]
+        if item["company_id"] not in seen_issuers
+    }
+    for item in selected["blind"]:
+        item["unseen_issuer"] = item["company_id"] in unseen_issuers
+
+    result: dict[str, object] = {
+        "allocation": "complete",
+        "stop_reason": None,
+        "candidate_manifest_sha256": manifest["seal"]["semantic_sha256"],  # type: ignore[index]
+        "silver_candidates_inspected": silver_inspected,
+        "silver_candidate_limit": silver_limit,
+        "selected_counts": {
+            split: len(selected[split]) for split in CANDIDATE_SPLITS
+        },
+        **selected,
+        "blind_relabel_seed": BLIND_RELABEL_SEED,
+        "blind_relabel_sample": _relabel_sample(selected["blind"]),
+    }
+    result["allocation_sha256"] = hashlib.sha256(
+        _canonical_json(result).encode("utf-8")
+    ).hexdigest()
+    return result
 
 
 class _AppendOnlyJsonl:
@@ -655,6 +1122,11 @@ class StageRun:
             ]
             if len(prior) >= len(candidates):
                 raise ValueError("candidate-manifest-exhausted")
+            if (
+                sum(record.get("split") == "training" for record in prior)
+                >= int(manifest["annex"]["limits"]["silver_candidate_limit"])  # type: ignore[index]
+            ):
+                raise ValueError("silver-candidate-limit-exhausted")
             expected = candidates[len(prior)]
             assert isinstance(expected, Mapping)
             if candidate_id != expected.get("candidate_id"):
@@ -675,6 +1147,7 @@ class StageRun:
             if reason not in {
                 "out-of-order-inspection",
                 "candidate-manifest-exhausted",
+                "silver-candidate-limit-exhausted",
             }:
                 raise
             return {
@@ -688,6 +1161,16 @@ class StageRun:
             "candidate_id": candidate_id,
             "record": record,
         }
+
+    def allocate_stage_1(
+        self,
+        manifest: Mapping[str, object],
+        reviews: Sequence[Mapping[str, object]],
+    ) -> dict[str, object]:
+        """Allocate Stage 1 from recorded candidate inspections."""
+        return allocate_stage_1(
+            manifest, reviews, self.candidate_inspection_records()
+        )
 
     def budget_exposure(self) -> dict[str, Decimal]:
         return self._budget_exposure_from(self.cost_records())
@@ -1063,6 +1546,14 @@ def _read_manifest(path: str) -> dict[str, object]:
     return value
 
 
+def _read_reviews(path: str) -> list[Mapping[str, object]]:
+    with Path(path).open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ValueError("The reviews file must be a JSON array of objects.")
+    return value
+
+
 def _write_json(value: object) -> None:
     json.dump(value, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
@@ -1110,6 +1601,14 @@ def main(argv: list[str] | None = None) -> int:
     inspect.add_argument("candidate_id", metavar="candidate-id")
     inspect.add_argument("--state-dir", required=True)
 
+    allocate = commands.add_parser(
+        "allocate-stage-1", help="Create the fixed Stage 1 data allocation."
+    )
+    allocate.add_argument("manifest")
+    allocate.add_argument("reviews")
+    allocate.add_argument("--output", required=True)
+    allocate.add_argument("--state-dir", required=True)
+
     args = parser.parse_args(argv)
     try:
         if args.command == "admit-example":
@@ -1130,6 +1629,24 @@ def main(argv: list[str] | None = None) -> int:
             )
             _write_json({"sealed_candidate_manifest": str(output_path)})
             return 0
+        if args.command == "allocate-stage-1":
+            allocation = StageRun(args.state_dir).allocate_stage_1(
+                _read_manifest(args.manifest), _read_reviews(args.reviews)
+            )
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps(allocation, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            _write_json(
+                {
+                    "stage_1_allocation": str(output_path),
+                    "allocation": allocation["allocation"],
+                    "stop_reason": allocation["stop_reason"],
+                }
+            )
+            return 0 if allocation["allocation"] == "complete" else 2
         if args.command == "confirm":
             confirmed = confirm_manifest(_read_manifest(args.manifest), args.confirmed_by)
             output_path = Path(args.output)
