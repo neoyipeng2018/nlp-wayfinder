@@ -74,6 +74,48 @@ serialized input, field separators, and model special tokens. It does not trunca
 the input. It returns the schema result `Invalid` and a stop reason when the input
 does not pass a check or has more than 1,024 tokens.
 
+Before labeling, make one candidate manifest for the financial-news source. The
+`annex` must use structured records for acquisition, rights, extraction,
+normalization, target-and-aspect expansion, event grouping, duplicate review,
+split rules, limits, and software versions. The split rules must give the start
+and end date of each training, development, and blind period. The limits record
+must set the Stage 1 silver-candidate limit to 6,668. Each candidate must have
+these fields:
+
+- `candidate_id`
+- `event_group_id`
+- `published_at`
+- `normalized_passage`
+- `near_duplicate_reviewed`, with the value `true`
+
+An optional `near_duplicate_group_id` records a reviewed near-duplicate group.
+The final manifest can contain only one candidate from that group. The seal
+calculates `content_sha256` from the normalized passage. It rejects repeated
+content hashes. It assigns `split` from the publication time and the recorded
+periods. It rejects an event group that occurs in more than one split.
+
+Seal the annex and create the fixed candidate order:
+
+```sh
+python3 -m nlp_wayfinder.stage_run seal-candidates draft-candidates.json \
+  --sealed-by NAME --output sealed-candidates.json
+```
+
+The order is the ascending SHA-256 of
+`nlp-wayfinder + stage + source + split + candidate_id + 20260905`. The seal
+hash covers the full annex and ordered candidates.
+
+Inspect only the next candidate in this order:
+
+```sh
+python3 -m nlp_wayfinder.stage_run inspect-candidate \
+  sealed-candidates.json CANDIDATE_ID --state-dir .wayfinder-state
+```
+
+The command writes an append-only inspection record. It rejects an absent or
+changed seal and an out-of-order candidate. It also validates duplicate and
+event-group split controls again before inspection.
+
 Record a cost commitment before the related action. Record the actual cost after
 the action:
 

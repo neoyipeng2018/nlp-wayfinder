@@ -44,6 +44,25 @@ EXAMPLE_CONSUMERS = (
     "specialist",
     "gpt",
 )
+CANDIDATE_ORDER_SALT = "20260905"
+CANDIDATE_SPLITS = ("training", "development", "blind")
+SOURCE_ANNEX_FIELDS = (
+    "acquisition",
+    "rights",
+    "extraction",
+    "normalization",
+    "target_and_aspect_expansion",
+    "grouping",
+    "duplicate_review",
+    "split_rules",
+    "limits",
+    "software_versions",
+)
+SPLIT_BOUNDARY_FIELDS = tuple(
+    f"{split}_{boundary}_on"
+    for split in CANDIDATE_SPLITS
+    for boundary in ("starts", "ends")
+)
 
 BUDGET_LIMITS = {
     "paid-silver-labels": Decimal("0.00"),
@@ -119,6 +138,214 @@ def confirm_manifest(
         "semantic_sha256": semantic_manifest_sha256(confirmed),
     }
     return confirmed
+
+
+def candidate_order_sha256(
+    stage: int,
+    source: str,
+    split: str,
+    candidate_id: str,
+) -> str:
+    """Return the frozen candidate-order value."""
+    expression = (
+        f"nlp-wayfinder{stage}{source}{split}{candidate_id}{CANDIDATE_ORDER_SALT}"
+    )
+    return hashlib.sha256(expression.encode("utf-8")).hexdigest()
+
+
+def _candidate_manifest_sha256(manifest: Mapping[str, object]) -> str:
+    semantic = copy.deepcopy(dict(manifest))
+    semantic.pop("seal", None)
+    return hashlib.sha256(_canonical_json(semantic).encode("utf-8")).hexdigest()
+
+
+def _annex_record(
+    annex: Mapping[str, object],
+    name: str,
+    required_fields: tuple[str, ...],
+) -> Mapping[str, object]:
+    record = annex.get(name)
+    if not isinstance(record, Mapping) or any(
+        not record.get(field) for field in required_fields
+    ):
+        raise ValueError("source-annex-incomplete")
+    return record
+
+
+def _split_periods(annex: Mapping[str, object]) -> dict[str, tuple[date, date]]:
+    split_rules = _annex_record(annex, "split_rules", SPLIT_BOUNDARY_FIELDS)
+    try:
+        periods = {
+            split: (
+                date.fromisoformat(str(split_rules[f"{split}_starts_on"])),
+                date.fromisoformat(str(split_rules[f"{split}_ends_on"])),
+            )
+            for split in CANDIDATE_SPLITS
+        }
+    except ValueError as error:
+        raise ValueError("source-annex-incomplete") from error
+    prior_end: date | None = None
+    for starts_on, ends_on in periods.values():
+        if starts_on > ends_on or (prior_end is not None and starts_on <= prior_end):
+            raise ValueError("split-periods-overlap")
+        prior_end = ends_on
+    return periods
+
+
+def _candidate_split(
+    published_at: object,
+    periods: Mapping[str, tuple[date, date]],
+) -> str:
+    if not isinstance(published_at, str):
+        raise ValueError("A candidate publication time is not valid.")
+    try:
+        published_on = date.fromisoformat(published_at[:10])
+    except ValueError as error:
+        raise ValueError("A candidate publication time is not valid.") from error
+    for split, (starts_on, ends_on) in periods.items():
+        if starts_on <= published_on <= ends_on:
+            return split
+    raise ValueError("candidate-outside-split-periods")
+
+
+def seal_candidate_manifest(
+    manifest: Mapping[str, object],
+    sealed_by: str,
+    *,
+    sealed_at: str | None = None,
+) -> dict[str, object]:
+    """Validate, order, and seal one Stage 1 candidate manifest."""
+    if not sealed_by.strip():
+        raise ValueError("The sealed-by value must contain text.")
+    sealed = copy.deepcopy(dict(manifest))
+    stage = sealed.get("stage")
+    source = sealed.get("source")
+    candidates = sealed.get("candidates")
+    if (
+        sealed.get("schema_version") != 1
+        or stage != 1
+        or source != "financial-news"
+        or not isinstance(candidates, list)
+        or not candidates
+    ):
+        raise ValueError("The candidate manifest is not valid for Stage 1.")
+    annex = sealed.get("annex")
+    if not isinstance(annex, Mapping) or any(
+        field not in annex for field in SOURCE_ANNEX_FIELDS
+    ):
+        raise ValueError("source-annex-incomplete")
+    _annex_record(annex, "acquisition", ("method", "evidence"))
+    rights = _annex_record(annex, "rights", (*RIGHTS_FIELDS, "evidence"))
+    if any(rights[field] is not True for field in RIGHTS_FIELDS):
+        raise ValueError("source-annex-incomplete")
+    for name in (
+        "extraction",
+        "normalization",
+        "target_and_aspect_expansion",
+        "grouping",
+    ):
+        _annex_record(annex, name, ("method",))
+    _annex_record(
+        annex,
+        "duplicate_review",
+        ("exact_method", "near_method", "completed_at"),
+    )
+    limits = _annex_record(
+        annex,
+        "limits",
+        ("silver_candidate_limit", "development_target", "blind_target"),
+    )
+    if limits["silver_candidate_limit"] != 6_668:
+        raise ValueError("source-annex-incomplete")
+    software_versions = annex.get("software_versions")
+    if not isinstance(software_versions, Mapping) or not software_versions:
+        raise ValueError("source-annex-incomplete")
+    periods = _split_periods(annex)
+
+    ordered: list[dict[str, object]] = []
+    candidate_ids: set[str] = set()
+    content_hashes: set[str] = set()
+    near_duplicate_groups: set[str] = set()
+    event_group_splits: dict[str, str] = {}
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            raise ValueError("A candidate record is not valid.")
+        candidate_copy = copy.deepcopy(dict(candidate))
+        candidate_id = candidate_copy.get("candidate_id")
+        if not isinstance(candidate_id, str) or not candidate_id.strip():
+            raise ValueError("A candidate ID must contain text.")
+        split = _candidate_split(candidate_copy.get("published_at"), periods)
+        supplied_split = candidate_copy.get("split")
+        if supplied_split is not None and supplied_split != split:
+            raise ValueError("candidate-in-wrong-split-period")
+        candidate_copy["split"] = split
+        if candidate_id in candidate_ids:
+            raise ValueError("A candidate ID occurs more than once.")
+        candidate_ids.add(candidate_id)
+        event_group_id = candidate_copy.get("event_group_id")
+        if not isinstance(event_group_id, str) or not event_group_id.strip():
+            raise ValueError("An event group ID must contain text.")
+        prior_split = event_group_splits.setdefault(event_group_id, str(split))
+        if prior_split != split:
+            raise ValueError("event-group-crosses-splits")
+        normalized_passage = candidate_copy.get("normalized_passage")
+        if not isinstance(normalized_passage, str) or not normalized_passage.strip():
+            raise ValueError("A normalized passage must contain text.")
+        content_sha256 = hashlib.sha256(
+            normalized_passage.encode("utf-8")
+        ).hexdigest()
+        supplied_content_sha256 = candidate_copy.get("content_sha256")
+        if (
+            supplied_content_sha256 is not None
+            and supplied_content_sha256 != content_sha256
+        ):
+            raise ValueError("candidate-content-hash-mismatch")
+        candidate_copy["content_sha256"] = content_sha256
+        if content_sha256 in content_hashes:
+            raise ValueError("exact-duplicate-unresolved")
+        content_hashes.add(content_sha256)
+        if candidate_copy.get("near_duplicate_reviewed") is not True:
+            raise ValueError("near-duplicate-review-incomplete")
+        near_group = candidate_copy.get("near_duplicate_group_id")
+        if near_group is not None:
+            if not isinstance(near_group, str) or not near_group.strip():
+                raise ValueError("A near-duplicate group ID is not valid.")
+            if near_group in near_duplicate_groups:
+                raise ValueError("near-duplicate-unresolved")
+            near_duplicate_groups.add(near_group)
+        candidate_copy["order_sha256"] = candidate_order_sha256(
+            stage, source, str(split), candidate_id
+        )
+        ordered.append(candidate_copy)
+    ordered.sort(key=lambda candidate: str(candidate["order_sha256"]))
+    sealed["candidates"] = ordered
+    sealed["seal"] = {
+        "sealed_by": sealed_by,
+        "sealed_at": sealed_at or _now(),
+        "semantic_sha256": _candidate_manifest_sha256(sealed),
+    }
+    return sealed
+
+
+def _is_valid_sealed_candidate_manifest(manifest: Mapping[str, object]) -> bool:
+    seal = manifest.get("seal")
+    if not isinstance(seal, Mapping) or not all(
+        seal.get(field) for field in ("sealed_by", "sealed_at", "semantic_sha256")
+    ):
+        return False
+    if seal["semantic_sha256"] != _candidate_manifest_sha256(manifest):
+        return False
+    try:
+        rebuilt = seal_candidate_manifest(
+            manifest,
+            str(seal["sealed_by"]),
+            sealed_at=str(seal["sealed_at"]),
+        )
+    except ValueError:
+        return False
+    return _canonical_json(rebuilt.get("candidates")) == _canonical_json(
+        manifest.get("candidates")
+    )
 
 
 class _AppendOnlyJsonl:
@@ -371,7 +598,7 @@ def load_modernbert_tokenizer() -> Tokenizer:
 
 
 class StageRun:
-    """Evaluate Stage 1 gates and own the two append-only audit logs."""
+    """Evaluate Stage 1 gates and own its append-only audit logs."""
 
     def __init__(
         self,
@@ -382,14 +609,85 @@ class StageRun:
         self.state_dir = Path(state_dir)
         self.spend_ledger_path = self.state_dir / "spend-ledger.jsonl"
         self.decision_log_path = self.state_dir / "decision-log.jsonl"
+        self.candidate_inspection_log_path = (
+            self.state_dir / "candidate-inspection-log.jsonl"
+        )
         self._spend_ledger = _AppendOnlyJsonl(self.spend_ledger_path, clock)
         self._decision_log = _AppendOnlyJsonl(self.decision_log_path, clock)
+        self._candidate_inspection_log = _AppendOnlyJsonl(
+            self.candidate_inspection_log_path, clock
+        )
 
     def cost_records(self) -> list[dict[str, Any]]:
         return self._spend_ledger.read()
 
     def decision_records(self) -> list[dict[str, Any]]:
         return self._decision_log.read()
+
+    def candidate_inspection_records(self) -> list[dict[str, Any]]:
+        return self._candidate_inspection_log.read()
+
+    def inspect_candidate(
+        self,
+        manifest: Mapping[str, object],
+        candidate_id: str,
+    ) -> dict[str, object]:
+        """Inspect only the next candidate in one sealed manifest."""
+        if not _is_valid_sealed_candidate_manifest(manifest):
+            return {
+                "inspection": "rejected",
+                "stop_reason": "unsealed-annex",
+                "candidate_id": candidate_id,
+            }
+        seal = manifest["seal"]
+        candidates = manifest["candidates"]
+        assert isinstance(seal, Mapping)
+        assert isinstance(candidates, list)
+        manifest_sha256 = str(seal["semantic_sha256"])
+
+        def next_inspection(
+            records: list[dict[str, Any]],
+        ) -> Mapping[str, object]:
+            prior = [
+                record
+                for record in records
+                if record.get("manifest_sha256") == manifest_sha256
+            ]
+            if len(prior) >= len(candidates):
+                raise ValueError("candidate-manifest-exhausted")
+            expected = candidates[len(prior)]
+            assert isinstance(expected, Mapping)
+            if candidate_id != expected.get("candidate_id"):
+                raise ValueError("out-of-order-inspection")
+            return {
+                "event": "candidate-inspected",
+                "manifest_sha256": manifest_sha256,
+                "candidate_id": candidate_id,
+                "order_sha256": expected["order_sha256"],
+                "split": expected["split"],
+                "event_group_id": expected["event_group_id"],
+            }
+
+        try:
+            record = self._candidate_inspection_log.append_checked(next_inspection)
+        except ValueError as error:
+            reason = str(error)
+            if reason not in {
+                "out-of-order-inspection",
+                "candidate-manifest-exhausted",
+            }:
+                raise
+            return {
+                "inspection": "rejected",
+                "stop_reason": reason,
+                "candidate_id": candidate_id,
+            }
+        return {
+            "inspection": "accepted",
+            "stop_reason": None,
+            "candidate_id": candidate_id,
+            "record": record,
+        }
 
     def budget_exposure(self) -> dict[str, Decimal]:
         return self._budget_exposure_from(self.cost_records())
@@ -798,6 +1096,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     admit.add_argument("example")
 
+    seal_candidates = commands.add_parser(
+        "seal-candidates", help="Validate and seal one candidate manifest."
+    )
+    seal_candidates.add_argument("manifest")
+    seal_candidates.add_argument("--sealed-by", required=True)
+    seal_candidates.add_argument("--output", required=True)
+
+    inspect = commands.add_parser(
+        "inspect-candidate", help="Inspect the next sealed candidate."
+    )
+    inspect.add_argument("manifest")
+    inspect.add_argument("candidate_id", metavar="candidate-id")
+    inspect.add_argument("--state-dir", required=True)
+
     args = parser.parse_args(argv)
     try:
         if args.command == "admit-example":
@@ -806,6 +1118,18 @@ def main(argv: list[str] | None = None) -> int:
             )
             _write_json(result)
             return 0 if result["admission"] == "accepted" else 2
+        if args.command == "seal-candidates":
+            sealed = seal_candidate_manifest(
+                _read_manifest(args.manifest), args.sealed_by
+            )
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps(sealed, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            _write_json({"sealed_candidate_manifest": str(output_path)})
+            return 0
         if args.command == "confirm":
             confirmed = confirm_manifest(_read_manifest(args.manifest), args.confirmed_by)
             output_path = Path(args.output)
@@ -817,6 +1141,12 @@ def main(argv: list[str] | None = None) -> int:
             _write_json({"confirmed_manifest": str(output_path)})
             return 0
         runner = StageRun(args.state_dir)
+        if args.command == "inspect-candidate":
+            result = runner.inspect_candidate(
+                _read_manifest(args.manifest), args.candidate_id
+            )
+            _write_json(result)
+            return 0 if result["inspection"] == "accepted" else 2
         if args.command == "record-cost":
             _write_json(
                 runner.record_cost(

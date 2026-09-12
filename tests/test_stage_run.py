@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from nlp_wayfinder.stage_run import (
     CostLimitError,
     StageRun,
     admit_example,
+    seal_candidate_manifest,
     confirm_manifest,
 )
 
@@ -126,6 +128,69 @@ def draft_manifest() -> dict[str, object]:
             },
             "evidence": "fixture cost projection",
         },
+    }
+
+
+def candidate_manifest() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "stage": 1,
+        "source": "financial-news",
+        "annex": {
+            "acquisition": {
+                "method": "Fixed export from the approved source.",
+                "evidence": "fixture-export-record",
+            },
+            "rights": {
+                "access_permitted": True,
+                "private_evaluation_permitted": True,
+                "training_permitted": True,
+                "weight_release_permitted": True,
+                "text_redistribution_permitted": True,
+                "evidence": "fixture-rights-record",
+            },
+            "extraction": {"method": "Extract complete article sentences."},
+            "normalization": {"method": "Use NFC text and normalized whitespace."},
+            "target_and_aspect_expansion": {
+                "method": "Use each supported company and aspect."
+            },
+            "grouping": {"method": "Group reports about the same event."},
+            "duplicate_review": {
+                "exact_method": "Compare normalized passage hashes.",
+                "near_method": "Review similarity groups.",
+                "completed_at": "2026-09-09T00:00:00Z",
+            },
+            "split_rules": {
+                "training_starts_on": "2026-01-01",
+                "training_ends_on": "2026-06-30",
+                "development_starts_on": "2026-07-01",
+                "development_ends_on": "2026-08-31",
+                "blind_starts_on": "2026-09-01",
+                "blind_ends_on": "2026-12-31",
+            },
+            "limits": {
+                "silver_candidate_limit": 6668,
+                "development_target": 200,
+                "blind_target": 400,
+            },
+            "software_versions": {"nlp-wayfinder": "fixture-revision"},
+        },
+        "candidates": [
+            {
+                "candidate_id": "candidate-b",
+                "event_group_id": "event-b",
+                "published_at": "2026-07-10T09:00:00Z",
+                "normalized_passage": "Harbor Grid opened its second plant.",
+                "near_duplicate_reviewed": True,
+            },
+            {
+                "candidate_id": "candidate-a",
+                "event_group_id": "event-a",
+                "published_at": "2026-03-10T09:00:00Z",
+                "normalized_passage": "Harbor Grid opened its first plant.",
+                "near_duplicate_reviewed": True,
+            },
+        ],
     }
 
 
@@ -452,6 +517,149 @@ class ExampleAdmissionTests(unittest.TestCase):
         results = [admit_example(case, self.tokenizer) for case in cases]
 
         self.assertEqual(["accepted", "accepted"], [r["admission"] for r in results])
+
+
+class CandidateManifestTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.runner = StageRun(
+            self.temp_dir.name,
+            clock=lambda: "2026-09-10T00:00:00Z",
+        )
+
+    def test_seal_creates_the_frozen_sha256_candidate_order(self) -> None:
+        sealed = seal_candidate_manifest(
+            candidate_manifest(),
+            "fixture-owner",
+            sealed_at="2026-09-10T00:00:00Z",
+        )
+
+        candidates = cast(list[dict[str, object]], sealed["candidates"])
+        hashes = [str(candidate["order_sha256"]) for candidate in candidates]
+        self.assertEqual(sorted(hashes), hashes)
+        for candidate in candidates:
+            expression = (
+                "nlp-wayfinder"
+                f"1financial-news{candidate['split']}"
+                f"{candidate['candidate_id']}20260905"
+            )
+            self.assertEqual(
+                hashlib.sha256(expression.encode("utf-8")).hexdigest(),
+                candidate["order_sha256"],
+            )
+        self.assertEqual(
+            {"training", "development"},
+            {candidate["split"] for candidate in candidates},
+        )
+        self.assertEqual(
+            "fixture-owner", sealed["seal"]["sealed_by"]  # type: ignore[index]
+        )
+
+    def test_seal_rejects_an_incomplete_source_annex(self) -> None:
+        manifest = candidate_manifest()
+        del manifest["annex"]["normalization"]  # type: ignore[index]
+
+        with self.assertRaisesRegex(ValueError, "source-annex-incomplete"):
+            seal_candidate_manifest(manifest, "fixture-owner")
+
+    def test_seal_rejects_unresolved_exact_or_near_duplicates(self) -> None:
+        exact = candidate_manifest()
+        exact["candidates"][1]["normalized_passage"] = (  # type: ignore[index]
+            exact["candidates"][0]["normalized_passage"]  # type: ignore[index]
+        )
+        near = candidate_manifest()
+        for candidate in near["candidates"]:  # type: ignore[union-attr]
+            candidate["near_duplicate_group_id"] = "near-1"
+
+        with self.assertRaisesRegex(ValueError, "exact-duplicate-unresolved"):
+            seal_candidate_manifest(exact, "fixture-owner")
+        with self.assertRaisesRegex(ValueError, "near-duplicate-unresolved"):
+            seal_candidate_manifest(near, "fixture-owner")
+
+    def test_seal_does_not_trust_a_supplied_content_hash(self) -> None:
+        manifest = candidate_manifest()
+        manifest["candidates"][0]["content_sha256"] = "0" * 64  # type: ignore[index]
+
+        with self.assertRaisesRegex(ValueError, "candidate-content-hash-mismatch"):
+            seal_candidate_manifest(manifest, "fixture-owner")
+
+    def test_seal_rejects_an_event_group_that_crosses_splits(self) -> None:
+        manifest = candidate_manifest()
+        manifest["candidates"][1]["event_group_id"] = "event-b"  # type: ignore[index]
+
+        with self.assertRaisesRegex(ValueError, "event-group-crosses-splits"):
+            seal_candidate_manifest(manifest, "fixture-owner")
+
+    def test_stage_run_rejects_an_unsealed_candidate_manifest(self) -> None:
+        result = self.runner.inspect_candidate(candidate_manifest(), "candidate-a")
+
+        self.assertEqual("rejected", result["inspection"])
+        self.assertEqual("unsealed-annex", result["stop_reason"])
+
+    def test_stage_run_rejects_out_of_order_inspection(self) -> None:
+        sealed = seal_candidate_manifest(candidate_manifest(), "fixture-owner")
+        candidates = cast(list[dict[str, object]], sealed["candidates"])
+
+        rejected = self.runner.inspect_candidate(
+            sealed, str(candidates[1]["candidate_id"])
+        )
+        first = self.runner.inspect_candidate(
+            sealed, str(candidates[0]["candidate_id"])
+        )
+        second = self.runner.inspect_candidate(
+            sealed, str(candidates[1]["candidate_id"])
+        )
+
+        self.assertEqual("out-of-order-inspection", rejected["stop_reason"])
+        self.assertEqual(
+            ["accepted", "accepted"],
+            [first["inspection"], second["inspection"]],
+        )
+        self.assertEqual(2, len(self.runner.candidate_inspection_records()))
+
+    def test_candidate_manifest_cli_seals_and_inspects_first_candidate(self) -> None:
+        draft_path = Path(self.temp_dir.name) / "draft-candidates.json"
+        sealed_path = Path(self.temp_dir.name) / "sealed-candidates.json"
+        draft_path.write_text(json.dumps(candidate_manifest()), encoding="utf-8")
+        sealed_result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "nlp_wayfinder.stage_run",
+                "seal-candidates",
+                str(draft_path),
+                "--sealed-by",
+                "fixture-owner",
+                "--output",
+                str(sealed_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        sealed = json.loads(sealed_path.read_text(encoding="utf-8"))
+        first_id = sealed["candidates"][0]["candidate_id"]
+
+        inspection_result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "nlp_wayfinder.stage_run",
+                "inspect-candidate",
+                str(sealed_path),
+                first_id,
+                "--state-dir",
+                self.temp_dir.name,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(0, sealed_result.returncode, sealed_result.stdout)
+        self.assertEqual(0, inspection_result.returncode, inspection_result.stdout)
+        self.assertEqual("accepted", json.loads(inspection_result.stdout)["inspection"])
 
 
 if __name__ == "__main__":
