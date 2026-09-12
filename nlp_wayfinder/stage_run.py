@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import socket
 import sys
 import time
@@ -62,6 +63,10 @@ BLIND_CELL_TARGET = 25
 BLIND_RELABEL_SEED = "20260905"
 BLIND_RELABEL_TARGET = 60
 BLIND_WASHOUT_DAYS = 14
+BLIND_BOOTSTRAP_SEED = "20260905"
+BLIND_BOOTSTRAP_SAMPLES = 10_000
+BLIND_BOOTSTRAP_INTERVAL = 0.95
+NON_INFERIORITY_MARGIN = -0.03
 SOURCE_ANNEX_FIELDS = (
     "acquisition",
     "rights",
@@ -1540,26 +1545,108 @@ def _macro_f1(
     predictions: Mapping[str, str], reference: Mapping[str, str]
 ) -> float:
     """Give each of the four classes equal weight. Use zero for an empty class."""
-    total = 0.0
-    for label in RESULT_LABELS:
-        true_positive = sum(
-            1
-            for candidate_id, truth in reference.items()
-            if truth == label and predictions.get(candidate_id) == label
+    return _macro_f1_from_counts(
+        _f1_counts(
+            [(truth, predictions.get(key, "")) for key, truth in reference.items()]
         )
-        false_positive = sum(
-            1
-            for candidate_id, predicted in predictions.items()
-            if predicted == label and reference.get(candidate_id) != label
+    )
+
+
+def _f1_counts(pairs: Sequence[tuple[str, str]]) -> list[int]:
+    """Count the true positives, false positives, and false negatives.
+
+    The result holds three counts for each of the four labels, in label order.
+    The counts add across disjoint example sets, so one event group keeps one
+    vector and a bootstrap sample is the sum of its group vectors.
+    """
+    position_of = {label: index for index, label in enumerate(RESULT_LABELS)}
+    counts = [0] * (3 * len(RESULT_LABELS))
+    for reference, predicted in pairs:
+        if reference == predicted:
+            counts[3 * position_of[reference]] += 1
+            continue
+        counts[3 * position_of[reference] + 2] += 1
+        if predicted in position_of:
+            # An absent prediction is only a false negative. The blind report
+            # rejects such a prediction before it scores the comparison.
+            counts[3 * position_of[predicted] + 1] += 1
+    return counts
+
+
+def _class_f1(counts: Sequence[int], label: str) -> float:
+    position = 3 * RESULT_LABELS.index(label)
+    true_positive, false_positive, false_negative = counts[position : position + 3]
+    denominator = 2 * true_positive + false_positive + false_negative
+    return (2 * true_positive / denominator) if denominator else 0.0
+
+
+def _macro_f1_from_counts(counts: Sequence[int]) -> float:
+    """Give each of the four classes equal weight. Use zero for an empty class."""
+    return sum(_class_f1(counts, label) for label in RESULT_LABELS) / len(RESULT_LABELS)
+
+
+def _percentile(values: Sequence[float], fraction: float) -> float:
+    """Read one percentile of ascending values with linear interpolation."""
+    position = (len(values) - 1) * fraction
+    below = math.floor(position)
+    above = math.ceil(position)
+    if below == above:
+        return values[below]
+    return values[below] + (values[above] - values[below]) * (position - below)
+
+
+def _paired_event_group_bootstrap(
+    group_counts: Sequence[tuple[list[int], list[int]]],
+) -> dict[str, object]:
+    """Resample event groups in pairs and give the difference interval.
+
+    Each sample takes the same event groups for the specialist and for GPT, so
+    the interval holds the paired difference of the four-class macro-F1.
+    """
+    generator = random.Random(int(BLIND_BOOTSTRAP_SEED))
+    width = 3 * len(RESULT_LABELS)
+    differences: list[float] = []
+    # ponytail: one plain loop. 10,000 samples of 400 blind examples take about
+    # six seconds. Use an array library only if a later stage needs more samples.
+    for _ in range(BLIND_BOOTSTRAP_SAMPLES):
+        specialist = [0] * width
+        gpt = [0] * width
+        for specialist_counts, gpt_counts in generator.choices(
+            group_counts, k=len(group_counts)
+        ):
+            for position in range(width):
+                specialist[position] += specialist_counts[position]
+                gpt[position] += gpt_counts[position]
+        differences.append(
+            _macro_f1_from_counts(specialist) - _macro_f1_from_counts(gpt)
         )
-        false_negative = sum(
-            1
-            for candidate_id, truth in reference.items()
-            if truth == label and predictions.get(candidate_id) != label
-        )
-        denominator = 2 * true_positive + false_positive + false_negative
-        total += (2 * true_positive / denominator) if denominator else 0.0
-    return total / len(RESULT_LABELS)
+    differences.sort()
+    tail = (1.0 - BLIND_BOOTSTRAP_INTERVAL) / 2
+    return {
+        "method": "paired-event-group-percentile",
+        "samples": BLIND_BOOTSTRAP_SAMPLES,
+        "seed": BLIND_BOOTSTRAP_SEED,
+        "resampling_unit": "event-group",
+        "event_group_count": len(group_counts),
+        "interval": BLIND_BOOTSTRAP_INTERVAL,
+        "lower_limit": _percentile(differences, tail),
+        "upper_limit": _percentile(differences, 1.0 - tail),
+    }
+
+
+def _cohen_kappa(pairs: Sequence[tuple[str, str]]) -> float | None:
+    """Give the four-class Cohen kappa, or nothing when chance agreement is one."""
+    if not pairs:
+        return None
+    observed = sum(1 for first, second in pairs if first == second) / len(pairs)
+    first_counts = Counter(first for first, _ in pairs)
+    second_counts = Counter(second for _, second in pairs)
+    expected = sum(
+        first_counts[label] * second_counts[label] for label in RESULT_LABELS
+    ) / (len(pairs) ** 2)
+    if expected == 1.0:
+        return None
+    return (observed - expected) / (1.0 - expected)
 
 
 def _contains_gpt_artifact(value: object) -> bool:
@@ -2861,6 +2948,323 @@ class StageRun:
         )
         return prediction_file
 
+    def _report_stop(self, run_id: str, reason: str) -> dict[str, object]:
+        self._decision_log.append(
+            {
+                "event": "stage-1-report",
+                "run_id": run_id,
+                "report": "invalid",
+                "stop_reason": reason,
+            }
+        )
+        return {"report": "invalid", "stop_reason": reason, "run_id": run_id}
+
+    def report_stage_1(
+        self,
+        stage_manifest: Mapping[str, object],
+        candidate_manifest: Mapping[str, object],
+        allocation: Mapping[str, object],
+        relabels: Sequence[Mapping[str, object]],
+    ) -> dict[str, object]:
+        """Score the sealed blind comparison and give the complete audit report."""
+        run_id = str(stage_manifest.get("run_id", "unknown-run"))
+        decision = self.evaluate(stage_manifest)
+        if decision["decision"] != "build-eligible":
+            return self._report_stop(run_id, str(decision["stop_reason"]))
+        if not _is_valid_sealed_candidate_manifest(candidate_manifest):
+            return self._report_stop(run_id, "unsealed-annex")
+        seal = candidate_manifest["seal"]
+        assert isinstance(seal, Mapping)
+        candidate_manifest_sha256 = str(seal["semantic_sha256"])
+        blind = allocation.get("blind")
+        if (
+            allocation.get("allocation") != "complete"
+            or allocation.get("candidate_manifest_sha256") != candidate_manifest_sha256
+            or not isinstance(blind, list)
+            or not blind
+        ):
+            return self._report_stop(run_id, "allocation-not-complete")
+
+        # Both prediction files come from the sealed logs. A file that a caller
+        # supplies has no place in the comparison.
+        specialist_file = self._sealed_prediction_file(
+            self.specialist_records(),
+            "specialist-predictions-sealed",
+            candidate_manifest_sha256,
+        )
+        if specialist_file is None:
+            return self._report_stop(run_id, "specialist-predictions-missing")
+        gpt_file = self._sealed_prediction_file(
+            self.gpt_blind_records(),
+            "gpt-blind-predictions-sealed",
+            candidate_manifest_sha256,
+        )
+        if gpt_file is None:
+            return self._report_stop(run_id, "gpt-predictions-missing")
+
+        reference: dict[str, str] = {}
+        event_group_of: dict[str, str] = {}
+        for item in blind:
+            if (
+                not isinstance(item, Mapping)
+                or item.get("label") not in RESULT_LABELS
+                or not isinstance(item.get("event_group_id"), str)
+            ):
+                return self._report_stop(run_id, "blind-label-invalid")
+            candidate_id = str(item["candidate_id"])
+            reference[candidate_id] = str(item["label"])
+            event_group_of[candidate_id] = str(item["event_group_id"])
+
+        predictions: dict[str, dict[str, str]] = {}
+        for system, prediction_file in (
+            ("specialist", specialist_file),
+            ("gpt", gpt_file),
+        ):
+            labels: dict[str, str] = {}
+            for item in cast(list[Mapping[str, object]], prediction_file["predictions"]):
+                label = item.get("label")
+                if label not in RESULT_LABELS:
+                    return self._report_stop(run_id, "incomplete-paired-predictions")
+                labels[str(item["candidate_id"])] = str(label)
+            if set(labels) != set(reference):
+                return self._report_stop(run_id, "incomplete-paired-predictions")
+            predictions[system] = labels
+
+        relabel_stop, self_consistency = self._score_relabels(allocation, relabels)
+        if relabel_stop is not None:
+            return self._report_stop(run_id, relabel_stop)
+
+        counts_by_system = {
+            system: _f1_counts(
+                [(reference[key], labels[key]) for key in sorted(reference)]
+            )
+            for system, labels in predictions.items()
+        }
+        macro_f1 = {
+            system: _macro_f1_from_counts(counts)
+            for system, counts in counts_by_system.items()
+        }
+        difference = macro_f1["specialist"] - macro_f1["gpt"]
+
+        grouped: dict[str, list[str]] = {}
+        for candidate_id, group_id in event_group_of.items():
+            grouped.setdefault(group_id, []).append(candidate_id)
+        group_counts = [
+            (
+                _f1_counts(
+                    [
+                        (reference[key], predictions["specialist"][key])
+                        for key in sorted(members)
+                    ]
+                ),
+                _f1_counts(
+                    [
+                        (reference[key], predictions["gpt"][key])
+                        for key in sorted(members)
+                    ]
+                ),
+            )
+            for _, members in sorted(grouped.items())
+        ]
+        bootstrap = _paired_event_group_bootstrap(group_counts)
+        lower_limit = cast(float, bootstrap["lower_limit"])
+        guardrail = "pass" if lower_limit >= NON_INFERIORITY_MARGIN else "fail"
+        superiority = lower_limit > 0.0
+
+        attempts = [
+            record
+            for record in self.gpt_blind_records()
+            if record.get("event") == "gpt-blind-attempt"
+        ]
+        training_runs = [
+            record
+            for record in self.specialist_records()
+            if record.get("event") == "specialist-training-run"
+        ]
+        frozen = next(
+            (
+                record
+                for record in self.specialist_records()
+                if record.get("event") == "specialist-run-frozen"
+            ),
+            {},
+        )
+
+        report: dict[str, object] = {
+            "report": "complete",
+            "stop_reason": None,
+            "run_id": run_id,
+            "stage": 1,
+            "source": "financial-news",
+            "decision": {
+                "blind_comparison": "valid",
+                "source_guardrail": guardrail,
+                "non_inferiority_margin": NON_INFERIORITY_MARGIN,
+                "superiority": superiority,
+                "reference_label": "first-human-label",
+            },
+            "counts": {
+                "blind_examples": len(reference),
+                "blind_event_groups": len(grouped),
+                "unseen_issuers": sum(
+                    1
+                    for item in cast(list[Mapping[str, object]], blind)
+                    if item.get("unseen_issuer")
+                ),
+                "training_examples": frozen.get("training_example_count"),
+                "development_examples": frozen.get("development_example_count"),
+                "silver_candidates_inspected": allocation.get(
+                    "silver_candidates_inspected"
+                ),
+                "relabel_examples": self_consistency["example_count"],
+                "gpt_attempts": len(attempts),
+            },
+            "identities": {
+                "specialist_model_id": specialist_file["model_id"],
+                "specialist_revision": specialist_file["revision"],
+                "checkpoint_id": specialist_file["checkpoint_id"],
+                "selected_seed": specialist_file["selected_seed"],
+                "inference_device_id": specialist_file["inference_device_id"],
+                "gpt_route_id": gpt_file["route_id"],
+                "gpt_reasoning_effort": gpt_file["reasoning_effort"],
+                "labeling_route_ids": list(EXPECTED_ROUTE_IDS),
+            },
+            "attempts": {
+                "gpt_by_outcome": dict(
+                    Counter(str(record.get("outcome")) for record in attempts)
+                ),
+                "gpt_retried_examples": sum(
+                    1
+                    for item in cast(
+                        list[Mapping[str, object]], gpt_file["predictions"]
+                    )
+                    if cast(int, item.get("attempt_count", 1)) > 1
+                ),
+                "specialist_training_runs": training_runs,
+            },
+            "hashes": {
+                "stage_manifest_sha256": semantic_manifest_sha256(stage_manifest),
+                "candidate_manifest_sha256": candidate_manifest_sha256,
+                "allocation_sha256": allocation.get("allocation_sha256"),
+                "specialist_prediction_file_sha256": specialist_file[
+                    "prediction_file_sha256"
+                ],
+                "gpt_prediction_file_sha256": gpt_file["prediction_file_sha256"],
+                "training_config_sha256": specialist_file["training_config_sha256"],
+                "gpt_prompt_sha256": gpt_file["prompt_sha256"],
+            },
+            "versions": {
+                "report": _software_versions(),
+                "specialist": specialist_file["software_versions"],
+                "gpt": gpt_file["software_versions"],
+            },
+            "prediction_files": {
+                "specialist": specialist_file,
+                "gpt": gpt_file,
+            },
+            "metrics": {
+                "specialist": {
+                    "class_f1": {
+                        label: _class_f1(counts_by_system["specialist"], label)
+                        for label in RESULT_LABELS
+                    },
+                    "macro_f1": macro_f1["specialist"],
+                },
+                "gpt": {
+                    "class_f1": {
+                        label: _class_f1(counts_by_system["gpt"], label)
+                        for label in RESULT_LABELS
+                    },
+                    "macro_f1": macro_f1["gpt"],
+                },
+                "reference_support": {
+                    label: sum(1 for value in reference.values() if value == label)
+                    for label in RESULT_LABELS
+                },
+                "macro_f1_difference": difference,
+                "bootstrap": bootstrap,
+                "self_consistency": self_consistency,
+            },
+            "ledger_entries": self.cost_records(),
+        }
+        self._decision_log.append(
+            {
+                "event": "stage-1-report",
+                "run_id": run_id,
+                "report": "complete",
+                "stop_reason": None,
+                "source_guardrail": guardrail,
+                "superiority": superiority,
+                "macro_f1_difference": difference,
+                "lower_limit": lower_limit,
+                "upper_limit": bootstrap["upper_limit"],
+            }
+        )
+        report["decision_records"] = self.decision_records()
+        report["report_sha256"] = hashlib.sha256(
+            _canonical_json(report).encode("utf-8")
+        ).hexdigest()
+        return report
+
+    @staticmethod
+    def _sealed_prediction_file(
+        records: Sequence[Mapping[str, object]],
+        event: str,
+        candidate_manifest_sha256: str,
+    ) -> dict[str, object] | None:
+        """Read the one sealed prediction file for this candidate manifest."""
+        for record in records:
+            if record.get("event") != event:
+                continue
+            prediction_file = record.get("prediction_file")
+            if (
+                isinstance(prediction_file, Mapping)
+                and prediction_file.get("candidate_manifest_sha256")
+                == candidate_manifest_sha256
+            ):
+                return cast(dict[str, object], prediction_file)
+        return None
+
+    def _score_relabels(
+        self,
+        allocation: Mapping[str, object],
+        relabels: Sequence[Mapping[str, object]],
+    ) -> tuple[str | None, dict[str, object]]:
+        """Measure the delayed second label. The first label does not change."""
+        sample = allocation.get("blind_relabel_sample")
+        if not isinstance(sample, list) or len(sample) != BLIND_RELABEL_TARGET:
+            return "relabel-sample-mismatch", {}
+        expected = {str(item["candidate_id"]): item for item in sample}
+        second: dict[str, str] = {}
+        for record in relabels:
+            candidate_id = str(record.get("candidate_id"))
+            item = expected.get(candidate_id)
+            if item is None or candidate_id in second:
+                return "relabel-sample-mismatch", {}
+            if record.get("label") not in RESULT_LABELS:
+                return "relabel-label-invalid", {}
+            if _parse_utc_timestamp(record.get("labeled_at")) < _parse_utc_timestamp(
+                item["relabel_not_before"]
+            ):
+                return "relabel-washout-not-met", {}
+            second[candidate_id] = str(record["label"])
+        if set(second) != set(expected):
+            return "relabel-sample-mismatch", {}
+
+        pairs = [
+            (str(expected[key]["label"]), second[key]) for key in sorted(expected)
+        ]
+        agreed = sum(1 for first, repeat in pairs if first == repeat)
+        return None, {
+            "example_count": len(pairs),
+            "seed": str(allocation.get("blind_relabel_seed", BLIND_RELABEL_SEED)),
+            "washout_days": BLIND_WASHOUT_DAYS,
+            "reference_label": "first-human-label",
+            "agreed_count": agreed,
+            "raw_agreement": agreed / len(pairs),
+            "cohen_kappa": _cohen_kappa(pairs),
+        }
+
     def inspect_candidate(
         self,
         manifest: Mapping[str, object],
@@ -3416,6 +3820,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     gpt.add_argument("--timeout-seconds", type=float, default=120)
 
+    report = commands.add_parser(
+        "report-stage-1", help="Decide and report the sealed Stage 1 result."
+    )
+    report.add_argument("stage_manifest")
+    report.add_argument("candidate_manifest")
+    report.add_argument("allocation")
+    report.add_argument("relabels")
+    report.add_argument("--output", required=True)
+    report.add_argument("--state-dir", required=True)
+
     args = parser.parse_args(argv)
     try:
         if args.command == "admit-example":
@@ -3497,6 +3911,30 @@ def main(argv: list[str] | None = None) -> int:
                     "gpt_predictions": predictions["gpt_predictions"],
                     "stop_reason": predictions["stop_reason"],
                     "prediction_count": predictions["prediction_count"],
+                }
+            )
+            return 0 if complete else 2
+        if args.command == "report-stage-1":
+            result = StageRun(args.state_dir).report_stage_1(
+                _read_manifest(args.stage_manifest),
+                _read_manifest(args.candidate_manifest),
+                _read_manifest(args.allocation),
+                _read_reviews(args.relabels),
+            )
+            complete = result["report"] == "complete"
+            if complete:
+                output_path = Path(args.output)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(
+                    json.dumps(result, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+            _write_json(
+                {
+                    "stage_1_report": args.output if complete else None,
+                    "report": result["report"],
+                    "stop_reason": result["stop_reason"],
+                    "decision": result.get("decision"),
                 }
             )
             return 0 if complete else 2

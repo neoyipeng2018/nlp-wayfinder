@@ -339,6 +339,50 @@ projection, and the sealed software versions. A later call returns the sealed
 file and does not train again. A sealed file for a different candidate manifest
 returns `frozen-specialist-run-changed`.
 
+Decide and report the Stage 1 result after both prediction files are sealed:
+
+```sh
+python3 -m nlp_wayfinder.stage_run report-stage-1 confirmed.json \
+  sealed-candidates.json allocation.json relabels.json \
+  --output stage-1-report.json --state-dir .wayfinder-state
+```
+
+The relabels file is a JSON array. Each item contains `candidate_id`, `label`,
+and `labeled_at`. The array must contain one second label for each of the 60
+examples in `blind_relabel_sample`. A second label before `relabel_not_before`
+returns `relabel-washout-not-met`. Another candidate set returns
+`relabel-sample-mismatch`.
+
+The operation reads both sealed prediction files from the log. It does not
+accept a prediction file from the operator. A missing file returns
+`specialist-predictions-missing` or `gpt-predictions-missing`. A prediction set
+that does not match the blind examples returns `incomplete-paired-predictions`.
+
+The operation applies the staged feasibility gate first, and it returns that
+stop reason when the gate does not pass. A candidate manifest that is not sealed
+returns `unsealed-annex`. An allocation that is not complete, or that is for
+another candidate manifest, returns `allocation-not-complete`. A blind example
+without a valid label or event group returns `blind-label-invalid`. A second
+label that is not one of the four classes returns `relabel-label-invalid`.
+
+The report gives each class F1, the four-class macro-F1 for the specialist model
+and for the GPT-5.6-sol baseline, and the specialist-minus-GPT difference. The
+paired bootstrap resamples the blind event groups 10,000 times with seed
+`20260905`. It gives the two-sided 95% percentile interval of the difference.
+Financial news passes the source guardrail only when the lower limit is
+`-0.03` or more. The report records superiority only when the lower limit is
+more than zero.
+
+The report also gives the raw agreement and the Cohen kappa of the delayed
+60-example relabel. The first human label stays as the reference label. The
+second label does not change the benchmark result.
+
+The report contains the decisions, the counts, the model and route identities,
+the GPT attempt counts, the manifest and prediction-file hashes, the software
+versions, both prediction files, the metrics, the decision records, and the
+spend-ledger entries. It carries its own SHA-256 hash. The command returns exit
+code `2` and writes no file when the report is not complete.
+
 Record a cost commitment before the related action. Record the actual cost after
 the action:
 
