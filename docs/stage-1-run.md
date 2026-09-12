@@ -212,10 +212,16 @@ provenance. Aggregation does not use it as a weight until human development
 labels calibrate it.
 
 A malformed answer earns one repair request to the same route with an identical
-request. No other abstention earns one. Both attempts stay in `raw-votes.jsonl`
-with their `retry_ordinal`, and the second attempt counts against the route free
-limit. Only the final attempt gives the vote, so each route and item still
-contributes one vote to aggregation.
+request. No other abstention earns one. Both attempts stay in `raw-votes.jsonl`,
+and each attempt holds its own position in `retry_ordinal`. Only the final
+attempt gives the vote, so each route and item still contributes one vote to
+aggregation.
+
+The repair is a full request. It counts against the route free limit, and it can
+itself stop collection with `free-limit-failure` or `paid-overflow-detected`. Give
+`current_stage_requests` in the route panel a margin for the repairs, because the
+schedule uses that number. A repair that hits the free limit spends no repair,
+so the route gets its repair again after the quota resets.
 
 A free-limit failure or a paid response stops collection. The command returns
 exit code `2` with stop reason `free-limit-failure` or `paid-overflow-detected`.
