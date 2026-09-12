@@ -10,6 +10,7 @@ import threading
 import unittest
 import unittest.mock
 from collections import Counter
+from datetime import date, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
@@ -21,9 +22,11 @@ from nlp_wayfinder.stage_run import (
     MAX_EXAMPLE_TOKENS,
     MODERNBERT_MODEL_ID,
     MODERNBERT_REVISION,
+    PASSAGE_TEXT_RIGHTS,
     SILVER_CALIBRATION_FOLDS,
     SILVER_MIN_PROBABILITY,
     SOURCE_ALLOCATION_TARGETS,
+    SOURCE_EVIDENCE_FRESHNESS_DAYS,
     SOURCE_SILVER_CANDIDATE_LIMITS,
     STAGE_SOURCES,
     OmniRouteHttpTransport,
@@ -43,6 +46,7 @@ from nlp_wayfinder.stage_run import (
     project_gpt_blind_cost,
     project_specialist_training_cost,
     _calibration_fold,
+    _source_evidence_sha256,
     _silver_rejection,
     candidate_order_sha256,
     cumulative_sources,
@@ -240,6 +244,46 @@ def route(route_id: str) -> dict[str, object]:
     }
 
 
+def rights_clause(
+    right: str,
+    *,
+    audited_object: str | None = None,
+    retrieved_on: str = "2026-09-10",
+) -> dict[str, object]:
+    """Give one complete rights clause record."""
+    return {
+        "primary_source_term": f"{right} clause of the published terms",
+        "quoted_clause": (
+            f"The licensor grants {right.replace('_', ' ')} for the passage text."
+        ),
+        "retrieved_on": retrieved_on,
+        "reviewer": "fixture-reviewer",
+        "audited_object": audited_object
+        or ("passage-text" if right in PASSAGE_TEXT_RIGHTS else "data-files"),
+    }
+
+
+def source_evidence(
+    source_type: str,
+    *,
+    checked_at: str = "2026-09-10",
+    retrieved_on: str = "2026-09-10",
+    lane: str = "clean-core",
+) -> dict[str, object]:
+    """Give one complete source eligibility evidence record."""
+    return {
+        "checked_at": checked_at,
+        "terms_url": f"https://example.test/{source_type}-terms",
+        "reviewer": "fixture-reviewer",
+        "access_method": "Fixed export under the published terms.",
+        "data_portfolio_lane": lane,
+        "rights_clauses": {
+            right: rights_clause(right, retrieved_on=retrieved_on)
+            for right in RIGHTS_FIELDS
+        },
+    }
+
+
 def draft_manifest() -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -253,11 +297,7 @@ def draft_manifest() -> dict[str, object]:
             "training_permitted": True,
             "weight_release_permitted": True,
             "text_redistribution_permitted": True,
-            "evidence": {
-                "checked_at": "2026-09-10T00:00:00Z",
-                "terms_url": "https://example.test/news-terms",
-                "reviewer": "fixture-reviewer",
-            },
+            "evidence": source_evidence("financial-news"),
         },
         "route_panel": {
             "inspection_complete": True,
@@ -3972,11 +4012,9 @@ def stage_source(source_type: str) -> dict[str, object]:
         "source_id": f"{source_type}-fixture",
         "source_type": source_type,
         **STAGE_2_RIGHTS,
-        "evidence": {
-            "checked_at": "2026-09-28T00:00:00Z",
-            "terms_url": f"https://example.test/{source_type}-terms",
-            "reviewer": "fixture-reviewer",
-        },
+        "evidence": source_evidence(
+            source_type, checked_at="2026-09-28", retrieved_on="2026-09-28"
+        ),
         "data_plan": {
             "silver_candidate_limit": SOURCE_SILVER_CANDIDATE_LIMITS[source_type],
             **SOURCE_ALLOCATION_TARGETS[source_type],
@@ -4607,3 +4645,232 @@ class StageThreeCumulativeTests(StageTwoCumulativeTests):
 
         for source in ("financial-news", "company-announcements"):
             self.assertEqual(BLIND_REPORT_SIZE, self.gpt_requests[source])
+
+
+class SourceEligibilityTests(unittest.TestCase):
+    """Another person can check the rights evidence of each source."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.state_dir = Path(self.temp_dir.name)
+        self.runner = StageRun(self.state_dir, clock=lambda: "2026-09-10T00:00:00Z")
+
+    def evaluate(self, manifest: Mapping[str, object]) -> dict[str, object]:
+        return self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+
+    def source_of(self, manifest: Mapping[str, object]) -> dict[str, Any]:
+        return cast(dict[str, Any], manifest["source"])
+
+    def evidence_of(self, manifest: Mapping[str, object]) -> dict[str, Any]:
+        return cast(dict[str, Any], self.source_of(manifest)["evidence"])
+
+    def test_complete_current_clause_records_return_build_eligible(self) -> None:
+        decision = self.evaluate(draft_manifest())
+
+        self.assertEqual("build-eligible", decision["decision"])
+        evidence = cast(dict[str, Any], decision["evidence"])
+        source = evidence["sources"]["financial-news"]
+        self.assertEqual(
+            set(RIGHTS_FIELDS), set(source["evidence"]["rights_clauses"])
+        )
+        self.assertEqual("clean-core", source["evidence"]["data_portfolio_lane"])
+        self.assertEqual(
+            _source_evidence_sha256(source["evidence"]), source["evidence_sha256"]
+        )
+
+    def test_a_right_without_its_clause_record_stops_the_stage(self) -> None:
+        manifest = draft_manifest()
+        del self.evidence_of(manifest)["rights_clauses"]["training_permitted"][
+            "quoted_clause"
+        ]
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("no-build", decision["decision"])
+        self.assertEqual(
+            "source-rights-evidence-incomplete", decision["stop_reason"]
+        )
+
+    def test_a_source_without_an_evidence_record_stops_the_stage(self) -> None:
+        manifest = draft_manifest()
+        self.source_of(manifest)["evidence"] = None
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual(
+            "source-rights-evidence-incomplete", decision["stop_reason"]
+        )
+        records = self.runner.decision_records()
+        self.assertEqual(1, len(records))
+        self.assertEqual(
+            _source_evidence_sha256(None), records[0]["evidence_sha256"]
+        )
+
+    def test_clause_text_fields_must_contain_text(self) -> None:
+        manifest = draft_manifest()
+        self.evidence_of(manifest)["rights_clauses"]["access_permitted"][
+            "quoted_clause"
+        ] = True
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual(
+            "source-rights-evidence-incomplete", decision["stop_reason"]
+        )
+
+    def test_one_missing_clause_record_of_five_stops_the_stage(self) -> None:
+        manifest = draft_manifest()
+        clauses = self.evidence_of(manifest)["rights_clauses"]
+        del clauses["text_redistribution_permitted"]
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual(4, len(clauses))
+        self.assertEqual(
+            "source-rights-evidence-incomplete", decision["stop_reason"]
+        )
+
+    def test_a_repository_clause_cannot_support_a_passage_text_right(self) -> None:
+        for right in PASSAGE_TEXT_RIGHTS:
+            for audited_object in ("repository", "data-files"):
+                with self.subTest(right=right, audited_object=audited_object):
+                    manifest = draft_manifest()
+                    self.evidence_of(manifest)["rights_clauses"][right] = (
+                        rights_clause(right, audited_object=audited_object)
+                    )
+
+                    decision = self.evaluate(manifest)
+
+                    self.assertEqual(
+                        "source-rights-evidence-incomplete",
+                        decision["stop_reason"],
+                    )
+
+    def test_the_freshness_window_holds_exactly_ninety_days(self) -> None:
+        starts_on = date.fromisoformat("2026-09-14")
+        fresh = starts_on - timedelta(days=SOURCE_EVIDENCE_FRESHNESS_DAYS)
+
+        for offset, expected in ((0, "build-eligible"), (1, "no-build")):
+            with self.subTest(offset=offset):
+                runner = StageRun(
+                    Path(self.temp_dir.name) / f"window-{offset}",
+                    clock=lambda: "2026-09-10T00:00:00Z",
+                )
+                manifest = draft_manifest()
+                self.evidence_of(manifest)["checked_at"] = (
+                    fresh - timedelta(days=offset)
+                ).isoformat()
+
+                decision = runner.evaluate(
+                    confirm_manifest(manifest, "fixture-owner")
+                )
+
+                self.assertEqual(expected, decision["decision"])
+                if expected == "no-build":
+                    self.assertEqual(
+                        "source-rights-evidence-stale", decision["stop_reason"]
+                    )
+
+    def test_evidence_older_than_the_window_stops_the_stage(self) -> None:
+        manifest = draft_manifest()
+        self.evidence_of(manifest)["checked_at"] = "2026-01-02"
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("source-rights-evidence-stale", decision["stop_reason"])
+
+    def test_evidence_dated_after_the_run_date_stops_the_stage(self) -> None:
+        manifest = draft_manifest()
+        self.evidence_of(manifest)["checked_at"] = "2026-09-11"
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("source-rights-evidence-stale", decision["stop_reason"])
+
+    def test_a_malformed_timestamp_stops_the_stage(self) -> None:
+        manifest = draft_manifest()
+        self.evidence_of(manifest)["checked_at"] = "2026-09-10-not-a-time"
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("source-rights-evidence-stale", decision["stop_reason"])
+
+    def test_a_stale_clause_retrieval_date_stops_the_stage(self) -> None:
+        manifest = draft_manifest()
+        self.evidence_of(manifest)["rights_clauses"]["access_permitted"][
+            "retrieved_on"
+        ] = "2026-01-02"
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("source-rights-evidence-stale", decision["stop_reason"])
+
+    def test_a_restricted_auxiliary_lane_stops_the_stage(self) -> None:
+        manifest = draft_manifest()
+        self.evidence_of(manifest)["data_portfolio_lane"] = "restricted-auxiliary"
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("source-lane-restricted", decision["stop_reason"])
+
+    def test_one_eligibility_stop_appends_one_decision_record(self) -> None:
+        manifest = draft_manifest()
+        self.evidence_of(manifest)["data_portfolio_lane"] = "restricted-auxiliary"
+
+        decision = self.evaluate(manifest)
+
+        records = self.runner.decision_records()
+        self.assertEqual(1, len(records))
+        self.assertEqual("source-eligibility-stopped", records[0]["event"])
+        self.assertEqual("stage-1-fixture", records[0]["run_id"])
+        self.assertEqual(1, records[0]["stage"])
+        self.assertEqual("financial-news-fixture", records[0]["source_id"])
+        self.assertEqual(decision["stop_reason"], records[0]["stop_reason"])
+        self.assertEqual(
+            _source_evidence_sha256(self.evidence_of(manifest)),
+            records[0]["evidence_sha256"],
+        )
+
+    def test_source_rights_run_before_every_other_gate(self) -> None:
+        manifest = draft_manifest()
+        self.evidence_of(manifest)["data_portfolio_lane"] = "restricted-auxiliary"
+        cast(dict[str, Any], manifest["budget"])["evidence"] = ""
+        cast(dict[str, Any], manifest["schedule"])["must_finish_by"] = "2026-09-15"
+        cast(dict[str, Any], manifest["route_panel"])["routes"] = []
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("source-lane-restricted", decision["stop_reason"])
+
+    def test_a_later_stage_source_keeps_the_same_evidence_rule(self) -> None:
+        runner = StageRun(
+            Path(self.temp_dir.name) / "stage-2", clock=lambda: "2026-09-28T00:00:00Z"
+        )
+        manifest = draft_stage_manifest(2)
+        sources = cast(list[dict[str, Any]], manifest["sources"])
+        evidence = cast(dict[str, Any], sources[1]["evidence"])
+        evidence["access_method"] = ""
+
+        decision = runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+
+        self.assertEqual(
+            "source-rights-evidence-incomplete", decision["stop_reason"]
+        )
+
+    def test_each_initial_manifest_still_returns_no_build(self) -> None:
+        for stage in (1, 2, 3):
+            with self.subTest(stage=stage):
+                runner = StageRun(
+                    Path(self.temp_dir.name) / f"initial-{stage}",
+                    clock=lambda: "2026-09-10T00:00:00Z",
+                )
+                with Path(f"manifests/stage-{stage}.initial.json").open(
+                    encoding="utf-8"
+                ) as stream:
+                    manifest = json.load(stream)
+
+                decision = runner.evaluate(manifest)
+
+                self.assertEqual("no-build", decision["decision"])
+                self.assertEqual("source-rights-failed", decision["stop_reason"])

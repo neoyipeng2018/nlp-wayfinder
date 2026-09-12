@@ -1,0 +1,11 @@
+#!/bin/sh
+
+set -eu
+
+project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+export PATH="$project_dir/.venv/bin:$PATH"
+export DATA_DIR="$project_dir/.omniroute"
+export OMNIROUTE_SERVER_HOST="127.0.0.1"
+
+exec omniroute "$@"

@@ -1,0 +1,81 @@
+# Rights audit for fresh financial-news and financial-social passage streams
+
+Research date: 2026-08-24
+
+## Decision
+
+No verified, zero-marginal-cost **live passage stream** was found that both matches the intended financial-news or market-social distribution and is expressly cleared for all three required uses: private model evaluation, model training/model-weight use, and redistribution of passage text.
+
+That is a binding portfolio constraint, not a data-engineering inconvenience. Public access, an API, an RSS feed, or presence in a web crawl does not by itself grant downstream content rights. “Private evaluation” also does not override a platform term that forbids automated extraction, machine-learning use, or retention.
+
+For the chosen two-lane posture:
+
+1. **Commercially clean core:** admit only text with an explicit permissive license or public-domain statement. Fresh SEC-, Federal Reserve Board-, and BLS-authored releases qualify legally, but they are regulator/macro announcements—not independent financial news or investor social media—and therefore must not silently fill those source quotas. GDELT-produced metadata may be used for discovery, not as a license to publisher prose.
+2. **Research-only auxiliary:** FinLin and FiQA may be used only within their non-commercial conditions. Stack Exchange financial sites are a live, licensed social auxiliary, but their discussion distribution does not substitute for Stocktwits/X-style market social media, and released model weights still need a CC BY-SA decision.
+3. **Fresh news/social blind set:** keep the strict source labels only if written publisher/author permission or a documented legal basis is obtained. Otherwise change the source scope. If passages are kept private after review, publish only a manifest (source URL or platform ID, timestamp, retrieval revision, content hash, and labels), not the text.
+
+If the specification still requires roughly 100 fresh financial-news and 100 fresh financial-social examples, rights clearance is a **build gate**. The zero-dollar, five-source portfolio cannot presently satisfy it with redistributable text.
+
+“Safe” below means an express first-party permission supports the stated use, subject to its conditions. “Pending” means access exists but the necessary content or model-weight right was not established; do not use until cleared. “Unsafe” means the terms or zero-cost constraint rule the use out. This is a conservative source audit, not legal advice.
+
+## Exact source roster
+
+| Candidate | Fresh task passage stream? | Private evaluation | Training / model weights | Text redistribution | Decision |
+|---|---|---|---|---|---|
+| **GDELT-created metadata, URLs, themes, and event annotations** | No—discovery/index data, not article passages | **Safe** | **Safe** | **Safe**, with GDELT citation | Use as discovery and provenance only. GDELT permits unrestricted academic, commercial, and government use and redistribution of its datasets. |
+| **GDELT Context snippets and linked publisher articles** | Yes, but publisher-authored | **Pending** per publisher | **Pending** per publisher | **Pending** per publisher | A GDELT result is not a publisher-text license. The Context API returns source sentences and the live feed is explicitly a URL firehose for downstream crawling. |
+| **Common Crawl WARC/WET pages** | Yes | **Pending** per publisher | **Pending** per publisher | **Pending** per publisher | Transport only. Common Crawl says crawled content may carry source-owner terms, makes the user bear third-party-rights risk, and recommends legal advice before commercial use. |
+| **Guardian Open Platform, free developer tier** | Yes | **Unsafe** for model evaluation | **Unsafe** | **Unsafe** as a dataset; only tightly conditioned website display is licensed | The free tier forbids ML/AI use, sentiment analysis, text/data mining, and automated extraction, and requires deletion/re-fetch within 24 hours. |
+| **NewsAPI free developer tier** | No full passages; URLs and metadata only | **Unsafe** for an ongoing internal benchmark | **Unsafe** | **Unsafe** for article text | Free access is development-environment-only, articles are delayed, and publisher rights remain separate. |
+| **Reuters Connect / AP site content without a paid license** | Yes | **Unsafe** under the zero-cost collection plan | **Unsafe** | **Unsafe** | Reuters offers current content through subscription/licensing products. AP forbids automated retrieval and archiving absent permission. Free browsing is not corpus permission. |
+| **Wikinews archive** | No longer fresh; read-only since 2026-05-04 | **Safe** | **Safe** | **Safe**, with required attribution | Useful licensed historical news only. Current text is CC BY 4.0, but the project no longer publishes new articles. |
+| **SEC-authored newsroom releases** | Fresh, but regulator announcements rather than independent news | **Safe** | **Safe** | **Safe**, excluding seals, logos, stock art, and identified third-party material | Commercially clean adjacent stream. SEC permits copying and further distribution of information on `sec.gov`. Do not generalize this row to publisher articles discovered through SEC links. |
+| **Federal Reserve Board-authored releases** | Fresh, but central-bank announcements rather than independent news | **Safe** | **Safe** | **Safe**, cite the Board and exclude identified non-Board material | Commercially clean adjacent macro stream. The Board says its site information is public domain unless otherwise indicated and provides current RSS feeds. |
+| **BLS-authored economic releases** | Fresh, but statistical releases rather than independent news | **Safe** | **Safe** | **Safe**, cite BLS and omit protected emblems/third-party images | Commercially clean adjacent macro stream. BLS says everything it publishes is public domain except specified photographs and illustrations. |
+| **FNSPID** | Historical through 2023; scraper code is not a rights-cleared live feed | **Pending** | **Pending**; no commercial-right inference | **Pending** | The owner repo is internally contradictory: it announces released commercial/research rights, retains a CC BY-NC 4.0 license file, and still prohibits commercial use. It also says the news was gathered/scraped from third-party sites; the authors cannot be assumed to own that prose. |
+| **Bluesky / AT Protocol firehose** | Yes | **Pending** absent author permission | **Pending** absent author permission | **Pending** absent author permission | The protocol makes public repositories and synchronization possible, but Bluesky says users retain ownership and grants the operative content license to Bluesky—not a blanket license to downstream collectors. Discovery only by default. |
+| **Reddit Data API** | Yes | **Unsafe** for this benchmark absent separate approval and rightsholder permission | **Unsafe** | **Unsafe** | The API license is limited to app access/display. Reddit expressly withholds ML/AI training rights without rightsholder permission and requires separate terms for commercial or excess research use. |
+| **Stocktwits** | Yes in principle, but no new API registrations | **Unsafe** without an approved API and written use permission | **Unsafe** | **Unsafe** | Current terms forbid automated extraction except through an approved offering or written authorization; user content remains user-owned, and the user-to-user grant covers use through service functionality only. |
+| **X API** | Yes, but not zero-cost | **Unsafe** under the zero-cost requirement | **Unsafe** under this portfolio; foundation/frontier training is also expressly prohibited | **Unsafe** beyond narrow platform rules | All read endpoints are pay-per-use. This alone removes X from the zero-marginal-cost roster. |
+| **Stack Exchange Personal Finance & Money / Quantitative Finance** | Fresh social discussion, but not representative market social media | **Safe**, with attribution | **Pending** for released/commercial weights pending a CC BY-SA analysis | **Safe** under each post's `content_license`, attribution, and share-alike conditions | Best lawful live social auxiliary. Record post/revision ID, author, URL, per-item license, timestamp, and deletion state. Do not treat it as a replacement for investor cashtag streams. |
+| **FinLin** | No; fixed three-month historical corpus | **Safe** for non-commercial research | **Safe** for internal non-commercial training; **pending** before releasing weights | **Safe** only non-commercial under CC BY-NC-SA 4.0 | Research-only auxiliary. Preserve corpus attribution/share-alike terms and do not infer commercial rights. |
+| **FiQA 2018** | No; fixed challenge corpus | **Safe** for non-commercial research | **Safe** for internal non-commercial training | **Pending**; the challenge's download permission is not an explicit redistribution license | Research-only auxiliary, not a fresh source. |
+| **TweetFinSent** | No; fixed Twitter corpus | **Pending** | **Pending** | **Pending** | The owner repository exposes tweet text but contains no explicit data license. Publication/downloadability is not reuse permission. |
+
+## Primary-source evidence
+
+### Discovery and crawls
+
+- GDELT states that all datasets it releases may be used without fee for unlimited academic, commercial, or governmental purposes and may be mirrored with citation ([GDELT About](https://www.gdeltproject.org/about.html)). That permission safely covers GDELT-produced fields. It does not establish that GDELT owns publisher prose. The [Context API](https://blog.gdeltproject.org/announcing-the-gdelt-context-2-0-api/) returns a matching source sentence plus context, while the [live article-list feeds](https://blog.gdeltproject.org/new-gdelt-article-list-rss-feeds-images-links-social-media-and-mobile-urls/) are described as URLs for organizations to crawl and archive themselves.
+- Common Crawl offers free access to raw pages, metadata, and text extracts ([overview](https://commoncrawl.org/overview)), but its [Terms of Use](https://commoncrawl.org/terms-of-use) say crawled content may be governed by the source owner's terms, require respect for third-party rights, specifically allocate AI/training claims to the user, and recommend legal advice before commercial use.
+
+### News and public-sector text
+
+- The Guardian's [Open Platform terms](https://www.theguardian.com/open-platform/terms-and-conditions) prohibit ML/AI use, sentiment analysis, text/data mining, and automated extraction in the developer tier. Its [access page](https://open-platform.theguardian.com/access/) identifies model training and sentiment analysis as commercial-tier use cases priced according to usage.
+- NewsAPI's [pricing page](https://newsapi.org/pricing) limits the free tier to development/testing, with 100 delayed requests per day, and says no plan provides full article content. Its [terms](https://newsapi.org/terms) preserve publisher rights and prohibit reproduction/republishing without separate authority.
+- Reuters describes current text delivery as a metered subscription and licensing service through [Reuters Connect](https://reutersagency.com/content-delivery-platforms/reuters-connect/). AP's [terms](https://www.ap.org/terms-and-conditions/) prohibit automated retrieval, copying, and archiving absent permission.
+- English Wikinews's official [copyright policy](https://en.wikinews.org/wiki/Wikinews:Copyright) licenses post-2024-12-16 text under CC BY 4.0, but also records that Wikinews became permanently read-only on 2026-05-04.
+- SEC's [website dissemination policy](https://www.sec.gov/about/privacy-information#website-dissemination) permits copying and further distribution of information on `sec.gov`; the same page limits automated access to at most 10 requests per second and excludes seals/logos. Use SEC-authored releases as the clean row. Although the SEC's [webmaster FAQ](https://www.sec.gov/about/webmaster-frequently-asked-questions) also says EDGAR public filing content is free to reuse, issuer-authored filing text belongs to the separate regulatory-filings source decision, not this news/social decision.
+- The Federal Reserve Board's [disclaimer](https://www.federalreserve.gov/disclaimer.htm) says its site information is public domain unless otherwise indicated, asks for citation, and excludes identified non-Board material. Its [RSS directory](https://www.federalreserve.gov/feeds/feeds.htm) provides current press-release and macro-policy feeds.
+- BLS says its publications are public domain except previously copyrighted photos/illustrations ([copyright information](https://www.bls.gov/opub/copyright-information.htm)) and provides current economic-release [RSS feeds](https://www.bls.gov/feed/).
+
+### Social platforms and historical corpora
+
+- Bluesky's protocol makes account repositories public and exportable ([AT Protocol repository specification](https://atproto.com/specs/repository)), but the [Bluesky terms](https://bsky.social/about/support/tos) say authors retain ownership and grant Bluesky only the license needed for Bluesky/AT Protocol operation. Public technical availability does not confer downstream training or redistribution rights.
+- Reddit's [Data API terms](https://redditinc.com/policies/data-api-terms) grant a revocable app-access/display license and explicitly require rightsholder permission for ML/AI training; commercial or out-of-limits research use requires a separate agreement.
+- Stocktwits says it is [not accepting new API registrations](https://api.stocktwits.com/developers). Its 2026-07-10 [terms](https://stocktwits.com/about/legal/terms/) prohibit automated extraction outside an approved API/written authorization and say users retain ownership of their posts.
+- X's [API documentation](https://docs.x.com/x-api/fundamentals/post-cap) says API v2 is pay-per-use. The [Developer Agreement](https://docs.x.com/developer-terms/agreement) also bars using X content to train or fine-tune a foundation/frontier model and restricts redistribution.
+- Stack Exchange's [API terms](https://stackoverflow.com/legal/api-terms-of-use) require source attribution; the API supports full post bodies through the `withbody` filter and a default 10,000-request daily keyed quota ([filters](https://api.stackexchange.com/docs/filters), [throttles](https://api.stackexchange.com/docs/throttle)). Subscriber content is CC BY-SA 4.0 under the [Public Network Terms](https://stackoverflow.com/legal/terms-of-service/public). The unresolved issue is not text access or redistribution; it is whether and how share-alike/attribution attaches to released model weights.
+- The FinLin owner repository applies CC BY-NC-SA 4.0 and describes the Stocktwits/news/company-report provenance ([FinLin](https://github.com/TDaudert/FinLin)). The official [FiQA challenge](https://sites.google.com/view/fiqa/home) permits train/test data only for non-commercial use. The [TweetFinSent owner repository](https://github.com/jpmcair/tweetfinsent) has no explicit data license.
+- FNSPID's owner repository contains a [CC BY-NC 4.0 license](https://github.com/Zdong104/FNSPID_Financial_News_Dataset/blob/main/LICENSE), while its [README](https://github.com/Zdong104/FNSPID_Financial_News_Dataset) simultaneously announces released commercial rights, prohibits commercial use, and documents third-party scraping. Treat the prose rights as unresolved.
+
+## Build gate and acquisition rule
+
+For every admitted fresh passage, the data manifest must name the actual text right—not just the access path—with `source_owner`, `retrieval_service`, `source_terms_url`, `content_license_or_permission`, `permitted_eval`, `permitted_training`, `permitted_weight_release`, `permitted_text_redistribution`, acquisition timestamp, immutable revision/ID, and deletion/withdrawal handling.
+
+The allowed acquisition rule is therefore:
+
+- GDELT/Common Crawl may find or transport a passage, but the **publisher/author row** decides its use.
+- A public-domain/CC allow-list may admit text automatically only when the page or source has a first-party reusable-text statement and the manifest captures it.
+- All other fresh news/social text remains out of training and out of the released corpus until written permission or a documented legal decision clears the exact uses.
+

@@ -221,6 +221,30 @@ RIGHTS_FIELDS = (
     "weight_release_permitted",
     "text_redistribution_permitted",
 )
+SOURCE_EVIDENCE_FIELDS = (
+    "checked_at",
+    "terms_url",
+    "reviewer",
+    "access_method",
+    "data_portfolio_lane",
+)
+RIGHTS_CLAUSE_FIELDS = (
+    "primary_source_term",
+    "quoted_clause",
+    "retrieved_on",
+    "reviewer",
+    "audited_object",
+)
+AUDITED_OBJECTS = ("passage-text", "data-files", "repository")
+# A license over the repository or the data files grants no passage-text right.
+PASSAGE_TEXT_RIGHTS = (
+    "training_permitted",
+    "weight_release_permitted",
+    "text_redistribution_permitted",
+)
+DATA_PORTFOLIO_LANES = ("clean-core", "restricted-auxiliary")
+CLEAN_CORE_LANE = "clean-core"
+SOURCE_EVIDENCE_FRESHNESS_DAYS = 90
 
 ROUTE_ELIGIBILITY_FIELDS = (
     "model_identity_verified",
@@ -400,6 +424,84 @@ def confirm_manifest(
         "semantic_sha256": semantic_manifest_sha256(confirmed),
     }
     return confirmed
+
+
+def _evidence_date(value: object) -> date | None:
+    """Give the calendar date of one evidence date or timestamp."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+        except ValueError:
+            return None
+
+
+def _is_fresh_evidence(value: object, *, starts_on: date, run_on: date) -> bool:
+    """Hold one evidence date inside the freshness window and out of the future."""
+    checked_on = _evidence_date(value)
+    if checked_on is None:
+        return False
+    return (
+        checked_on <= run_on
+        and (starts_on - checked_on).days <= SOURCE_EVIDENCE_FRESHNESS_DAYS
+    )
+
+
+def _source_evidence_sha256(evidence: object) -> str:
+    """Return the hash of one source eligibility evidence record."""
+    return hashlib.sha256(_canonical_json(evidence).encode("utf-8")).hexdigest()
+
+
+def _is_complete_rights_clause(clause: object, right: str) -> bool:
+    """Hold one rights clause to its quote, its date, and its audited object."""
+    if not isinstance(clause, Mapping) or not all(
+        isinstance(clause.get(field), str) and clause[field].strip()
+        for field in RIGHTS_CLAUSE_FIELDS
+    ):
+        return False
+    audited_object = clause.get("audited_object")
+    if audited_object not in AUDITED_OBJECTS:
+        return False
+    return not (right in PASSAGE_TEXT_RIGHTS and audited_object != "passage-text")
+
+
+def _source_evidence_stop_reason(
+    evidence: object, *, starts_on: date, run_on: date
+) -> str | None:
+    """Give the first stop reason of one source eligibility evidence record."""
+    if not isinstance(evidence, Mapping) or not all(
+        isinstance(evidence.get(field), str) and evidence[field].strip()
+        for field in SOURCE_EVIDENCE_FIELDS
+    ):
+        return "source-rights-evidence-incomplete"
+    clauses = evidence.get("rights_clauses")
+    if not isinstance(clauses, Mapping) or not all(
+        _is_complete_rights_clause(clauses.get(right), right)
+        for right in RIGHTS_FIELDS
+    ):
+        return "source-rights-evidence-incomplete"
+    if evidence.get("data_portfolio_lane") not in DATA_PORTFOLIO_LANES:
+        return "source-rights-evidence-incomplete"
+    dates = [evidence["checked_at"]] + [
+        cast(Mapping[str, object], clauses[right])["retrieved_on"]
+        for right in RIGHTS_FIELDS
+    ]
+    if not all(
+        _is_fresh_evidence(value, starts_on=starts_on, run_on=run_on)
+        for value in dates
+    ):
+        return "source-rights-evidence-stale"
+    if evidence["data_portfolio_lane"] != CLEAN_CORE_LANE:
+        return "source-lane-restricted"
+    return None
 
 
 def _prediction_file_stage(record: Mapping[str, object]) -> int:
@@ -3951,6 +4053,29 @@ class StageRun:
     def _stop(self, run_id: str, reason: str, stage: int) -> dict[str, object]:
         return self._decision(run_id, "no-build", reason, stage=stage)
 
+    def _eligibility_stop(
+        self,
+        run_id: str,
+        stage: int,
+        source_id: str,
+        reason: str,
+        evidence: object,
+    ) -> dict[str, object]:
+        """Name the source, the reason, and the evidence that failed."""
+        self._decision_log.append(
+            {
+                "event": "source-eligibility-stopped",
+                "run_id": run_id,
+                "stage": stage,
+                "source_id": source_id,
+                "stop_reason": reason,
+                "evidence_sha256": _source_evidence_sha256(evidence),
+            }
+        )
+        return self._decision(
+            run_id, "no-build", reason, stage=stage, record=False
+        )
+
     def evaluate(self, manifest: Mapping[str, object]) -> dict[str, object]:
         """Return the first staged stop or a complete build decision."""
         run_id = str(manifest.get("run_id", "unknown-run"))
@@ -3961,6 +4086,44 @@ class StageRun:
             or not run_id.strip()
         ):
             return self._stop(run_id, "invalid-manifest", 1)
+
+        # Source rights come first. No later gate can make an unprovable
+        # source eligible.
+        staged_form = isinstance(manifest.get("sources"), list)
+        sources = (
+            cast(list[object], manifest["sources"])
+            if staged_form
+            else [manifest.get("source")]
+        )
+        run_on = _evidence_date(self._clock()) or date.today()
+        source_records: list[Mapping[str, object]] = []
+        for item in sources:
+            if not isinstance(item, Mapping):
+                return self._stop(run_id, "source-rights-failed", stage)
+            item_evidence = item.get("evidence")
+            if not (
+                item.get("source_type") in STAGE_SOURCES[stage]
+                and bool(item.get("source_id"))
+                and all(item.get(field) is True for field in RIGHTS_FIELDS)
+            ):
+                return self._stop(run_id, "source-rights-failed", stage)
+            item_schedule = item.get("schedule") or manifest.get("schedule")
+            starts_on = (
+                _evidence_date(item_schedule.get("starts_on"))
+                if isinstance(item_schedule, Mapping)
+                else None
+            )
+            reason = _source_evidence_stop_reason(
+                item_evidence, starts_on=starts_on or run_on, run_on=run_on
+            )
+            if reason is not None:
+                return self._eligibility_stop(
+                    run_id, stage, str(item["source_id"]), reason, item_evidence
+                )
+            source_records.append(item)
+        source_types = [str(item["source_type"]) for item in source_records]
+        if sorted(source_types) != sorted(STAGE_SOURCES[stage]):
+            return self._stop(run_id, "stage-source-incomplete", stage)
 
         confirmation = manifest.get("confirmation")
         actual_hash = semantic_manifest_sha256(manifest)
@@ -4033,34 +4196,6 @@ class StageRun:
                     "confirmed_at": confirmation["confirmed_at"],
                 }
             )
-
-        # Each source of the stage passes its own access and rights gate.
-        staged_form = isinstance(manifest.get("sources"), list)
-        sources = (
-            cast(list[object], manifest["sources"])
-            if staged_form
-            else [manifest.get("source")]
-        )
-        source_records: list[Mapping[str, object]] = []
-        for item in sources:
-            if not isinstance(item, Mapping):
-                return self._stop(run_id, "source-rights-failed", stage)
-            item_evidence = item.get("evidence")
-            if not (
-                item.get("source_type") in STAGE_SOURCES[stage]
-                and bool(item.get("source_id"))
-                and all(item.get(field) is True for field in RIGHTS_FIELDS)
-                and isinstance(item_evidence, Mapping)
-                and all(
-                    bool(item_evidence.get(field))
-                    for field in ("checked_at", "terms_url", "reviewer")
-                )
-            ):
-                return self._stop(run_id, "source-rights-failed", stage)
-            source_records.append(item)
-        source_types = [str(item["source_type"]) for item in source_records]
-        if sorted(source_types) != sorted(STAGE_SOURCES[stage]):
-            return self._stop(run_id, "stage-source-incomplete", stage)
 
         # The data gate holds each source to its own fixed quota plan.
         for item in source_records:
@@ -4226,6 +4361,9 @@ class StageRun:
                     "source_id": item["source_id"],
                     "rights": {field: item[field] for field in RIGHTS_FIELDS},
                     "evidence": item["evidence"],
+                    "evidence_sha256": _source_evidence_sha256(
+                        cast(Mapping[str, object], item["evidence"])
+                    ),
                     "planned_commitments_usd": {
                         category: _usd(amount)
                         for category, amount in planned_by_source[

@@ -30,7 +30,7 @@ Each source record must contain:
 - `source_id` and `source_type`
 - `access_permitted`, `private_evaluation_permitted`, `training_permitted`,
   `weight_release_permitted`, and `text_redistribution_permitted`, each `true`
-- `evidence`, with `checked_at`, `terms_url`, and `reviewer`
+- the complete source `evidence` record that `docs/stage-1-run.md` defines
 - `data_plan`, with `silver_candidate_limit` 3,333, `training` 2,000,
   `development` 200, and `blind` 400
 - `route_requests`, with the request count of this source for each eligible route
@@ -39,7 +39,9 @@ Each source record must contain:
 
 The gate applies each check to each source separately:
 
-- The rights check stops with `source-rights-failed`.
+- The source and rights flags check stops with `source-rights-failed`.
+- The clause evidence check stops with `source-rights-evidence-incomplete`,
+  `source-rights-evidence-stale`, or `source-lane-restricted`.
 - The data check stops with `source-data-plan-invalid`.
 - The route and schedule check stops with `route-schedule-infeasible` or
   `invalid-route-demand`.

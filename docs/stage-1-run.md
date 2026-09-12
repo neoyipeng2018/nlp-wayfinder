@@ -40,6 +40,25 @@ planned cost in `budget.planned_commitments_usd`. A later stage gives a `sources
 array instead, and each record in that array holds its own data plan, route
 demand, schedule, and planned cost. `docs/stage-2-run.md` gives that form.
 
+Each source must contain one `evidence` record. The record must contain
+`checked_at`, `terms_url`, `reviewer`, `access_method`, and
+`data_portfolio_lane`. The lane must be `clean-core` or
+`restricted-auxiliary`. A restricted auxiliary source cannot supply training
+data.
+
+The evidence record must also contain `rights_clauses`. This object must contain
+one record for each of the five source rights. Each clause record must contain
+`primary_source_term`, `quoted_clause`, `retrieved_on`, `reviewer`, and
+`audited_object`. The audited object must be `passage-text`, `data-files`, or
+`repository`. A repository or data-files clause cannot permit training, weight
+release, or text redistribution. The check date and each retrieval date must not
+be later than the run date. They must be within 90 days of `starts_on`.
+
+Incomplete clause evidence returns `source-rights-evidence-incomplete`. Old or
+future evidence returns `source-rights-evidence-stale`. A restricted auxiliary
+lane returns `source-lane-restricted`. The decision log records the source, the
+reason, and the SHA-256 hash of the source evidence.
+
 Admit one target–aspect example before you send it to a person or a model:
 
 ```sh
