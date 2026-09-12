@@ -1,0 +1,80 @@
+{
+  "budget": {
+    "evidence": "No approved Stage 2 cost projection exists."
+  },
+  "route_panel": {
+    "inspection_complete": false,
+    "routes": []
+  },
+  "run_id": "stage-2-initial",
+  "schema_version": 1,
+  "sources": [
+    {
+      "access_permitted": false,
+      "data_plan": {
+        "blind": 400,
+        "development": 200,
+        "silver_candidate_limit": 3333,
+        "training": 2000
+      },
+      "evidence": {
+        "checked_at": "",
+        "reviewer": "",
+        "terms_url": ""
+      },
+      "planned_commitments_usd": {
+        "contingency": "0.00",
+        "data-and-storage": "0.00",
+        "gpt": "0.00",
+        "paid-silver-labels": "0.00",
+        "specialist": "0.00"
+      },
+      "private_evaluation_permitted": false,
+      "route_requests": {},
+      "schedule": {
+        "evidence": "No route schedule is approved.",
+        "must_finish_by": "",
+        "starts_on": ""
+      },
+      "source_id": "unapproved-company-announcements-source",
+      "source_type": "company-announcements",
+      "text_redistribution_permitted": false,
+      "training_permitted": false,
+      "weight_release_permitted": false
+    },
+    {
+      "access_permitted": false,
+      "data_plan": {
+        "blind": 400,
+        "development": 200,
+        "silver_candidate_limit": 3333,
+        "training": 2000
+      },
+      "evidence": {
+        "checked_at": "",
+        "reviewer": "",
+        "terms_url": ""
+      },
+      "planned_commitments_usd": {
+        "contingency": "0.00",
+        "data-and-storage": "0.00",
+        "gpt": "0.00",
+        "paid-silver-labels": "0.00",
+        "specialist": "0.00"
+      },
+      "private_evaluation_permitted": false,
+      "route_requests": {},
+      "schedule": {
+        "evidence": "No route schedule is approved.",
+        "must_finish_by": "",
+        "starts_on": ""
+      },
+      "source_id": "unapproved-regulatory-filings-source",
+      "source_type": "regulatory-filings",
+      "text_redistribution_permitted": false,
+      "training_permitted": false,
+      "weight_release_permitted": false
+    }
+  ],
+  "stage": 2
+}
