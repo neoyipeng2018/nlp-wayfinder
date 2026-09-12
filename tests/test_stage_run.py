@@ -26,6 +26,10 @@ from nlp_wayfinder.stage_run import (
     OmniRouteHttpTransport,
     RESULT_LABELS,
     STAGE_1_ASPECTS,
+    VOTE_CONFIDENCE_BANDS,
+    VOTE_FIELDS,
+    VOTE_MAX_OUTPUT_TOKENS,
+    VOTE_REASON_CODES,
     CostLimitError,
     OmniRouteResponse,
     StageRun,
@@ -47,6 +51,35 @@ ROUTE_IDS = (
     "cf/@cf/zai-org/glm-4.7-flash",
     "groq/qwen/qwen3.6-27b",
 )
+
+
+SILVER_PASSAGE = "Harbor Grid revenue increased by ten percent."
+
+
+def vote_content(
+    passage: str,
+    *,
+    label: str = "positive",
+    confidence_band: str = "high",
+    reason_code: str = "favorable evidence",
+    **changed: object,
+) -> str:
+    """Build one full auditable vote whose evidence is the complete passage."""
+    vote: dict[str, object] = {
+        "label": label,
+        "confidence_band": confidence_band,
+        "evidence_start": 0,
+        "evidence_end": len(passage),
+        "evidence_text": passage,
+        "reason_code": reason_code,
+    }
+    vote.update(changed)
+    return json.dumps(vote)
+
+
+def request_passage(request: Mapping[str, object]) -> str:
+    messages = cast(Sequence[Mapping[str, str]], request["messages"])
+    return str(json.loads(messages[1]["content"])["passage"])
 
 
 class WordTokenizer:
@@ -76,7 +109,7 @@ class FixedVoteTransport:
             "id": f"response-{len(self.requests)}",
             "model": model,
             "choices": [
-                {"message": {"content": '{"label":"positive"}'}}
+                {"message": {"content": vote_content(request_passage(request))}}
             ],
             "usage": {
                 "prompt_tokens": 91,
@@ -122,6 +155,22 @@ class SequenceVoteTransport(FixedVoteTransport):
                 raise self.first
             return self.first
         return super().complete(request, timeout_seconds)
+
+
+class ScriptedVoteTransport(FixedVoteTransport):
+    """Answer from a fixed script, then fall back to the valid response."""
+
+    def __init__(self, *scripted: OmniRouteResponse) -> None:
+        super().__init__()
+        self.scripted = list(scripted)
+
+    def complete(
+        self, request: Mapping[str, object], timeout_seconds: float
+    ) -> OmniRouteResponse:
+        if not self.scripted:
+            return super().complete(request, timeout_seconds)
+        self.requests.append((copy.deepcopy(dict(request)), timeout_seconds))
+        return self.scripted.pop(0)
 
 
 class MalformedVoteTransport(FixedVoteTransport):
@@ -1344,7 +1393,7 @@ class VoteCollectionTests(unittest.TestCase):
                 "company": company_record("Harbor Grid Ltd"),
                 "aspect": STAGE_1_ASPECTS[0],
                 "published_at": "2026-03-10T09:00:00Z",
-                "normalized_passage": "Harbor Grid revenue increased by ten percent.",
+                "normalized_passage": SILVER_PASSAGE,
                 "near_duplicate_reviewed": True,
             },
             {
@@ -1424,7 +1473,7 @@ class VoteCollectionTests(unittest.TestCase):
     def response(
         self,
         *,
-        content: str = '{"label":"positive"}',
+        content: str = vote_content(SILVER_PASSAGE),
         model: str = "mistral-medium-3-5",
         status_code: int = 200,
         refusal: str | None = None,
@@ -1544,6 +1593,38 @@ class VoteCollectionTests(unittest.TestCase):
         self.assertEqual(
             [0, 1] * 6, [record["retry_ordinal"] for record in repaired]
         )
+
+    def test_a_free_limit_repair_keeps_one_ordinal_for_each_attempt(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+
+        stopped = self.runner.collect_votes(
+            stage_manifest,
+            candidates,
+            allocation,
+            ScriptedVoteTransport(
+                self.response(content="positive"),
+                self.response(content="", status_code=429),
+            ),
+        )
+        again = self.runner.collect_votes(
+            stage_manifest, candidates, allocation, FixedVoteTransport()
+        )
+
+        self.assertEqual("free-limit-failure", stopped["stop_reason"])
+        self.assertEqual("complete", again["collection"])
+        repaired = [
+            record
+            for record in self.runner.raw_vote_records()
+            if record["candidate_id"] == "silver-1"
+            and record["requested_route_id"] == ROUTE_IDS[0]
+        ]
+        self.assertEqual([0, 1, 2], [record["retry_ordinal"] for record in repaired])
+        self.assertEqual(
+            ["malformed-answer", "free-limit", None],
+            [record["abstention_reason"] for record in repaired],
+        )
+        # The free-limit attempt spends no repair, so the vote still arrives.
+        self.assertEqual("valid", repaired[-1]["outcome"])
 
     def test_other_abstentions_earn_no_repair_attempt(self) -> None:
         cases: dict[str, OmniRouteResponse | BaseException] = {
@@ -1740,6 +1821,22 @@ class VoteCollectionTests(unittest.TestCase):
         freeze = self.runner.vote_collection_records()[0]
         self.assertEqual(sorted(ROUTE_IDS), freeze["route_ids"])
 
+    def test_a_changed_vote_schema_stops_collection(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+        self.runner.collect_votes(
+            stage_manifest, candidates, allocation, FixedVoteTransport()
+        )
+
+        with unittest.mock.patch(
+            "nlp_wayfinder.stage_run.VOTE_REASON_CODES",
+            (*VOTE_REASON_CODES, "other"),
+        ):
+            changed = self.runner.collect_votes(
+                stage_manifest, candidates, allocation, FixedVoteTransport()
+            )
+
+        self.assertEqual("frozen-vote-collection-changed", changed["stop_reason"])
+
     def test_transport_uses_the_dedicated_provider_endpoint(self) -> None:
         sent: dict[str, Any] = {}
 
@@ -1906,6 +2003,140 @@ class VoteCollectionTests(unittest.TestCase):
         self.assertEqual("paid-overflow", vote["abstention_reason"])
 
 
+    def test_the_vote_request_holds_the_full_auditable_vote_schema(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+        transport = FixedVoteTransport()
+
+        self.runner.collect_votes(
+            stage_manifest, candidates, allocation, transport
+        )
+
+        request, _ = transport.requests[0]
+        self.assertEqual(VOTE_MAX_OUTPUT_TOKENS, request["max_tokens"])
+        schema = cast(Mapping[str, Any], request["response_format"])["json_schema"]
+        self.assertTrue(schema["strict"])
+        body = schema["schema"]
+        self.assertEqual(set(VOTE_FIELDS), set(body["properties"]))
+        self.assertEqual(sorted(VOTE_FIELDS), sorted(body["required"]))
+        self.assertFalse(body["additionalProperties"])
+        self.assertEqual(
+            list(RESULT_LABELS), body["properties"]["label"]["enum"]
+        )
+        self.assertEqual(
+            list(VOTE_CONFIDENCE_BANDS),
+            body["properties"]["confidence_band"]["enum"],
+        )
+        self.assertEqual(
+            list(VOTE_REASON_CODES), body["properties"]["reason_code"]["enum"]
+        )
+
+    def test_the_raw_vote_keeps_the_band_the_evidence_and_the_reason_code(
+        self,
+    ) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs()
+
+        self.runner.collect_votes(
+            stage_manifest, candidates, allocation, FixedVoteTransport()
+        )
+
+        record = self.runner.raw_vote_records()[0]
+        self.assertEqual("valid", record["outcome"])
+        self.assertEqual("positive", record["label"])
+        self.assertEqual("high", record["confidence_band"])
+        self.assertEqual("favorable evidence", record["reason_code"])
+        self.assertEqual(0, record["evidence_start"])
+        self.assertEqual(len(SILVER_PASSAGE), record["evidence_end"])
+        self.assertEqual(SILVER_PASSAGE, record["evidence_text"])
+
+    def test_an_invalid_field_or_a_wrong_offset_is_an_abstention(self) -> None:
+        cases: dict[str, str] = {
+            "unknown-band": vote_content(SILVER_PASSAGE, confidence_band="certain"),
+            "unknown-reason-code": vote_content(
+                SILVER_PASSAGE, reason_code="it looks good"
+            ),
+            "unknown-label": vote_content(SILVER_PASSAGE, label="bullish"),
+            "missing-field": json.dumps(
+                {
+                    key: value
+                    for key, value in json.loads(
+                        vote_content(SILVER_PASSAGE)
+                    ).items()
+                    if key != "reason_code"
+                }
+            ),
+            "added-property": vote_content(SILVER_PASSAGE, comment="very clear"),
+            "shifted-offset": vote_content(SILVER_PASSAGE, evidence_start=1),
+            "offset-after-the-passage": vote_content(
+                SILVER_PASSAGE, evidence_end=len(SILVER_PASSAGE) + 5
+            ),
+            "text-that-is-not-in-the-passage": vote_content(
+                SILVER_PASSAGE, evidence_text="Harbor Grid revenue decreased."
+            ),
+            "empty-span": vote_content(SILVER_PASSAGE, evidence_end=0, evidence_text=""),
+            "text-without-offsets": vote_content(
+                SILVER_PASSAGE, evidence_start=None, evidence_end=None
+            ),
+        }
+        for name, content in cases.items():
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory() as state_dir:
+                    runner = StageRun(
+                        state_dir, clock=lambda: "2026-09-12T00:00:00Z"
+                    )
+                    stage_manifest, candidates, allocation = self.vote_inputs()
+
+                    runner.collect_votes(
+                        stage_manifest,
+                        candidates,
+                        allocation,
+                        SequenceVoteTransport(self.response(content=content)),
+                    )
+
+                    vote = runner.raw_vote_records()[0]
+                    self.assertEqual("abstention", vote["outcome"])
+                    self.assertEqual("malformed-answer", vote["abstention_reason"])
+                    self.assertIsNone(vote["label"])
+                    self.assertIsNone(vote["confidence_band"])
+                    self.assertIsNone(vote["reason_code"])
+                    self.assertIsNone(vote["evidence_text"])
+
+    def test_null_evidence_is_valid_only_for_insufficient_evidence(self) -> None:
+        cases = {
+            "insufficient evidence": "valid",
+            "neutral": "abstention",
+        }
+        for label, expected_outcome in cases.items():
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as state_dir:
+                    runner = StageRun(
+                        state_dir, clock=lambda: "2026-09-12T00:00:00Z"
+                    )
+                    stage_manifest, candidates, allocation = self.vote_inputs()
+                    content = vote_content(
+                        SILVER_PASSAGE,
+                        label=label,
+                        confidence_band="low",
+                        reason_code="evidence absent",
+                        evidence_start=None,
+                        evidence_end=None,
+                        evidence_text=None,
+                    )
+
+                    runner.collect_votes(
+                        stage_manifest,
+                        candidates,
+                        allocation,
+                        SequenceVoteTransport(self.response(content=content)),
+                    )
+
+                    vote = runner.raw_vote_records()[0]
+                    self.assertEqual(expected_outcome, vote["outcome"])
+                    if expected_outcome == "valid":
+                        self.assertEqual(label, vote["label"])
+                        self.assertEqual("evidence absent", vote["reason_code"])
+                        self.assertIsNone(vote["evidence_start"])
+
+
 class SilverAggregationTests(unittest.TestCase):
     """Aggregate the collected votes into calibrated accepted silver labels."""
 
@@ -1940,7 +2171,13 @@ class SilverAggregationTests(unittest.TestCase):
             "blind": [],
         }
 
-    def add_votes(self, candidate_id: str, labels: Mapping[str, str]) -> None:
+    def add_votes(
+        self,
+        candidate_id: str,
+        labels: Mapping[str, str],
+        *,
+        confidence_band: str = "high",
+    ) -> None:
         for route_id, label in labels.items():
             self.runner._raw_vote_log.append(
                 {
@@ -1949,10 +2186,14 @@ class SilverAggregationTests(unittest.TestCase):
                     "requested_route_id": route_id,
                     "outcome": "valid",
                     "label": label,
+                    "confidence_band": confidence_band,
+                    "reason_code": "favorable evidence",
                 }
             )
 
-    def add_development_votes(self, *, noisy_routes: int = 0) -> None:
+    def add_development_votes(
+        self, *, noisy_routes: int = 0, confidence_band: str = "high"
+    ) -> None:
         """Vote on every development example. The first routes can be unreliable."""
         for index, item in enumerate(self.development):
             gold = str(item["label"])
@@ -1967,6 +2208,7 @@ class SilverAggregationTests(unittest.TestCase):
                     else gold
                     for position, route_id in enumerate(ROUTE_IDS)
                 },
+                confidence_band=confidence_band,
             )
 
     def aggregate(self, training_ids: list[str]) -> dict[str, object]:
@@ -1990,6 +2232,27 @@ class SilverAggregationTests(unittest.TestCase):
             cast(float, accepted["probability"]), SILVER_MIN_PROBABILITY
         )
         self.assertEqual(64, len(cast(str, result["aggregation_sha256"])))
+
+    def test_the_confidence_band_is_not_an_aggregation_weight(self) -> None:
+        # A self-reported band is not calibrated, so it must not change the result.
+        results = []
+        for band in VOTE_CONFIDENCE_BANDS:
+            with tempfile.TemporaryDirectory() as state_dir:
+                self.runner = StageRun(
+                    Path(state_dir), clock=lambda: "2026-09-12T00:00:00Z"
+                )
+                self.add_development_votes(confidence_band=band)
+                self.add_votes(
+                    "silver-1",
+                    dict.fromkeys(ROUTE_IDS, "positive"),
+                    confidence_band=band,
+                )
+                results.append(self.aggregate(["silver-1"]))
+
+        self.assertEqual("complete", results[0]["aggregation"])
+        self.assertEqual(
+            1, len({str(result["aggregation_sha256"]) for result in results})
+        )
 
     def test_the_sealed_fit_keeps_one_four_by_four_matrix_for_each_voter(self) -> None:
         self.add_development_votes(noisy_routes=1)
