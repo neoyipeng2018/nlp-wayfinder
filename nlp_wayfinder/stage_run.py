@@ -14,13 +14,35 @@ from collections.abc import Callable, Mapping
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 
 EXPECTED_ROUTE_IDS = (
     "mistral/mistral-medium-3-5",
     "cf/@cf/zai-org/glm-4.7-flash",
     "groq/qwen/qwen3.6-27b",
+)
+
+MODERNBERT_MODEL_ID = "answerdotai/ModernBERT-base"
+MODERNBERT_REVISION = "8949b909ec900327062f0ebf497f51aef5e6f0c8"
+MAX_EXAMPLE_TOKENS = 1_024
+STAGE_1_ASPECTS = (
+    "financial performance",
+    "demand and commercial traction",
+    "operations, supply, and capacity",
+    "outlook and expectations",
+)
+RESULT_LABELS = (
+    "positive",
+    "neutral",
+    "negative",
+    "insufficient evidence",
+)
+EXAMPLE_CONSUMERS = (
+    "human",
+    "labeling-route",
+    "specialist",
+    "gpt",
 )
 
 BUDGET_LIMITS = {
@@ -56,6 +78,12 @@ class AuditLogError(ValueError):
 
 class CostLimitError(ValueError):
     """Raised before a cost record could exceed a fixed limit."""
+
+
+class Tokenizer(Protocol):
+    """The tokenizer operation that example admission needs."""
+
+    def __call__(self, text: str, **kwargs: object) -> Mapping[str, object]: ...
 
 
 def _now() -> str:
@@ -191,6 +219,155 @@ def _money(value: object) -> Decimal:
 
 def _usd(value: Decimal) -> str:
     return f"{value:.2f}"
+
+
+def _invalid_example(reason: str) -> dict[str, object]:
+    return {
+        "admission": "rejected",
+        "schema_result": "Invalid",
+        "stop_reason": reason,
+        "allowed_result_labels": list(RESULT_LABELS),
+    }
+
+
+def _is_complete_sentence(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    while stripped and stripped[-1] in {'"', "'", "”", "’"}:
+        stripped = stripped[:-1].rstrip()
+    return bool(stripped) and stripped[-1] in ".!?"
+
+
+def _token_count(tokenizer: Tokenizer, text: str) -> int:
+    encoded = tokenizer(
+        text,
+        add_special_tokens=True,
+        truncation=False,
+        return_attention_mask=False,
+        return_token_type_ids=False,
+    )
+    input_ids = encoded.get("input_ids")
+    if (
+        not isinstance(input_ids, list)
+        or not input_ids
+        or isinstance(input_ids[0], list)
+    ):
+        raise ValueError("The tokenizer did not return one token sequence.")
+    return len(input_ids)
+
+
+def serialize_example(passage: str, company: str, aspect: str) -> str:
+    """Serialize the one shared input for all people and systems."""
+    return (
+        f"Passage:\n{passage}\n\n"
+        f"Company:\n{company}\n\n"
+        f"Aspect:\n{aspect}"
+    )
+
+
+def admit_example(
+    example: Mapping[str, object],
+    tokenizer: Tokenizer,
+) -> dict[str, object]:
+    """Validate and serialize one Stage 1 target–aspect example."""
+    company = example.get("company")
+    if not isinstance(company, Mapping):
+        return _invalid_example("invalid-company")
+    if (
+        not isinstance(company.get("name"), str)
+        or not company["name"].strip()
+        or not isinstance(company.get("ticker"), str)
+        or not company["ticker"].strip()
+        or not isinstance(company.get("exchange"), str)
+        or not company["exchange"].strip()
+        or company.get("publicly_traded") is not True
+    ):
+        return _invalid_example("invalid-company")
+
+    aspect = example.get("aspect")
+    if aspect not in STAGE_1_ASPECTS:
+        return _invalid_example("invalid-aspect")
+
+    label = example.get("label")
+    if label is not None and label not in RESULT_LABELS:
+        return _invalid_example("invalid-label")
+
+    sentences = example.get("sentences")
+    if not isinstance(sentences, list) or not sentences:
+        return _invalid_example("invalid-sentence-span")
+    positions: list[int] = []
+    texts: list[str] = []
+    for sentence in sentences:
+        if not isinstance(sentence, Mapping):
+            return _invalid_example("invalid-sentence-span")
+        position = sentence.get("position")
+        text = sentence.get("text")
+        if (
+            not isinstance(position, int)
+            or isinstance(position, bool)
+            or position < 0
+            or not isinstance(text, str)
+            or not _is_complete_sentence(text)
+        ):
+            return _invalid_example("invalid-sentence-span")
+        positions.append(position)
+        texts.append(text.strip())
+    if positions != list(range(positions[0], positions[0] + len(positions))):
+        return _invalid_example("nonconsecutive-sentences")
+
+    included_positions = set(positions)
+    for key, reason in (
+        ("target_evidence_positions", "target-evidence-missing"),
+        ("required_evidence_positions", "required-evidence-missing"),
+    ):
+        evidence_positions = example.get(key)
+        if (
+            not isinstance(evidence_positions, list)
+            or not evidence_positions
+            or any(
+                not isinstance(position, int)
+                or isinstance(position, bool)
+                or position not in included_positions
+                for position in evidence_positions
+            )
+        ):
+            return _invalid_example(reason)
+
+    passage = " ".join(texts)
+    serialized = serialize_example(passage, str(company["name"]).strip(), str(aspect))
+    token_count = _token_count(tokenizer, serialized)
+    if token_count > MAX_EXAMPLE_TOKENS:
+        return _invalid_example("evidence-does-not-fit")
+
+    return {
+        "admission": "accepted",
+        "schema_result": None,
+        "stop_reason": None,
+        "allowed_result_labels": list(RESULT_LABELS),
+        "label": label,
+        "serialized_input": serialized,
+        "serialized_input_sha256": hashlib.sha256(
+            serialized.encode("utf-8")
+        ).hexdigest(),
+        "token_count": token_count,
+        "token_limit": MAX_EXAMPLE_TOKENS,
+        "consumers": list(EXAMPLE_CONSUMERS),
+    }
+
+
+def load_modernbert_tokenizer() -> Tokenizer:
+    """Load the only tokenizer that can admit experiment examples."""
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as error:
+        raise RuntimeError(
+            "Install transformers to use the example admission command."
+        ) from error
+    return AutoTokenizer.from_pretrained(
+        MODERNBERT_MODEL_ID,
+        revision=MODERNBERT_REVISION,
+    )
 
 
 class StageRun:
@@ -616,8 +793,19 @@ def main(argv: list[str] | None = None) -> int:
     cost.add_argument("--amount-usd", required=True)
     cost.add_argument("--evidence", required=True)
 
+    admit = commands.add_parser(
+        "admit-example", help="Validate one Stage 1 target-aspect example."
+    )
+    admit.add_argument("example")
+
     args = parser.parse_args(argv)
     try:
+        if args.command == "admit-example":
+            result = admit_example(
+                _read_manifest(args.example), load_modernbert_tokenizer()
+            )
+            _write_json(result)
+            return 0 if result["admission"] == "accepted" else 2
         if args.command == "confirm":
             confirmed = confirm_manifest(_read_manifest(args.manifest), args.confirmed_by)
             output_path = Path(args.output)
@@ -643,7 +831,7 @@ def main(argv: list[str] | None = None) -> int:
         decision = runner.evaluate(_read_manifest(args.manifest))
         _write_json(decision)
         return 0 if decision["decision"] == "build-eligible" else 2
-    except (AuditLogError, CostLimitError, OSError, ValueError) as error:
+    except (AuditLogError, CostLimitError, OSError, RuntimeError, ValueError) as error:
         _write_json({"error": type(error).__name__, "message": str(error)})
         return 2
 

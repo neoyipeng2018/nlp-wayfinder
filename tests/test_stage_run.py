@@ -12,7 +12,14 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
-from nlp_wayfinder.stage_run import CostLimitError, StageRun, confirm_manifest
+from nlp_wayfinder.stage_run import (
+    MAX_EXAMPLE_TOKENS,
+    RESULT_LABELS,
+    CostLimitError,
+    StageRun,
+    admit_example,
+    confirm_manifest,
+)
 
 
 ROUTE_IDS = (
@@ -20,6 +27,43 @@ ROUTE_IDS = (
     "cf/@cf/zai-org/glm-4.7-flash",
     "groq/qwen/qwen3.6-27b",
 )
+
+
+class WordTokenizer:
+    """Count whitespace tokens and the two outer special tokens."""
+
+    def __call__(self, text: str, **kwargs: object) -> dict[str, object]:
+        self.last_text = text
+        self.last_options = kwargs
+        return {"input_ids": [101, *range(len(text.split())), 102]}
+
+
+def example(
+    passage: str,
+    *,
+    company: str = "Harbor Grid Ltd",
+    aspect: str = "operations, supply, and capacity",
+    label: str | None = "neutral",
+) -> dict[str, object]:
+    sentences = [
+        {"position": index, "text": sentence.strip() + "."}
+        for index, sentence in enumerate(passage.rstrip(".").split(". "), start=20)
+    ]
+    value: dict[str, object] = {
+        "company": {
+            "name": company,
+            "ticker": "HGL",
+            "exchange": "LSE",
+            "publicly_traded": True,
+        },
+        "aspect": aspect,
+        "sentences": sentences,
+        "target_evidence_positions": [20],
+        "required_evidence_positions": [item["position"] for item in sentences],
+    }
+    if label is not None:
+        value["label"] = label
+    return value
 
 
 def route(route_id: str) -> dict[str, object]:
@@ -288,6 +332,126 @@ class StageRunTests(unittest.TestCase):
         output = json.loads(result.stdout)
         self.assertEqual("no-build", output["decision"])
         self.assertEqual("source-rights-failed", output["stop_reason"])
+
+
+class ExampleAdmissionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tokenizer = WordTokenizer()
+
+    def test_admits_one_shared_evidence_preserving_input(self) -> None:
+        candidate = example(
+            "Harbor Grid said the planned two-week maintenance shutdown is not "
+            "expected to have a material effect on full-year output"
+        )
+
+        result = admit_example(candidate, self.tokenizer)
+
+        self.assertEqual("accepted", result["admission"])
+        self.assertIsNone(result["schema_result"])
+        self.assertEqual("neutral", result["label"])
+        self.assertEqual(list(RESULT_LABELS), result["allowed_result_labels"])
+        self.assertEqual(
+            ["human", "labeling-route", "specialist", "gpt"],
+            result["consumers"],
+        )
+        self.assertEqual(result["serialized_input"], self.tokenizer.last_text)
+        self.assertEqual(MAX_EXAMPLE_TOKENS, result["token_limit"])
+        self.assertTrue(self.tokenizer.last_options["add_special_tokens"])
+        self.assertFalse(self.tokenizer.last_options["truncation"])
+
+    def test_rejects_a_target_that_is_not_a_publicly_traded_company(self) -> None:
+        candidate = example("Consumer prices rose during the quarter")
+        candidate["company"]["publicly_traded"] = False  # type: ignore[index]
+
+        result = admit_example(candidate, self.tokenizer)
+
+        self.assertEqual("Invalid", result["schema_result"])
+        self.assertEqual("invalid-company", result["stop_reason"])
+
+    def test_rejects_an_aspect_outside_the_stage_1_set(self) -> None:
+        candidate = example(
+            "Harbor Grid made a new investment",
+            aspect="capital allocation",
+        )
+
+        result = admit_example(candidate, self.tokenizer)
+
+        self.assertEqual("Invalid", result["schema_result"])
+        self.assertEqual("invalid-aspect", result["stop_reason"])
+
+    def test_invalid_is_not_a_result_label(self) -> None:
+        candidate = example("Harbor Grid output was stable", label="Invalid")
+
+        result = admit_example(candidate, self.tokenizer)
+
+        self.assertEqual("Invalid", result["schema_result"])
+        self.assertEqual("invalid-label", result["stop_reason"])
+        self.assertNotIn("Invalid", result["allowed_result_labels"])
+
+    def test_rejects_nonconsecutive_or_incomplete_sentences(self) -> None:
+        candidate = example("Harbor Grid output rose. Demand remained stable")
+        candidate["sentences"][1]["position"] = 22  # type: ignore[index]
+        nonconsecutive = admit_example(candidate, self.tokenizer)
+        candidate["sentences"][1]["position"] = 21  # type: ignore[index]
+        candidate["sentences"][1]["text"] = "Demand remained stable"  # type: ignore[index]
+        incomplete = admit_example(candidate, self.tokenizer)
+
+        self.assertEqual("nonconsecutive-sentences", nonconsecutive["stop_reason"])
+        self.assertEqual("invalid-sentence-span", incomplete["stop_reason"])
+
+    def test_rejects_missing_target_or_required_evidence(self) -> None:
+        candidate = example("Harbor Grid output rose")
+        candidate["target_evidence_positions"] = []
+        missing_target = admit_example(candidate, self.tokenizer)
+        candidate["target_evidence_positions"] = [20]
+        candidate["required_evidence_positions"] = [21]
+        missing_required = admit_example(candidate, self.tokenizer)
+
+        self.assertEqual("target-evidence-missing", missing_target["stop_reason"])
+        self.assertEqual("required-evidence-missing", missing_required["stop_reason"])
+
+    def test_counts_the_complete_serialized_input_at_the_token_boundary(self) -> None:
+        candidate = example("Harbor Grid output was stable")
+        base_result = admit_example(candidate, self.tokenizer)
+        base_count = cast(int, base_result["token_count"])
+        added = MAX_EXAMPLE_TOKENS - base_count
+        candidate["sentences"][0]["text"] = (  # type: ignore[index]
+            "Harbor Grid output was stable " + " ".join(["context"] * added) + "."
+        )
+
+        at_limit = admit_example(candidate, self.tokenizer)
+        candidate["sentences"][0]["text"] = (  # type: ignore[index]
+            str(candidate["sentences"][0]["text"])[:-1] + " context."
+        )
+        above_limit = admit_example(candidate, self.tokenizer)
+
+        self.assertEqual(MAX_EXAMPLE_TOKENS, at_limit["token_count"])
+        self.assertEqual("accepted", at_limit["admission"])
+        self.assertEqual("evidence-does-not-fit", above_limit["stop_reason"])
+
+    def test_frozen_manual_aspect_and_evidence_cases_are_valid(self) -> None:
+        cases = (
+            example(
+                "Northstar Foods said quarterly revenue rose 8%. Its operating "
+                "margin fell by two percentage points because input costs increased. "
+                "The report gave no overall profit figure or assessment",
+                company="Northstar Foods plc",
+                aspect="financial performance",
+                label="insufficient evidence",
+            ),
+            example(
+                "The chief executive said bookings remain robust. An analyst then "
+                "said channel checks showed more customer cancellations. Management "
+                "did not answer the cancellation point",
+                company="Cedar Cloud Inc",
+                aspect="demand and commercial traction",
+                label="insufficient evidence",
+            ),
+        )
+
+        results = [admit_example(case, self.tokenizer) for case in cases]
+
+        self.assertEqual(["accepted", "accepted"], [r["admission"] for r in results])
 
 
 if __name__ == "__main__":

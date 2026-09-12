@@ -34,6 +34,46 @@ python3 -m nlp_wayfinder.stage_run check confirmed.json \
 A valid result is `build-eligible`. This result does not start work. Get separate
 approval before you use an external service.
 
+Admit one target–aspect example before you send it to a person or a model:
+
+```sh
+python3 -m nlp_wayfinder.stage_run admit-example example.json
+```
+
+The example file must contain one verified public company, one Stage 1 aspect,
+and a consecutive list of complete sentences. It must identify the sentence
+positions that contain the target and the required evidence. An optional label
+must be `positive`, `neutral`, `negative`, or `insufficient evidence`.
+
+Use this JSON structure:
+
+```json
+{
+  "company": {
+    "name": "Harbor Grid Ltd",
+    "ticker": "HGL",
+    "exchange": "LSE",
+    "publicly_traded": true
+  },
+  "aspect": "operations, supply, and capacity",
+  "sentences": [
+    {
+      "position": 20,
+      "text": "Harbor Grid said the shutdown will have no material effect on output."
+    }
+  ],
+  "target_evidence_positions": [20],
+  "required_evidence_positions": [20],
+  "label": "neutral"
+}
+```
+
+The command uses the pinned ModernBERT tokenizer. It returns one serialized input
+for the human, each labeling route, the specialist, and GPT. It counts the complete
+serialized input, field separators, and model special tokens. It does not truncate
+the input. It returns the schema result `Invalid` and a stop reason when the input
+does not pass a check or has more than 1,024 tokens.
+
 Record a cost commitment before the related action. Record the actual cost after
 the action:
 
