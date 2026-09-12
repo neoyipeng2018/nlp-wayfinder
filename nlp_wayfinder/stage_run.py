@@ -46,6 +46,26 @@ RESULT_LABELS = (
     "negative",
     "insufficient evidence",
 )
+VOTE_CONFIDENCE_BANDS = ("high", "medium", "low")
+VOTE_REASON_CODES = (
+    "favorable evidence",
+    "unfavorable evidence",
+    "stated stability or no material effect",
+    "evidence absent",
+    "evidence about another aspect",
+    "evidence about another target",
+    "conflicting without resolution",
+)
+VOTE_FIELDS = (
+    "label",
+    "confidence_band",
+    "evidence_start",
+    "evidence_end",
+    "evidence_text",
+    "reason_code",
+)
+# The evidence span makes the answer longer than one label.
+VOTE_MAX_OUTPUT_TOKENS = 300
 EXAMPLE_CONSUMERS = (
     "human",
     "labeling-route",
@@ -285,8 +305,17 @@ class OmniRouteHttpTransport:
 LABELING_SYSTEM_PROMPT = (
     "Classify the supplied company and aspect from only the supplied financial "
     "passage. Use one label: positive, neutral, negative, or insufficient "
-    "evidence. Return only a JSON object with one label field. Do not add an "
-    "explanation."
+    "evidence. Return only a JSON object with these fields: "
+    + ", ".join(VOTE_FIELDS)
+    + ". Set confidence_band to one of: "
+    + ", ".join(VOTE_CONFIDENCE_BANDS)
+    + ". Set reason_code to one of: "
+    + ", ".join(VOTE_REASON_CODES)
+    + ". Copy evidence_text exactly from the passage. Set evidence_start and "
+    "evidence_end to the character offsets of that text, so that evidence_text "
+    "is the same as passage[evidence_start:evidence_end]. Set evidence_start, "
+    "evidence_end, and evidence_text to null only for the insufficient "
+    "evidence label. Do not add an explanation."
 )
 
 
@@ -1282,7 +1311,7 @@ def _vote_request(
         "messages": _vote_prompt(candidate),
         "stream": False,
         "temperature": 0,
-        "max_tokens": 20,
+        "max_tokens": VOTE_MAX_OUTPUT_TOKENS,
         "response_format": {
             "type": "json_schema",
             "json_schema": {
@@ -1290,8 +1319,15 @@ def _vote_request(
                 "strict": True,
                 "schema": {
                     "type": "object",
-                    "properties": {"label": {"enum": list(RESULT_LABELS)}},
-                    "required": ["label"],
+                    "properties": {
+                        "label": {"enum": list(RESULT_LABELS)},
+                        "confidence_band": {"enum": list(VOTE_CONFIDENCE_BANDS)},
+                        "evidence_start": {"type": ["integer", "null"]},
+                        "evidence_end": {"type": ["integer", "null"]},
+                        "evidence_text": {"type": ["string", "null"]},
+                        "reason_code": {"enum": list(VOTE_REASON_CODES)},
+                    },
+                    "required": list(VOTE_FIELDS),
                     "additionalProperties": False,
                 },
             },
@@ -1685,7 +1721,8 @@ def _response_message(response: OmniRouteResponse) -> Mapping[str, object] | Non
     return message if isinstance(message, Mapping) else None
 
 
-def _response_label(response: OmniRouteResponse) -> str | None:
+def _response_answer(response: OmniRouteResponse) -> dict[str, Any] | None:
+    """Return the JSON object of one answer, or None for anything else."""
     message = _response_message(response)
     if message is None or message.get("refusal"):
         return None
@@ -1696,13 +1733,58 @@ def _response_label(response: OmniRouteResponse) -> str | None:
         value = json.loads(content)
     except json.JSONDecodeError:
         return None
+    return value if isinstance(value, dict) else None
+
+
+def _response_label(response: OmniRouteResponse) -> str | None:
+    value = _response_answer(response)
     if (
-        not isinstance(value, dict)
+        value is None
         or set(value) != {"label"}
         or value.get("label") not in RESULT_LABELS
     ):
         return None
     return str(value["label"])
+
+
+def _response_vote(
+    response: OmniRouteResponse, candidate: Mapping[str, object]
+) -> dict[str, Any] | None:
+    """Return the full validated vote, or None for a malformed answer.
+
+    The evidence must be an exact substring of this item's normalized passage
+    at the offsets that the answer gives. An answer that fails any check is
+    malformed, and the caller makes it an abstention.
+    """
+    vote = _response_answer(response)
+    if vote is None or set(vote) != set(VOTE_FIELDS):
+        return None
+    if (
+        vote["label"] not in RESULT_LABELS
+        or vote["confidence_band"] not in VOTE_CONFIDENCE_BANDS
+        or vote["reason_code"] not in VOTE_REASON_CODES
+    ):
+        return None
+    start, end, text = (
+        vote["evidence_start"],
+        vote["evidence_end"],
+        vote["evidence_text"],
+    )
+    if start is None and end is None and text is None:
+        # Only insufficient evidence can answer without a passage span.
+        return vote if vote["label"] == "insufficient evidence" else None
+    passage = str(candidate["normalized_passage"])
+    if (
+        isinstance(start, bool)
+        or isinstance(end, bool)
+        or not isinstance(start, int)
+        or not isinstance(end, int)
+        or not isinstance(text, str)
+        or not 0 <= start < end <= len(passage)
+        or passage[start:end] != text
+    ):
+        return None
+    return vote
 
 
 def _response_is_refusal(response: OmniRouteResponse) -> bool:
@@ -2087,7 +2169,8 @@ class StageRun:
                     if returned_provider and returned_model
                     else None
                 )
-                label = _response_label(response)
+                vote = _response_vote(response, candidate)
+                label = None if vote is None else str(vote["label"])
                 fallback_attempts = _int_header(
                     headers, "x-omniroute-fallback-attempts"
                 )
@@ -2129,6 +2212,8 @@ class StageRun:
                         "paid-overflow",
                         None,
                     )
+                if outcome != "valid":
+                    vote = None
                 usage = response.body.get("usage")
                 if not isinstance(usage, Mapping):
                     usage = {}
@@ -2155,6 +2240,13 @@ class StageRun:
                     "outcome": outcome,
                     "abstention_reason": abstention_reason,
                     "label": label,
+                    # The band is provenance. Aggregation does not use it as
+                    # a weight.
+                    "confidence_band": None if vote is None else vote["confidence_band"],
+                    "evidence_start": None if vote is None else vote["evidence_start"],
+                    "evidence_end": None if vote is None else vote["evidence_end"],
+                    "evidence_text": None if vote is None else vote["evidence_text"],
+                    "reason_code": None if vote is None else vote["reason_code"],
                     "token_use": {
                         "prompt_tokens": usage.get("prompt_tokens"),
                         "completion_tokens": usage.get("completion_tokens"),

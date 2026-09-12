@@ -171,13 +171,45 @@ to the dedicated provider endpoint with the fully qualified model, no cache, and
 no memory. There is no automatic routing, no Fusion, no fallback, and no bare
 alias.
 
+Each vote uses the full auditable vote schema. The strict JSON schema holds
+`label`, `confidence_band`, `evidence_start`, `evidence_end`, `evidence_text`,
+and `reason_code`. It permits no added property. The band is `high`, `medium`,
+or `low`. The output-token cap is 300 tokens.
+
+The reason code is one of these values:
+
+- `favorable evidence`
+- `unfavorable evidence`
+- `stated stability or no material effect`
+- `evidence absent`
+- `evidence about another aspect`
+- `evidence about another target`
+- `conflicting without resolution`
+
 The operation writes one append-only record for each attempt in
 `raw-votes.jsonl`. The record contains the prompt, the request and response
-hashes, the returned route and model identity, the token use, the times, and the
-cost metadata.
+hashes, the returned route and model identity, the label, the confidence band,
+the evidence offsets and text, the reason code, the token use, the times, and
+the cost metadata.
+
+The operation validates each answer against the item that it requested. The
+item identity is the passage itself: the collector accepts the evidence only
+when it is in the normalized passage of the requested item, which rejects an
+answer about a different item. The
+label, the band, and the reason code must be members of their lists. The
+evidence text must be the exact substring of that item's normalized passage
+between `evidence_start` and `evidence_end`. The span must hold one character
+or more, and it must stay inside the passage. The three evidence fields are null
+only for the `insufficient evidence` label. An answer that fails any of these
+checks is a malformed answer.
 
 A refusal, a malformed answer, a timeout, a route substitution, or a cache hit is
-an abstention. An abstention has no label. It is not `insufficient evidence`.
+an abstention. An abstention has no label, no band, no evidence, and no reason
+code. It is not `insufficient evidence`.
+
+The self-reported band is not a probability. It stays in the record as
+provenance. Aggregation does not use it as a weight until human development
+labels calibrate it.
 
 A free-limit failure or a paid response stops collection. The command returns
 exit code `2` with stop reason `free-limit-failure` or `paid-overflow-detected`.
