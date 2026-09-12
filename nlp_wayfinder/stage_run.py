@@ -119,6 +119,51 @@ GPT_FORECAST_FIELDS = (
 )
 BLIND_LABEL_FIELDS = ("label", "reference_label", "silver_label", "labeled_at")
 
+SPECIALIST_SEEDS = (1, 2, 3)
+SPECIALIST_OPERATIONAL_REPEATS = 1
+SPECIALIST_PILOT_LIMIT_USD = Decimal("5.00")
+SPECIALIST_COMPATIBILITY_TOKENS = 512
+SPECIALIST_MINIMUM_DEVICE_MEMORY_GB = 8
+SPECIALIST_GPU_ARCHITECTURES = (
+    "ampere",
+    "ada lovelace",
+    "hopper",
+    "blackwell",
+)
+SPECIALIST_M3_FIELDS = (
+    "device_id",
+    "unified_memory_gb",
+    "max_sequence_tokens",
+    "compatibility_verified",
+    "local_inference_verified",
+    "evidence",
+)
+SPECIALIST_PILOT_FIELDS = (
+    "gpu_model",
+    "gpu_architecture",
+    "gpu_memory_gb",
+    "peak_memory_gb",
+    "max_sequence_tokens",
+    "pilot_usd",
+    "initial_loss",
+    "final_loss",
+    "examples_per_second",
+    "training_examples_per_seed",
+    "hourly_usd",
+    "storage_gb",
+    "storage_usd_per_gb_month",
+    "storage_months",
+    "tax_rate",
+)
+SPECIALIST_TRAIN_RESULT_FIELDS = (
+    "checkpoint_id",
+    "model_id",
+    "revision",
+    "max_sequence_tokens",
+    "head_labels",
+    "development_predictions",
+)
+
 RIGHTS_FIELDS = (
     "access_permitted",
     "private_evaluation_permitted",
@@ -167,6 +212,16 @@ class VoteTransport(Protocol):
     def complete(
         self, request: Mapping[str, object], timeout_seconds: float
     ) -> OmniRouteResponse: ...
+
+
+class TrainingBackend(Protocol):
+    """Train one specialist checkpoint and predict on the local device."""
+
+    def train(self, config: Mapping[str, object]) -> Mapping[str, object]: ...
+
+    def predict(
+        self, checkpoint_id: str, examples: Sequence[Mapping[str, object]]
+    ) -> Mapping[str, object]: ...
 
 
 class OmniRouteHttpTransport:
@@ -1374,6 +1429,164 @@ def project_gpt_blind_cost(
     return result
 
 
+def check_m3_compatibility(check: Mapping[str, object]) -> str | None:
+    """Return one stop reason for the 8 GB M3 device check, or None."""
+    if any(field not in check for field in SPECIALIST_M3_FIELDS):
+        return "m3-check-incomplete"
+    if not str(check["device_id"]).strip() or not str(check["evidence"]).strip():
+        return "m3-check-incomplete"
+    try:
+        memory = float(cast(float, check["unified_memory_gb"]))
+        tokens = int(cast(int, check["max_sequence_tokens"]))
+    except (TypeError, ValueError):
+        return "m3-check-incomplete"
+    if (
+        memory < SPECIALIST_MINIMUM_DEVICE_MEMORY_GB
+        or tokens != SPECIALIST_COMPATIBILITY_TOKENS
+        or check["compatibility_verified"] is not True
+        or check["local_inference_verified"] is not True
+    ):
+        return "m3-check-failed"
+    return None
+
+
+def project_specialist_training_cost(
+    pilot: Mapping[str, object],
+    *,
+    remaining_usd: Decimal = BUDGET_LIMITS["specialist"],
+) -> dict[str, object]:
+    """Project three-seed training and one repeat from measured pilot evidence."""
+    runs = len(SPECIALIST_SEEDS) + SPECIALIST_OPERATIONAL_REPEATS
+
+    def stop(reason: str, projected: str | None = None) -> dict[str, object]:
+        return {
+            "forecast": "stopped",
+            "stop_reason": reason,
+            "seeds": list(SPECIALIST_SEEDS),
+            "operational_repeats": SPECIALIST_OPERATIONAL_REPEATS,
+            "training_runs": runs,
+            "projected_usd": projected,
+            "pilot_usd": None,
+            "remaining_usd": _usd(remaining_usd),
+        }
+
+    if any(field not in pilot for field in SPECIALIST_PILOT_FIELDS):
+        return stop("specialist-pilot-incomplete")
+    try:
+        pilot_usd = _money(pilot["pilot_usd"])
+        hourly_usd = _decimal_rate(pilot["hourly_usd"])
+        storage_gb = _decimal_rate(pilot["storage_gb"])
+        storage_rate = _decimal_rate(pilot["storage_usd_per_gb_month"])
+        storage_months = _decimal_rate(pilot["storage_months"])
+        tax_rate = _decimal_rate(pilot["tax_rate"])
+        gpu_memory_gb = float(cast(float, pilot["gpu_memory_gb"]))
+        peak_memory_gb = float(cast(float, pilot["peak_memory_gb"]))
+        initial_loss = float(cast(float, pilot["initial_loss"]))
+        final_loss = float(cast(float, pilot["final_loss"]))
+        examples_per_second = float(cast(float, pilot["examples_per_second"]))
+        examples = int(cast(int, pilot["training_examples_per_seed"]))
+        tokens = int(cast(int, pilot["max_sequence_tokens"]))
+    except (InvalidOperation, TypeError, ValueError):
+        return stop("specialist-pilot-incomplete")
+    if (
+        examples_per_second <= 0
+        or examples <= 0
+        or gpu_memory_gb <= 0
+        or peak_memory_gb <= 0
+        or storage_gb <= 0
+        or storage_months <= 0
+        or not str(pilot["gpu_model"]).strip()
+    ):
+        return stop("specialist-pilot-incomplete")
+    if str(pilot["gpu_architecture"]).strip().lower() not in SPECIALIST_GPU_ARCHITECTURES:
+        return stop("specialist-pilot-architecture")
+    if tokens != MAX_EXAMPLE_TOKENS:
+        return stop("specialist-pilot-token-limit")
+    if peak_memory_gb > gpu_memory_gb:
+        return stop("specialist-pilot-memory")
+    if not final_loss < initial_loss:
+        return stop("specialist-pilot-loss")
+    if pilot_usd > SPECIALIST_PILOT_LIMIT_USD:
+        return stop("specialist-pilot-cost-exceeded")
+
+    hours_per_run = Decimal(str(examples / examples_per_second)) / 3600
+    compute_usd = hourly_usd * hours_per_run * runs
+    storage_usd = storage_gb * storage_rate * storage_months
+    projected = ((compute_usd + storage_usd) * (1 + tax_rate)).quantize(
+        Decimal("0.01"), rounding=ROUND_CEILING
+    )
+    if projected > remaining_usd:
+        return {
+            **stop("specialist-budget-exceeded", _usd(projected)),
+            "pilot_usd": _usd(pilot_usd),
+        }
+    return {
+        "forecast": "within-budget",
+        "stop_reason": None,
+        "seeds": list(SPECIALIST_SEEDS),
+        "operational_repeats": SPECIALIST_OPERATIONAL_REPEATS,
+        "training_runs": runs,
+        "projected_usd": _usd(projected),
+        "pilot_usd": _usd(pilot_usd),
+        "remaining_usd": _usd(remaining_usd),
+        "hours_per_run": float(hours_per_run),
+        "gpu_model": pilot["gpu_model"],
+        "peak_memory_gb": peak_memory_gb,
+        "final_loss": final_loss,
+    }
+
+
+def _macro_f1(
+    predictions: Mapping[str, str], reference: Mapping[str, str]
+) -> float:
+    """Give each of the four classes equal weight. Use zero for an empty class."""
+    total = 0.0
+    for label in RESULT_LABELS:
+        true_positive = sum(
+            1
+            for candidate_id, truth in reference.items()
+            if truth == label and predictions.get(candidate_id) == label
+        )
+        false_positive = sum(
+            1
+            for candidate_id, predicted in predictions.items()
+            if predicted == label and reference.get(candidate_id) != label
+        )
+        false_negative = sum(
+            1
+            for candidate_id, truth in reference.items()
+            if truth == label and predictions.get(candidate_id) != label
+        )
+        denominator = 2 * true_positive + false_positive + false_negative
+        total += (2 * true_positive / denominator) if denominator else 0.0
+    return total / len(RESULT_LABELS)
+
+
+def _contains_gpt_artifact(value: object) -> bool:
+    """Find a GPT route or a GPT field in a training or selection input.
+
+    The check reads field names and route identifiers only. Passage text that
+    mentions GPT is source material, not GPT output.
+    """
+    if isinstance(value, Mapping):
+        return any(
+            "gpt" in str(key).lower() or _contains_gpt_artifact(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_gpt_artifact(item) for item in value)
+    return isinstance(value, str) and GPT_ROUTE_ID in value
+
+
+def _specialist_input(candidate: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "candidate_id": candidate["candidate_id"],
+        "passage": candidate["normalized_passage"],
+        "target": candidate["company_id"],
+        "aspect": candidate["aspect"],
+    }
+
+
 def _response_message(response: OmniRouteResponse) -> Mapping[str, object] | None:
     choices = response.body.get("choices")
     if not isinstance(choices, list) or len(choices) != 1:
@@ -1610,6 +1823,7 @@ class StageRun:
             self.state_dir / "silver-aggregation-log.jsonl"
         )
         self.gpt_blind_log_path = self.state_dir / "gpt-blind-log.jsonl"
+        self.specialist_log_path = self.state_dir / "specialist-log.jsonl"
         self._spend_ledger = _AppendOnlyJsonl(self.spend_ledger_path, clock)
         self._decision_log = _AppendOnlyJsonl(self.decision_log_path, clock)
         self._candidate_inspection_log = _AppendOnlyJsonl(
@@ -1623,6 +1837,7 @@ class StageRun:
             self.silver_aggregation_log_path, clock
         )
         self._gpt_blind_log = _AppendOnlyJsonl(self.gpt_blind_log_path, clock)
+        self._specialist_log = _AppendOnlyJsonl(self.specialist_log_path, clock)
 
     def cost_records(self) -> list[dict[str, Any]]:
         return self._spend_ledger.read()
@@ -1644,6 +1859,9 @@ class StageRun:
 
     def gpt_blind_records(self) -> list[dict[str, Any]]:
         return self._gpt_blind_log.read()
+
+    def specialist_records(self) -> list[dict[str, Any]]:
+        return self._specialist_log.read()
 
     def _collection_stop(
         self, reason: str, route_ids: Sequence[str]
@@ -2355,6 +2573,288 @@ class StageRun:
         self._gpt_blind_log.append(
             {
                 "event": "gpt-blind-predictions-sealed",
+                "run_id": stage_manifest["run_id"],
+                "prediction_file": prediction_file,
+            }
+        )
+        return prediction_file
+
+    def _specialist_stop(self, reason: str) -> dict[str, object]:
+        return {
+            "specialist_predictions": "invalid",
+            "stop_reason": reason,
+            "model_id": MODERNBERT_MODEL_ID,
+            "revision": MODERNBERT_REVISION,
+            "prediction_count": 0,
+            "predictions": [],
+        }
+
+    def train_specialist(
+        self,
+        stage_manifest: Mapping[str, object],
+        candidate_manifest: Mapping[str, object],
+        allocation: Mapping[str, object],
+        aggregation: Mapping[str, object],
+        backend: TrainingBackend,
+        *,
+        device_checks: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Train the pinned specialist and seal its local blind prediction file."""
+        decision = self.evaluate(stage_manifest)
+        if decision["decision"] != "build-eligible":
+            return self._specialist_stop(str(decision["stop_reason"]))
+        if not _is_valid_sealed_candidate_manifest(candidate_manifest):
+            return self._specialist_stop("unsealed-annex")
+        seal = candidate_manifest["seal"]
+        assert isinstance(seal, Mapping)
+        candidate_manifest_sha256 = str(seal["semantic_sha256"])
+        if (
+            allocation.get("allocation") != "complete"
+            or allocation.get("candidate_manifest_sha256") != candidate_manifest_sha256
+        ):
+            return self._specialist_stop("allocation-not-complete")
+
+        records = self.specialist_records()
+        # A sealed file serves each later regression test. Do not train again.
+        sealed = [
+            record
+            for record in records
+            if record.get("event") == "specialist-predictions-sealed"
+        ]
+        if sealed:
+            prior = cast(dict[str, object], sealed[0]["prediction_file"])
+            if prior.get("candidate_manifest_sha256") != candidate_manifest_sha256:
+                return self._specialist_stop("frozen-specialist-run-changed")
+            return prior
+
+        if (
+            aggregation.get("aggregation") != "complete"
+            or aggregation.get("candidate_manifest_sha256") != candidate_manifest_sha256
+        ):
+            return self._specialist_stop("silver-labels-not-accepted")
+        accepted_silver = aggregation.get("accepted_silver")
+        if not isinstance(accepted_silver, list) or not accepted_silver:
+            return self._specialist_stop("silver-labels-not-accepted")
+        # GPT supplies no training, development, calibration, or selection input.
+        if any(
+            _contains_gpt_artifact(value)
+            # The stage manifest is not in this list. Its budget has one
+            # permitted `gpt` category for the separate blind comparison.
+            for value in (aggregation, allocation, device_checks, candidate_manifest)
+        ):
+            return self._specialist_stop("gpt-artifact-present")
+
+        m3_check = device_checks.get("m3")
+        if not isinstance(m3_check, Mapping):
+            return self._specialist_stop("m3-check-incomplete")
+        m3_stop = check_m3_compatibility(m3_check)
+        if m3_stop is not None:
+            return self._specialist_stop(m3_stop)
+
+        pilot = device_checks.get("gpu_pilot")
+        if not isinstance(pilot, Mapping):
+            return self._specialist_stop("specialist-pilot-incomplete")
+        # The pilot spends from the same allocation. Its measured cost lowers the
+        # balance even before the operator records it in the ledger.
+        try:
+            pilot_usd = _money(pilot.get("pilot_usd"))
+        except ValueError:
+            pilot_usd = Decimal("0.00")
+        projection = project_specialist_training_cost(
+            pilot,
+            remaining_usd=(
+                BUDGET_LIMITS["specialist"]
+                - max(self.budget_exposure()["specialist"], pilot_usd)
+            ),
+        )
+        if projection["forecast"] != "within-budget":
+            return self._specialist_stop(str(projection["stop_reason"]))
+
+        candidates_value = candidate_manifest["candidates"]
+        assert isinstance(candidates_value, list)
+        candidate_by_id = {
+            str(candidate["candidate_id"]): candidate
+            for candidate in candidates_value
+            if isinstance(candidate, Mapping)
+        }
+
+        def rows(split: str) -> list[Mapping[str, object]] | str:
+            """Give the split candidates, or one stop reason."""
+            items = allocation.get(split)
+            if not isinstance(items, list) or not items:
+                return "specialist-candidate-invalid"
+            selected: list[Mapping[str, object]] = []
+            for item in items:
+                candidate_id = (
+                    item.get("candidate_id") if isinstance(item, Mapping) else None
+                )
+                candidate = candidate_by_id.get(str(candidate_id))
+                if candidate is None or candidate.get("split") != split:
+                    return "specialist-candidate-invalid"
+                if any(field in candidate for field in BLIND_LABEL_FIELDS):
+                    return "blind-label-exposed"
+                selected.append(candidate)
+            return selected
+
+        splits = [rows(split) for split in ("training", "development", "blind")]
+        for split_rows in splits:
+            if isinstance(split_rows, str):
+                return self._specialist_stop(split_rows)
+        training_candidates, development_candidates, blind_candidates = cast(
+            list[list[Mapping[str, object]]], splits
+        )
+
+        silver_labels: dict[str, str] = {}
+        for item in accepted_silver:
+            if not isinstance(item, Mapping) or item.get("label") not in RESULT_LABELS:
+                return self._specialist_stop("silver-labels-not-accepted")
+            silver_labels[str(item["candidate_id"])] = str(item["label"])
+        training_rows = [
+            {
+                **_specialist_input(candidate),
+                "label": silver_labels[str(candidate["candidate_id"])],
+            }
+            for candidate in training_candidates
+            if str(candidate["candidate_id"]) in silver_labels
+        ]
+        if not training_rows:
+            return self._specialist_stop("silver-labels-not-accepted")
+        # The development labels stay with the selection code. Only inputs go out.
+        development_rows = [
+            _specialist_input(candidate) for candidate in development_candidates
+        ]
+        blind_rows = [_specialist_input(candidate) for candidate in blind_candidates]
+
+        development_labels: dict[str, str] = {}
+        for item in cast(list[Mapping[str, object]], allocation["development"]):
+            if item.get("label") not in RESULT_LABELS:
+                return self._specialist_stop("development-label-invalid")
+            development_labels[str(item["candidate_id"])] = str(item["label"])
+
+        base_config: dict[str, object] = {
+            "model_id": MODERNBERT_MODEL_ID,
+            "revision": MODERNBERT_REVISION,
+            "new_head": True,
+            "head_labels": list(RESULT_LABELS),
+            "input_fields": ["passage", "target", "aspect"],
+            "max_sequence_tokens": MAX_EXAMPLE_TOKENS,
+        }
+        freeze = {
+            "event": "specialist-run-frozen",
+            "run_id": stage_manifest["run_id"],
+            "stage_manifest_sha256": semantic_manifest_sha256(stage_manifest),
+            "candidate_manifest_sha256": candidate_manifest_sha256,
+            "training_config_sha256": hashlib.sha256(
+                _canonical_json(base_config).encode("utf-8")
+            ).hexdigest(),
+            "seeds": list(SPECIALIST_SEEDS),
+            "training_example_count": len(training_rows),
+            "development_example_count": len(development_rows),
+            "blind_example_count": len(blind_rows),
+            "m3_device_id": m3_check["device_id"],
+            "projected_usd": projection["projected_usd"],
+            "pilot_usd": projection["pilot_usd"],
+        }
+        freeze_records = [
+            record
+            for record in records
+            if record.get("event") == "specialist-run-frozen"
+        ]
+        if freeze_records:
+            if any(freeze_records[0].get(field) != freeze[field] for field in freeze):
+                return self._specialist_stop("frozen-specialist-run-changed")
+        else:
+            self._specialist_log.append(freeze)
+
+        checkpoints: list[dict[str, object]] = []
+        for seed in SPECIALIST_SEEDS:
+            config = {
+                **base_config,
+                "seed": seed,
+                "training": training_rows,
+                "development": development_rows,
+            }
+            result = backend.train(config)
+            predictions = result.get("development_predictions")
+            if (
+                any(field not in result for field in SPECIALIST_TRAIN_RESULT_FIELDS)
+                or result["model_id"] != MODERNBERT_MODEL_ID
+                or result["revision"] != MODERNBERT_REVISION
+                or result["max_sequence_tokens"] != MAX_EXAMPLE_TOKENS
+                or list(cast(list[str], result["head_labels"])) != list(RESULT_LABELS)
+                or not isinstance(predictions, Mapping)
+                or set(predictions) != set(development_labels)
+                or any(label not in RESULT_LABELS for label in predictions.values())
+            ):
+                return self._specialist_stop("specialist-training-invalid")
+            macro_f1 = _macro_f1(
+                {str(key): str(value) for key, value in predictions.items()},
+                development_labels,
+            )
+            checkpoints.append(
+                {
+                    "seed": seed,
+                    "checkpoint_id": str(result["checkpoint_id"]),
+                    "development_macro_f1": macro_f1,
+                }
+            )
+            self._specialist_log.append(
+                {
+                    "event": "specialist-training-run",
+                    "seed": seed,
+                    "checkpoint_id": str(result["checkpoint_id"]),
+                    "development_macro_f1": macro_f1,
+                    "training_example_count": len(training_rows),
+                }
+            )
+
+        # The human development labels select the checkpoint. A tie takes the
+        # lowest seed.
+        selected = min(
+            checkpoints,
+            key=lambda item: (
+                -cast(float, item["development_macro_f1"]),
+                cast(int, item["seed"]),
+            ),
+        )
+        inference = backend.predict(str(selected["checkpoint_id"]), blind_rows)
+        device_id = inference.get("device_id") if isinstance(inference, Mapping) else None
+        if device_id != m3_check["device_id"]:
+            return self._specialist_stop("local-inference-device-mismatch")
+        labels = inference.get("predictions")
+        if not isinstance(labels, Mapping):
+            return self._specialist_stop("specialist-inference-invalid")
+        predictions_out: list[dict[str, object]] = []
+        for row in blind_rows:
+            label = labels.get(str(row["candidate_id"]))
+            if label not in RESULT_LABELS:
+                return self._specialist_stop("missing-prediction")
+            predictions_out.append(
+                {"candidate_id": row["candidate_id"], "label": label}
+            )
+
+        prediction_file: dict[str, object] = {
+            "specialist_predictions": "sealed",
+            "stop_reason": None,
+            "model_id": MODERNBERT_MODEL_ID,
+            "revision": MODERNBERT_REVISION,
+            "candidate_manifest_sha256": candidate_manifest_sha256,
+            "training_config_sha256": freeze["training_config_sha256"],
+            "checkpoint_id": selected["checkpoint_id"],
+            "selected_seed": selected["seed"],
+            "checkpoints": checkpoints,
+            "inference_device_id": device_id,
+            "projection": projection,
+            "software_versions": _software_versions(),
+            "prediction_count": len(predictions_out),
+            "predictions": predictions_out,
+        }
+        prediction_file["prediction_file_sha256"] = hashlib.sha256(
+            _canonical_json(prediction_file).encode("utf-8")
+        ).hexdigest()
+        self._specialist_log.append(
+            {
+                "event": "specialist-predictions-sealed",
                 "run_id": stage_manifest["run_id"],
                 "prediction_file": prediction_file,
             }

@@ -13,10 +13,12 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Mapping, cast
+from typing import Any, Mapping, Sequence, cast
 
 from nlp_wayfinder.stage_run import (
     MAX_EXAMPLE_TOKENS,
+    MODERNBERT_MODEL_ID,
+    MODERNBERT_REVISION,
     SILVER_CALIBRATION_FOLDS,
     SILVER_MIN_PROBABILITY,
     OmniRouteHttpTransport,
@@ -29,6 +31,7 @@ from nlp_wayfinder.stage_run import (
     allocate_stage_1,
     main as stage_run_main,
     project_gpt_blind_cost,
+    project_specialist_training_cost,
     _calibration_fold,
     _silver_rejection,
     candidate_order_sha256,
@@ -2407,3 +2410,509 @@ class GptBlindPredictionTests(unittest.TestCase):
         sealed = json.loads(output.read_text(encoding="utf-8"))
         self.assertEqual("sealed", sealed["gpt_predictions"])
         self.assertEqual(2, sealed["prediction_count"])
+
+
+class FakeTrainingBackend:
+    """Train one checkpoint for each seed and predict on the local device."""
+
+    def __init__(
+        self,
+        *,
+        development_labels: Mapping[int, Mapping[str, str]] | None = None,
+        blind_labels: Mapping[str, str] | None = None,
+        device_id: str = "m3-fixture",
+        train_result: Mapping[str, object] | None = None,
+    ) -> None:
+        self.trainings: list[dict[str, object]] = []
+        self.inferences: list[tuple[str, list[dict[str, object]]]] = []
+        self.development_labels = development_labels
+        self.blind_labels = blind_labels
+        self.device_id = device_id
+        self.train_result = train_result
+
+    def train(self, config: Mapping[str, object]) -> Mapping[str, object]:
+        self.trainings.append(copy.deepcopy(dict(config)))
+        seed = int(cast(int, config["seed"]))
+        development = cast(list[Mapping[str, object]], config["development"])
+        if self.development_labels is not None:
+            predictions = dict(self.development_labels[seed])
+        else:
+            predictions = {
+                str(item["candidate_id"]): "positive" for item in development
+            }
+        result = {
+            "checkpoint_id": f"checkpoint-seed-{seed}",
+            "model_id": MODERNBERT_MODEL_ID,
+            "revision": MODERNBERT_REVISION,
+            "max_sequence_tokens": MAX_EXAMPLE_TOKENS,
+            "head_labels": list(RESULT_LABELS),
+            "development_predictions": predictions,
+        }
+        if self.train_result is not None:
+            result.update(self.train_result)
+        return result
+
+    def predict(
+        self, checkpoint_id: str, examples: Sequence[Mapping[str, object]]
+    ) -> Mapping[str, object]:
+        self.inferences.append(
+            (checkpoint_id, [copy.deepcopy(dict(item)) for item in examples])
+        )
+        labels = self.blind_labels
+        return {
+            "device_id": self.device_id,
+            "predictions": {
+                str(item["candidate_id"]): (
+                    labels[str(item["candidate_id"])]
+                    if labels is not None
+                    else "positive"
+                )
+                for item in examples
+                if labels is None or str(item["candidate_id"]) in labels
+            },
+        }
+
+
+class SpecialistTrainingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.runner = StageRun(
+            Path(self.temp_dir.name), clock=lambda: "2026-09-12T00:00:00Z"
+        )
+
+    def m3_check(self, **changes: object) -> dict[str, object]:
+        declared: dict[str, object] = {
+            "device_id": "m3-fixture",
+            "unified_memory_gb": 8,
+            "max_sequence_tokens": 512,
+            "compatibility_verified": True,
+            "local_inference_verified": True,
+            "evidence": "fixture device record",
+        }
+        declared.update(changes)
+        return declared
+
+    def pilot(self, **changes: object) -> dict[str, object]:
+        declared: dict[str, object] = {
+            "gpu_model": "A40",
+            "gpu_architecture": "Ampere",
+            "gpu_memory_gb": 48,
+            "peak_memory_gb": 31.5,
+            "max_sequence_tokens": MAX_EXAMPLE_TOKENS,
+            "pilot_usd": "4.20",
+            "initial_loss": 1.39,
+            "final_loss": 0.62,
+            "examples_per_second": 8.0,
+            "training_examples_per_seed": 12_000,
+            "hourly_usd": "0.80",
+            "storage_gb": 30,
+            "storage_usd_per_gb_month": "0.02",
+            "storage_months": 1,
+            "tax_rate": "0.00",
+        }
+        declared.update(changes)
+        return declared
+
+    def specialist_inputs(
+        self, **changes: object
+    ) -> tuple[dict[str, object], dict[str, object], dict[str, object], dict[str, object]]:
+        stage_manifest = confirm_manifest(draft_manifest(), "fixture-owner")
+        candidates = candidate_manifest()
+        rows: list[dict[str, object]] = []
+        for index in range(2):
+            rows.append(
+                {
+                    "candidate_id": f"training-{index}",
+                    "event_group_id": f"event-training-{index}",
+                    "company_id": "Harbor Grid Ltd",
+                    "aspect": STAGE_1_ASPECTS[index % 4],
+                    "published_at": "2026-03-10T09:00:00Z",
+                    "normalized_passage": f"Harbor Grid training passage {index}.",
+                    "near_duplicate_reviewed": True,
+                }
+            )
+        for index in range(4):
+            rows.append(
+                {
+                    "candidate_id": f"development-{index}",
+                    "event_group_id": f"event-development-{index}",
+                    "company_id": "Bay Rail Plc",
+                    "aspect": STAGE_1_ASPECTS[index % 4],
+                    "published_at": "2026-07-10T09:00:00Z",
+                    "normalized_passage": f"Bay Rail development passage {index}.",
+                    "near_duplicate_reviewed": True,
+                }
+            )
+        for index in range(2):
+            rows.append(
+                {
+                    "candidate_id": f"blind-{index}",
+                    "event_group_id": f"event-blind-{index}",
+                    "company_id": "Coast Metal Plc",
+                    "aspect": STAGE_1_ASPECTS[index % 4],
+                    "published_at": "2026-09-10T09:00:00Z",
+                    "normalized_passage": f"Coast Metal blind passage {index}.",
+                    "near_duplicate_reviewed": True,
+                }
+            )
+        candidates["candidates"] = cast(list[dict[str, object]], rows)
+        sealed = seal_candidate_manifest(candidates, "fixture-owner")
+        manifest_sha256 = str(
+            cast(Mapping[str, object], sealed["seal"])["semantic_sha256"]
+        )
+        allocation: dict[str, object] = {
+            "allocation": "complete",
+            "stop_reason": None,
+            "candidate_manifest_sha256": manifest_sha256,
+            "training": [{"candidate_id": "training-0"}, {"candidate_id": "training-1"}],
+            "development": [
+                {"candidate_id": f"development-{index}", "label": RESULT_LABELS[index]}
+                for index in range(4)
+            ],
+            "blind": [
+                {"candidate_id": "blind-0", "label": "positive"},
+                {"candidate_id": "blind-1", "label": "negative"},
+            ],
+        }
+        aggregation: dict[str, object] = {
+            "aggregation": "complete",
+            "stop_reason": None,
+            "candidate_manifest_sha256": manifest_sha256,
+            "accepted_silver_count": 2,
+            "accepted_silver": [
+                {
+                    "candidate_id": "training-0",
+                    "label": "positive",
+                    "probability": 0.91,
+                },
+                {
+                    "candidate_id": "training-1",
+                    "label": "negative",
+                    "probability": 0.86,
+                },
+            ],
+        }
+        aggregation.update(changes)
+        return stage_manifest, sealed, allocation, aggregation
+
+    def train(
+        self,
+        backend: Any,
+        *,
+        m3: Mapping[str, object] | None = None,
+        pilot: Mapping[str, object] | None = None,
+        inputs: tuple[Any, Any, Any, Any] | None = None,
+    ) -> dict[str, object]:
+        stage_manifest, candidates, allocation, aggregation = (
+            inputs if inputs is not None else self.specialist_inputs()
+        )
+        return self.runner.train_specialist(
+            stage_manifest,
+            candidates,
+            allocation,
+            aggregation,
+            backend,
+            device_checks={
+                "m3": self.m3_check() if m3 is None else m3,
+                "gpu_pilot": self.pilot() if pilot is None else pilot,
+            },
+        )
+
+    def development_labels(self) -> dict[int, dict[str, str]]:
+        reference = {
+            f"development-{index}": RESULT_LABELS[index] for index in range(4)
+        }
+        wrong = dict(reference)
+        wrong["development-0"] = "negative"
+        return {1: wrong, 2: dict(reference), 3: wrong}
+
+    def test_the_sealed_file_uses_the_pinned_initialization(self) -> None:
+        backend = FakeTrainingBackend(development_labels=self.development_labels())
+
+        result = self.train(backend)
+
+        self.assertEqual("sealed", result["specialist_predictions"])
+        self.assertIsNone(result["stop_reason"])
+        self.assertEqual(MODERNBERT_MODEL_ID, result["model_id"])
+        self.assertEqual(MODERNBERT_REVISION, result["revision"])
+        self.assertEqual("checkpoint-seed-2", result["checkpoint_id"])
+        self.assertEqual(2, result["prediction_count"])
+        self.assertEqual(64, len(cast(str, result["prediction_file_sha256"])))
+        self.assertEqual(
+            ["blind-0", "blind-1"],
+            [
+                cast(Mapping[str, object], item)["candidate_id"]
+                for item in cast(list[object], result["predictions"])
+            ],
+        )
+        self.assertEqual(3, len(backend.trainings))
+        for config in backend.trainings:
+            self.assertEqual(MODERNBERT_MODEL_ID, config["model_id"])
+            self.assertEqual(MODERNBERT_REVISION, config["revision"])
+            self.assertEqual(MAX_EXAMPLE_TOKENS, config["max_sequence_tokens"])
+            self.assertEqual(list(RESULT_LABELS), config["head_labels"])
+            training = cast(list[Mapping[str, object]], config["training"])
+            self.assertEqual(2, len(training))
+            self.assertEqual(
+                {"candidate_id", "passage", "target", "aspect", "label"},
+                set(training[0]),
+            )
+            self.assertEqual("positive", training[0]["label"])
+
+    def test_the_development_input_never_carries_a_human_label(self) -> None:
+        backend = FakeTrainingBackend(development_labels=self.development_labels())
+
+        self.train(backend)
+
+        for config in backend.trainings:
+            development = cast(list[Mapping[str, object]], config["development"])
+            self.assertEqual(4, len(development))
+            for item in development:
+                self.assertEqual(
+                    {"candidate_id", "passage", "target", "aspect"}, set(item)
+                )
+
+    def test_the_blind_inference_runs_on_the_checked_m3_device(self) -> None:
+        backend = FakeTrainingBackend(development_labels=self.development_labels())
+
+        result = self.train(backend)
+
+        self.assertEqual("m3-fixture", result["inference_device_id"])
+        checkpoint_id, examples = backend.inferences[0]
+        self.assertEqual("checkpoint-seed-2", checkpoint_id)
+        for item in examples:
+            self.assertEqual(
+                {"candidate_id", "passage", "target", "aspect"}, set(item)
+            )
+
+    def test_another_inference_device_stops_the_run(self) -> None:
+        backend = FakeTrainingBackend(device_id="rented-gpu")
+
+        result = self.train(backend)
+
+        self.assertEqual("invalid", result["specialist_predictions"])
+        self.assertEqual("local-inference-device-mismatch", result["stop_reason"])
+
+    def test_an_incomplete_m3_check_stops_the_run(self) -> None:
+        check = self.m3_check()
+        del check["local_inference_verified"]
+
+        result = self.train(FakeTrainingBackend(), m3=check)
+
+        self.assertEqual("m3-check-incomplete", result["stop_reason"])
+
+    def test_a_failed_m3_check_stops_the_run(self) -> None:
+        result = self.train(
+            FakeTrainingBackend(), m3=self.m3_check(max_sequence_tokens=1_024)
+        )
+
+        self.assertEqual("m3-check-failed", result["stop_reason"])
+
+    def test_a_pilot_above_five_dollars_stops_the_run(self) -> None:
+        result = self.train(FakeTrainingBackend(), pilot=self.pilot(pilot_usd="5.01"))
+
+        self.assertEqual("specialist-pilot-cost-exceeded", result["stop_reason"])
+
+    def test_an_older_gpu_architecture_stops_the_run(self) -> None:
+        result = self.train(
+            FakeTrainingBackend(), pilot=self.pilot(gpu_architecture="Turing")
+        )
+
+        self.assertEqual("specialist-pilot-architecture", result["stop_reason"])
+
+    def test_a_short_pilot_input_stops_the_run(self) -> None:
+        result = self.train(
+            FakeTrainingBackend(), pilot=self.pilot(max_sequence_tokens=512)
+        )
+
+        self.assertEqual("specialist-pilot-token-limit", result["stop_reason"])
+
+    def test_memory_above_the_gpu_stops_the_run(self) -> None:
+        result = self.train(FakeTrainingBackend(), pilot=self.pilot(peak_memory_gb=64))
+
+        self.assertEqual("specialist-pilot-memory", result["stop_reason"])
+
+    def test_a_loss_that_does_not_decrease_stops_the_run(self) -> None:
+        result = self.train(FakeTrainingBackend(), pilot=self.pilot(final_loss=1.39))
+
+        self.assertEqual("specialist-pilot-loss", result["stop_reason"])
+
+    def test_the_projection_covers_seeds_storage_tax_and_one_repeat(self) -> None:
+        projection = project_specialist_training_cost(self.pilot())
+
+        self.assertEqual("within-budget", projection["forecast"])
+        self.assertEqual(4, projection["training_runs"])
+        self.assertEqual(1, projection["operational_repeats"])
+        self.assertEqual([1, 2, 3], projection["seeds"])
+        # 12,000 examples at 8.0 per second is 0.416667 hours for each run.
+        # Four runs at USD 0.80 and 30 GB at USD 0.02 gives USD 1.94.
+        self.assertEqual("1.94", projection["projected_usd"])
+        self.assertEqual("35.00", projection["remaining_usd"])
+
+    def test_the_projection_adds_the_declared_tax(self) -> None:
+        projection = project_specialist_training_cost(self.pilot(tax_rate="0.10"))
+
+        self.assertEqual("2.13", projection["projected_usd"])
+
+    def test_a_projection_above_the_balance_stops_the_run(self) -> None:
+        projection = project_specialist_training_cost(
+            self.pilot(), remaining_usd=Decimal("1.00")
+        )
+
+        self.assertEqual("specialist-budget-exceeded", projection["stop_reason"])
+        self.assertEqual("1.94", projection["projected_usd"])
+
+    def test_a_projection_above_the_remaining_allocation_stops_training(self) -> None:
+        self.runner.record_cost(
+            action_id="gpu-pilot",
+            kind="commitment",
+            category="specialist",
+            amount_usd="5.00",
+            evidence="fixture pilot commitment",
+        )
+        # USD 30.25 fits the USD 35 allocation but not the USD 30 balance.
+        pilot = self.pilot(hourly_usd="17.79")
+
+        result = self.train(FakeTrainingBackend(), pilot=pilot)
+
+        self.assertEqual("specialist-budget-exceeded", result["stop_reason"])
+        self.assertEqual(
+            "within-budget",
+            project_specialist_training_cost(pilot)["forecast"],
+        )
+
+    def test_the_pilot_cost_lowers_the_specialist_balance(self) -> None:
+        # USD 35 less the USD 5 pilot leaves USD 30 for the three seed runs.
+        pilot = self.pilot(pilot_usd="5.00", hourly_usd="17.79")
+
+        result = self.train(FakeTrainingBackend(), pilot=pilot)
+
+        self.assertEqual("specialist-budget-exceeded", result["stop_reason"])
+
+    def test_a_passage_that_mentions_gpt_does_not_stop_the_run(self) -> None:
+        inputs = list(self.specialist_inputs())
+        candidates = cast(dict[str, object], inputs[1])
+        draft = {key: value for key, value in candidates.items() if key != "seal"}
+        draft["candidates"] = [
+            {
+                key: value
+                for key, value in cast(Mapping[str, object], item).items()
+                if key not in ("content_sha256", "split")
+            }
+            for item in cast(list[Any], draft["candidates"])
+        ]
+        cast(list[dict[str, object]], draft["candidates"])[0]["normalized_passage"] = (
+            "Harbor Grid sells GPT servers to three customers."
+        )
+        changed = seal_candidate_manifest(draft, "fixture-owner")
+        manifest_sha256 = cast(Mapping[str, object], changed["seal"])["semantic_sha256"]
+        inputs[1] = changed
+        cast(dict[str, object], inputs[2])["candidate_manifest_sha256"] = manifest_sha256
+        cast(dict[str, object], inputs[3])["candidate_manifest_sha256"] = manifest_sha256
+
+        result = self.train(
+            FakeTrainingBackend(development_labels=self.development_labels()),
+            inputs=cast(Any, tuple(inputs)),
+        )
+
+        self.assertEqual("sealed", result["specialist_predictions"])
+
+    def test_a_blind_label_in_the_manifest_stops_the_run(self) -> None:
+        inputs = list(self.specialist_inputs())
+        candidates = cast(dict[str, object], inputs[1])
+        draft = {key: value for key, value in candidates.items() if key != "seal"}
+        draft["candidates"] = [
+            {
+                key: value
+                for key, value in cast(Mapping[str, object], item).items()
+                if key not in ("content_sha256", "split")
+            }
+            for item in cast(list[Any], draft["candidates"])
+        ]
+        cast(list[dict[str, object]], draft["candidates"])[-1]["label"] = "positive"
+        changed = seal_candidate_manifest(draft, "fixture-owner")
+        manifest_sha256 = cast(Mapping[str, object], changed["seal"])["semantic_sha256"]
+        inputs[1] = changed
+        cast(dict[str, object], inputs[2])["candidate_manifest_sha256"] = manifest_sha256
+        cast(dict[str, object], inputs[3])["candidate_manifest_sha256"] = manifest_sha256
+
+        result = self.train(
+            FakeTrainingBackend(), inputs=cast(Any, tuple(inputs))
+        )
+
+        self.assertEqual("blind-label-exposed", result["stop_reason"])
+
+    def test_a_gpt_artifact_stops_the_run(self) -> None:
+        inputs = self.specialist_inputs()
+        aggregation = cast(dict[str, object], inputs[3])
+        aggregation["label_source"] = "cx/gpt-5.6-sol-medium"
+
+        result = self.train(FakeTrainingBackend(), inputs=inputs)
+
+        self.assertEqual("gpt-artifact-present", result["stop_reason"])
+
+    def test_unaccepted_silver_labels_stop_the_run(self) -> None:
+        inputs = self.specialist_inputs(aggregation="stopped")
+
+        result = self.train(FakeTrainingBackend(), inputs=inputs)
+
+        self.assertEqual("silver-labels-not-accepted", result["stop_reason"])
+
+    def test_a_missing_blind_prediction_stops_the_run(self) -> None:
+        backend = FakeTrainingBackend(blind_labels={"blind-0": "positive"})
+
+        result = self.train(backend)
+
+        self.assertEqual("missing-prediction", result["stop_reason"])
+
+    def test_another_initialization_stops_the_run(self) -> None:
+        backend = FakeTrainingBackend(train_result={"revision": "other-revision"})
+
+        result = self.train(backend)
+
+        self.assertEqual("specialist-training-invalid", result["stop_reason"])
+
+    def test_the_sealed_file_is_reused_without_new_training(self) -> None:
+        backend = FakeTrainingBackend(development_labels=self.development_labels())
+        first = self.train(backend)
+        second_backend = FakeTrainingBackend(
+            development_labels=self.development_labels()
+        )
+
+        second = self.train(second_backend)
+
+        self.assertEqual(first, second)
+        self.assertEqual([], second_backend.trainings)
+        self.assertEqual([], second_backend.inferences)
+
+    def test_a_changed_candidate_manifest_stops_a_sealed_run(self) -> None:
+        self.train(FakeTrainingBackend(development_labels=self.development_labels()))
+        stage_manifest, candidates, allocation, aggregation = self.specialist_inputs()
+        draft = {key: value for key, value in candidates.items() if key != "seal"}
+        draft["candidates"] = [
+            {
+                key: value
+                for key, value in cast(Mapping[str, object], item).items()
+                if key not in ("content_sha256", "split")
+            }
+            for item in cast(list[Any], draft["candidates"])
+        ]
+        cast(list[dict[str, object]], draft["candidates"])[0][
+            "normalized_passage"
+        ] = "Harbor Grid changed its training passage."
+        changed = seal_candidate_manifest(draft, "fixture-owner")
+        manifest_sha256 = cast(Mapping[str, object], changed["seal"])["semantic_sha256"]
+        allocation["candidate_manifest_sha256"] = manifest_sha256
+        aggregation["candidate_manifest_sha256"] = manifest_sha256
+
+        result = self.runner.train_specialist(
+            stage_manifest,
+            changed,
+            allocation,
+            aggregation,
+            FakeTrainingBackend(),
+            device_checks={"m3": self.m3_check(), "gpu_pilot": self.pilot()},
+        )
+
+        self.assertEqual("frozen-specialist-run-changed", result["stop_reason"])

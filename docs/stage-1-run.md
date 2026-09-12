@@ -283,6 +283,62 @@ sealed software versions, and the projection. A later regression comparison read
 the sealed file from the log. It does not make a new GPT call. A sealed file for a
 different candidate manifest returns `frozen-gpt-run-changed`.
 
+Train the pinned specialist and seal its blind prediction file with
+`StageRun.train_specialist`. The operation has no command-line form. The
+training backend runs on the rented GPU and on the M3 computer. The operator
+calls the method from the run script. The operator also supplies one backend
+object with a `train` method and a `predict` method.
+
+The `device_checks` input must contain `m3` and `gpu_pilot`. The `m3` check must
+contain `device_id`, `unified_memory_gb`, `max_sequence_tokens`, which must be
+512, `compatibility_verified`, `local_inference_verified`, and `evidence`. An
+absent field returns `m3-check-incomplete`. A failed value returns
+`m3-check-failed`.
+
+The `gpu_pilot` check is the measured 1,024-token pilot. It must contain
+`gpu_model`, `gpu_architecture`, `gpu_memory_gb`, `peak_memory_gb`,
+`max_sequence_tokens`, `pilot_usd`, `initial_loss`, `final_loss`,
+`examples_per_second`, `training_examples_per_seed`, `hourly_usd`, `storage_gb`,
+`storage_usd_per_gb_month`, `storage_months`, and `tax_rate`. The operation
+projects three seed runs and one operational repeat. It adds the storage cost
+and the tax. It then compares the result with the unspent part of the USD 35
+specialist allocation. The measured pilot cost also lowers that balance. A USD 5
+pilot leaves a USD 30 balance. Give `training_examples_per_seed` as the complete
+number of examples for one seed run, which is the epoch count multiplied by the
+accepted silver examples. It stops with `specialist-pilot-incomplete`,
+`specialist-pilot-architecture` for a GPU that is older than Ampere,
+`specialist-pilot-token-limit` for a pilot that is not 1,024 tokens,
+`specialist-pilot-memory`, `specialist-pilot-loss` for a loss that does not
+decrease, `specialist-pilot-cost-exceeded` for a pilot above USD 5, or
+`specialist-budget-exceeded`.
+
+Each seed run uses the pinned ModernBERT revision, a new four-class head, and
+explicit `passage`, `target`, and `aspect` fields. The training rows carry the
+accepted silver labels. The development rows carry no label, because the human
+development labels stay in the selection code. The run stops with
+`specialist-training-invalid` when a checkpoint reports another initialization,
+another token limit, another head, or an incomplete development prediction set.
+
+The operation selects the checkpoint that has the highest development macro-F1.
+A tie takes the lowest seed. The final blind inference must run on the checked M3 device.
+Another device returns `local-inference-device-mismatch`. A missing blind label
+returns `missing-prediction`.
+
+GPT output cannot enter this operation. The run stops with
+`gpt-artifact-present` when the silver aggregation, the allocation, the device
+checks, or the candidate manifest contains a GPT field name or the GPT route
+identifier. A passage that mentions GPT is source text and does not stop the
+run. A candidate that carries a label stops the run with `blind-label-exposed`.
+
+Record the specialist cost commitment with `record-cost` before the pilot and
+before the training runs. The operation does not record cost for you.
+
+The operation seals the run in `specialist-log.jsonl` and returns one prediction
+file with its own SHA-256 hash, the selected checkpoint, each seed result, the
+projection, and the sealed software versions. A later call returns the sealed
+file and does not train again. A sealed file for a different candidate manifest
+returns `frozen-specialist-run-changed`.
+
 Record a cost commitment before the related action. Record the actual cost after
 the action:
 
