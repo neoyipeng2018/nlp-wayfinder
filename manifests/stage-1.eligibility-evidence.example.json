@@ -1,0 +1,87 @@
+{
+  "example_status": "UNAPPROVED TEMPLATE - THIS FILE CANNOT AUTHORIZE A BUILD",
+  "source_eligibility_evidence": {
+    "checked_at": "YYYY-MM-DD",
+    "terms_url": "https://PRIMARY-SOURCE-TERMS-URL",
+    "reviewer": "REVIEWER-NAME",
+    "access_method": "EXACT-ACCESS-METHOD-FROM-THE-SEALED-ANNEX",
+    "data_portfolio_lane": "UNAPPROVED-SELECT-clean-core-OR-restricted-auxiliary",
+    "rights": {
+      "access_permitted": {
+        "permitted": false,
+        "primary_source_term_url": "https://PRIMARY-SOURCE-TERM-URL",
+        "exact_clause": "EXACT-CLAUSE-FOR-ACCESS",
+        "retrieved_at": "YYYY-MM-DD",
+        "reviewer": "REVIEWER-NAME",
+        "audited_object": "passage-text"
+      },
+      "private_evaluation_permitted": {
+        "permitted": false,
+        "primary_source_term_url": "https://PRIMARY-SOURCE-TERM-URL",
+        "exact_clause": "EXACT-CLAUSE-FOR-PRIVATE-EVALUATION",
+        "retrieved_at": "YYYY-MM-DD",
+        "reviewer": "REVIEWER-NAME",
+        "audited_object": "passage-text"
+      },
+      "training_permitted": {
+        "permitted": false,
+        "primary_source_term_url": "https://PRIMARY-SOURCE-TERM-URL",
+        "exact_clause": "EXACT-CLAUSE-FOR-TRAINING",
+        "retrieved_at": "YYYY-MM-DD",
+        "reviewer": "REVIEWER-NAME",
+        "audited_object": "passage-text"
+      },
+      "weight_release_permitted": {
+        "permitted": false,
+        "primary_source_term_url": "https://PRIMARY-SOURCE-TERM-URL",
+        "exact_clause": "EXACT-CLAUSE-FOR-WEIGHT-RELEASE",
+        "retrieved_at": "YYYY-MM-DD",
+        "reviewer": "REVIEWER-NAME",
+        "audited_object": "passage-text"
+      },
+      "text_redistribution_permitted": {
+        "permitted": false,
+        "primary_source_term_url": "https://PRIMARY-SOURCE-TERM-URL",
+        "exact_clause": "EXACT-CLAUSE-FOR-TEXT-REDISTRIBUTION",
+        "retrieved_at": "YYYY-MM-DD",
+        "reviewer": "REVIEWER-NAME",
+        "audited_object": "passage-text"
+      }
+    }
+  },
+  "source_yield_evidence": {
+    "checked_at": "YYYY-MM-DDTHH:MM:SSZ",
+    "candidate_pool_size": 1,
+    "candidate_pool": [
+      {
+        "candidate_id": "UNAPPROVED-CANDIDATE-ID",
+        "split": "UNAPPROVED-SELECT-training-OR-development-OR-blind"
+      }
+    ],
+    "candidate_pool_sha256": "SHA256-OF-THE-SEALED-CANDIDATE-POOL",
+    "sample_size": 1,
+    "order_salt": "20260905",
+    "sampled_candidates": [
+      {
+        "candidate_id": "UNAPPROVED-CANDIDATE-ID",
+        "split": "UNAPPROVED-SELECT-training-OR-development-OR-blind",
+        "verified_company_target": false
+      }
+    ]
+  },
+  "route_eligibility_evidence": {
+    "checked_at": "YYYY-MM-DD",
+    "account": "DATED-ACCOUNT-RECORD",
+    "terms_url": "https://PROVIDER-TERMS-URL",
+    "observed_route_id": "PROVIDER/FIXED-MODEL-ID",
+    "observed_free_requests_remaining": 0,
+    "observed_requests_per_day": 0,
+    "account_no_paid_overflow": false,
+    "training_use": {
+      "term_url": "https://PROVIDER-TRAINING-USE-TERM-URL",
+      "exact_clause": "EXACT-CLAUSE-THAT-PERMITS-TRAINING-USE",
+      "retrieved_at": "YYYY-MM-DD",
+      "reviewer": "REVIEWER-NAME"
+    }
+  }
+}

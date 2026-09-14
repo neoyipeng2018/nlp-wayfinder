@@ -16,11 +16,13 @@
         "silver_candidate_limit": 3333,
         "training": 2000
       },
-      "license": {
+      "eligibility_evidence": {
+        "access_method": "",
         "checked_at": "",
-        "covers_passage_text": false,
-        "license_id": "",
-        "license_url": ""
+        "data_portfolio_lane": "",
+        "reviewer": "",
+        "rights": {},
+        "terms_url": ""
       },
       "planned_commitments_usd": {
         "contingency": "0.00",
@@ -54,11 +56,13 @@
         "silver_candidate_limit": 3333,
         "training": 2000
       },
-      "license": {
+      "eligibility_evidence": {
+        "access_method": "",
         "checked_at": "",
-        "covers_passage_text": false,
-        "license_id": "",
-        "license_url": ""
+        "data_portfolio_lane": "",
+        "reviewer": "",
+        "rights": {},
+        "terms_url": ""
       },
       "planned_commitments_usd": {
         "contingency": "0.00",

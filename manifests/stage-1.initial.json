@@ -21,11 +21,13 @@
   },
   "schema_version": 1,
   "source": {
-    "license": {
+    "eligibility_evidence": {
+      "access_method": "",
       "checked_at": "",
-      "covers_passage_text": false,
-      "license_id": "",
-      "license_url": ""
+      "data_portfolio_lane": "",
+      "reviewer": "",
+      "rights": {},
+      "terms_url": ""
     },
     "source_id": "unapproved-financial-news-source",
     "source_type": "financial-news",

@@ -1,5 +1,15 @@
 # Stage 1 Run Control
 
+Create the locked Python environment before you run a command:
+
+```sh
+uv sync --locked
+```
+
+Use `uv run python` in place of `python3` for the commands below. The lock file
+installs Python 3.11 through 3.13 dependencies, including Crowd-Kit 1.4.2 and
+the ModernBERT tokenizer support.
+
 The Stage 1 control reads one JSON manifest. It returns one JSON decision. It does
 not start an external action.
 
@@ -11,7 +21,15 @@ python3 -m nlp_wayfinder.stage_run check manifests/stage-1.initial.json \
 ```
 
 The command returns exit code `2`, decision `no-build`, and stop reason
-`source-rights-failed`.
+`source-rights-evidence-incomplete`.
+
+The current initial manifests were checked with this gate. All three return exit
+code `2`, decision `no-build`, and stop reason
+`source-rights-evidence-incomplete`:
+
+- `manifests/stage-1.initial.json`
+- `manifests/stage-2.initial.json`
+- `manifests/stage-3.initial.json`
 
 Make and review a new manifest before zero-change confirmation. Then add the
 zero-change confirmation evidence to a new file:
@@ -40,19 +58,24 @@ planned cost in `budget.planned_commitments_usd`. A later stage gives a `sources
 array instead, and each record in that array holds its own data plan, route
 demand, schedule, and planned cost. `docs/stage-2-run.md` gives that form.
 
-Each source must contain one `license` record. The record must contain
-`license_id`, `license_url`, `covers_passage_text`, and `checked_at`. The
-approved license IDs are `CC0-1.0` and `CC-BY-4.0`.
+Each source must contain one `eligibility_evidence` record. The record must give
+`checked_at`, `terms_url`, `reviewer`, `access_method`,
+`data_portfolio_lane`, and `rights`. The lane must be `clean-core`. A
+`restricted-auxiliary` source cannot supply cumulative-checkpoint training data.
 
-`CC0-1.0` must use
-`https://creativecommons.org/publicdomain/zero/1.0/`. `CC-BY-4.0` must use
-`https://creativecommons.org/licenses/by/4.0/`.
+`rights` must contain one record for each of the five fixed rights. Each record
+must give `permitted`, `primary_source_term_url`, `exact_clause`,
+`retrieved_at`, `reviewer`, and `audited_object`. The training, weight-release,
+and text-redistribution rights must audit `passage-text`. A repository or data
+file license is not sufficient. Source evidence must not be in the future and
+must be no more than 90 days old at `starts_on`.
 
-The license must cover the passage text. A license for only a repository or a
-data file is not sufficient. The check date must not be later than the run date.
-It must be within 90 days of `starts_on`. A missing or unapproved license returns
-`source-rights-failed`. Old or future evidence returns
-`source-rights-evidence-stale`.
+Incomplete evidence returns `source-rights-evidence-incomplete`. Old or future
+evidence returns `source-rights-evidence-stale`. A restricted lane returns
+`source-lane-restricted`.
+
+Use `manifests/stage-1.eligibility-evidence.example.json` as the field guide.
+It is an unapproved template. Its placeholder values cannot authorize a build.
 
 Each source must also contain one `yield_evidence` record. The record must
 contain `checked_at`, `candidate_pool_size`, `candidate_pool`,
@@ -218,6 +241,23 @@ gate permits no fewer than three eligible routes. A later change of the routes,
 the stage manifest, the candidate manifest, or the prompt returns
 `frozen-vote-collection-changed`.
 
+Each candidate route must give complete account evidence under `evidence`. The
+record must give `checked_at`, `account`, `terms_url`, `observed_route_id`,
+`observed_free_requests_remaining`, `observed_requests_per_day`,
+`account_no_paid_overflow`, and a `training_use` term record. Route evidence
+must not be in the future and must be no more than 30 days old at `starts_on`.
+The observed route ID and free-limit figures must equal the declared route
+values. An incomplete or stale candidate is not in the eligible panel. Three
+other valid routes can still pass. An identity or free-limit mismatch stops the
+stage. The build decision records each evidence record, its SHA-256 value, and
+the accepted route set.
+
+The route refusal reasons are `route-evidence-incomplete` and
+`route-evidence-stale`. If fewer than three routes remain, the stage returns
+`insufficient-eligible-routes`. A free-limit mismatch returns
+`route-evidence-inconsistent`. A route-identity mismatch returns
+`route-identity-unconfirmed`.
+
 Each accepted silver candidate and each development example receives one vote
 from each frozen route. Blind examples never enter this path. Each request goes
 to the dedicated provider endpoint with the fully qualified model, no cache, and
@@ -291,8 +331,7 @@ split.
 Aggregate the collected votes into accepted silver labels:
 
 ```sh
-python3 -m pip install 'crowd-kit==1.4.2'
-python3 -m nlp_wayfinder.stage_run aggregate-silver \
+uv run python -m nlp_wayfinder.stage_run aggregate-silver \
   confirmed.json sealed-candidates.json stage-1-allocation.json \
   --state-dir .wayfinder-state --output accepted-silver.json
 ```
@@ -512,5 +551,5 @@ of contingency without a new planning decision.
 Run all tests with:
 
 ```sh
-python3 -m unittest discover -s tests -v
+uv run python -m unittest discover -s tests -v
 ```

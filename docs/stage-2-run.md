@@ -18,7 +18,7 @@ python3 -m nlp_wayfinder.stage_run check manifests/stage-2.initial.json \
 ```
 
 The command returns exit code `2`, decision `no-build`, and stop reason
-`source-rights-failed`.
+`source-rights-evidence-incomplete`.
 
 A Stage 2 manifest has `stage` 2 and a `sources` array. The array must hold one
 record for `company-announcements` and one record for `regulatory-filings`. A
@@ -28,7 +28,7 @@ returns `source-rights-failed`.
 Each source record must contain:
 
 - `source_id` and `source_type`
-- the open `license` record that `docs/stage-1-run.md` defines
+- the `eligibility_evidence` record that `docs/stage-1-run.md` defines
 - the `yield_evidence` record that `docs/stage-1-run.md` defines
 - `data_plan`, with `silver_candidate_limit` 3,333, `training` 2,000,
   `development` 200, and `blind` 400
@@ -38,8 +38,8 @@ Each source record must contain:
 
 The gate applies each check to each source separately:
 
-- The open-license check stops with `source-rights-failed` or
-  `source-rights-evidence-stale`.
+- The source evidence check stops with `source-rights-evidence-incomplete`,
+  `source-rights-evidence-stale`, or `source-lane-restricted`.
 - The source-yield check stops with `source-yield-unproven` or
   `source-rights-evidence-stale`.
 - The data check stops with `source-data-plan-invalid`.

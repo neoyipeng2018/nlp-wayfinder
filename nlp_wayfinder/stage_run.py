@@ -14,6 +14,7 @@ import socket
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -222,9 +223,27 @@ RIGHTS_FIELDS = (
     "text_redistribution_permitted",
 )
 SOURCE_EVIDENCE_FRESHNESS_DAYS = 90
-APPROVED_OPEN_LICENSES = {
-    "CC0-1.0": "https://creativecommons.org/publicdomain/zero/1.0/",
-    "CC-BY-4.0": "https://creativecommons.org/licenses/by/4.0/",
+ROUTE_EVIDENCE_FRESHNESS_DAYS = 30
+SOURCE_ELIGIBILITY_FIELDS = (
+    "checked_at",
+    "terms_url",
+    "reviewer",
+    "access_method",
+    "data_portfolio_lane",
+    "rights",
+)
+RIGHTS_CLAUSE_FIELDS = (
+    "permitted",
+    "primary_source_term_url",
+    "exact_clause",
+    "retrieved_at",
+    "reviewer",
+    "audited_object",
+)
+PASSAGE_TEXT_RIGHTS = {
+    "training_permitted",
+    "weight_release_permitted",
+    "text_redistribution_permitted",
 }
 
 ROUTE_ELIGIBILITY_FIELDS = (
@@ -443,14 +462,16 @@ def _evidence_datetime(value: object) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _is_fresh_evidence(value: object, *, starts_on: date, run_on: date) -> bool:
+def _is_fresh_evidence(
+    value: object, *, starts_on: date, run_on: date, freshness_days: int
+) -> bool:
     """Hold one evidence date inside the freshness window and out of the future."""
     checked_on = _evidence_date(value)
     if checked_on is None:
         return False
     return (
         checked_on <= run_on
-        and (starts_on - checked_on).days <= SOURCE_EVIDENCE_FRESHNESS_DAYS
+        and (starts_on - checked_on).days <= freshness_days
     )
 
 
@@ -459,30 +480,146 @@ def _evidence_sha256(evidence: object) -> str:
     return hashlib.sha256(_canonical_json(evidence).encode("utf-8")).hexdigest()
 
 
-def _open_license_stop_reason(
-    license_record: object, *, starts_on: date, run_on: date
+def _is_http_url(value: object) -> bool:
+    """Return true for one absolute HTTP or HTTPS URL."""
+    if not isinstance(value, str):
+        return False
+    parsed = urllib.parse.urlparse(value.strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _source_eligibility_stop_reason(
+    evidence: object, *, starts_on: date, run_on: date
 ) -> str | None:
-    """Check the minimum open-license record for passage text."""
-    if not isinstance(license_record, Mapping):
-        return "source-rights-failed"
-    license_id = license_record.get("license_id")
-    if (
-        not isinstance(license_id, str)
-        or license_id not in APPROVED_OPEN_LICENSES
-        or license_record.get("license_url")
-        != APPROVED_OPEN_LICENSES[license_id]
-        or license_record.get("covers_passage_text") is not True
+    """Check one complete, attributable source rights record."""
+    if not isinstance(evidence, Mapping):
+        return "source-rights-evidence-incomplete"
+    if any(
+        field not in evidence
+        or (field != "rights" and not str(evidence.get(field, "")).strip())
+        for field in SOURCE_ELIGIBILITY_FIELDS
     ):
-        return "source-rights-failed"
+        return "source-rights-evidence-incomplete"
+    if evidence.get("data_portfolio_lane") not in {
+        "clean-core",
+        "restricted-auxiliary",
+    }:
+        return "source-rights-evidence-incomplete"
+    if evidence.get("data_portfolio_lane") == "restricted-auxiliary":
+        return "source-lane-restricted"
+    if not _is_http_url(evidence.get("terms_url")):
+        return "source-rights-evidence-incomplete"
     if not _is_fresh_evidence(
-        license_record.get("checked_at"), starts_on=starts_on, run_on=run_on
+        evidence.get("checked_at"),
+        starts_on=starts_on,
+        run_on=run_on,
+        freshness_days=SOURCE_EVIDENCE_FRESHNESS_DAYS,
     ):
         return "source-rights-evidence-stale"
+    rights = evidence.get("rights")
+    if not isinstance(rights, Mapping) or set(rights) != set(RIGHTS_FIELDS):
+        return "source-rights-evidence-incomplete"
+    for right in RIGHTS_FIELDS:
+        clause = rights.get(right)
+        if not isinstance(clause, Mapping) or any(
+            field not in clause
+            or (
+                field != "permitted"
+                and not str(clause.get(field, "")).strip()
+            )
+            for field in RIGHTS_CLAUSE_FIELDS
+        ):
+            return "source-rights-evidence-incomplete"
+        if clause.get("permitted") is not True:
+            return "source-rights-evidence-incomplete"
+        if not _is_http_url(clause.get("primary_source_term_url")):
+            return "source-rights-evidence-incomplete"
+        if not _is_fresh_evidence(
+            clause.get("retrieved_at"),
+            starts_on=starts_on,
+            run_on=run_on,
+            freshness_days=SOURCE_EVIDENCE_FRESHNESS_DAYS,
+        ):
+            return "source-rights-evidence-stale"
+        if (
+            right in PASSAGE_TEXT_RIGHTS
+            and clause.get("audited_object") != "passage-text"
+        ):
+            return "source-rights-evidence-incomplete"
+    return None
+
+
+def _route_evidence_reason(
+    route: Mapping[str, object], *, starts_on: date, run_on: date
+) -> str | None:
+    """Check one route account record without contacting the provider."""
+    evidence = route.get("evidence")
+    if not isinstance(evidence, Mapping):
+        return "route-evidence-incomplete"
+    required_text = ("checked_at", "account", "terms_url", "observed_route_id")
+    if any(not str(evidence.get(field, "")).strip() for field in required_text):
+        return "route-evidence-incomplete"
+    if not _is_http_url(evidence.get("terms_url")):
+        return "route-evidence-incomplete"
+    if not _is_fresh_evidence(
+        evidence.get("checked_at"),
+        starts_on=starts_on,
+        run_on=run_on,
+        freshness_days=ROUTE_EVIDENCE_FRESHNESS_DAYS,
+    ):
+        return "route-evidence-stale"
+    if evidence.get("observed_route_id") != route.get("route_id"):
+        return "route-identity-unconfirmed"
+    if evidence.get("account_no_paid_overflow") is not True:
+        return "route-evidence-incomplete"
+    training_use = evidence.get("training_use")
+    if not isinstance(training_use, Mapping) or any(
+        not str(training_use.get(field, "")).strip()
+        for field in ("term_url", "exact_clause", "retrieved_at", "reviewer")
+    ):
+        return "route-evidence-incomplete"
+    if not _is_http_url(training_use.get("term_url")):
+        return "route-evidence-incomplete"
+    if not _is_fresh_evidence(
+        training_use.get("retrieved_at"),
+        starts_on=starts_on,
+        run_on=run_on,
+        freshness_days=ROUTE_EVIDENCE_FRESHNESS_DAYS,
+    ):
+        return "route-evidence-stale"
+    observed_fields = (
+        "observed_free_requests_remaining",
+        "observed_requests_per_day",
+    )
+    if any(
+        not isinstance(evidence.get(field), int)
+        or isinstance(evidence.get(field), bool)
+        for field in observed_fields
+    ):
+        return "route-evidence-incomplete"
+    for declared_field, observed_field in (
+        ("free_requests_remaining", "observed_free_requests_remaining"),
+        ("requests_per_day", "observed_requests_per_day"),
+    ):
+        declared = route.get(declared_field)
+        observed = evidence.get(observed_field)
+        if (
+            not isinstance(declared, int)
+            or isinstance(declared, bool)
+            or declared != observed
+        ):
+            return "route-evidence-inconsistent"
+    if not all(route.get(field) is True for field in ROUTE_ELIGIBILITY_FIELDS):
+        return "route-evidence-incomplete"
     return None
 
 
 def _sealed_yield_sample(
-    candidates: Sequence[Mapping[str, object]], order_salt: str
+    candidates: Sequence[Mapping[str, object]],
+    order_salt: str,
+    *,
+    stage: int,
+    source_type: str,
 ) -> list[dict[str, object]]:
     """Give one sample in its fixed candidate order."""
     return [
@@ -490,7 +627,11 @@ def _sealed_yield_sample(
         for candidate in sorted(
             candidates,
             key=lambda item: hashlib.sha256(
-                f"{order_salt}:{item['candidate_id']}".encode("utf-8")
+                (
+                    "nlp-wayfinder"
+                    f"{stage}{source_type}{item['split']}"
+                    f"{item['candidate_id']}{order_salt}"
+                ).encode("utf-8")
             ).hexdigest(),
         )
     ]
@@ -502,6 +643,7 @@ def _source_yield_result(
     candidate_pool: object,
     pool_sealed_at: object,
     *,
+    stage: int,
     starts_on: date,
     run_on: date,
 ) -> tuple[str | None, dict[str, object] | None]:
@@ -509,7 +651,12 @@ def _source_yield_result(
     if not isinstance(evidence, Mapping):
         return "source-yield-unproven", None
     checked_at = evidence.get("checked_at")
-    if not _is_fresh_evidence(checked_at, starts_on=starts_on, run_on=run_on):
+    if not _is_fresh_evidence(
+        checked_at,
+        starts_on=starts_on,
+        run_on=run_on,
+        freshness_days=SOURCE_EVIDENCE_FRESHNESS_DAYS,
+    ):
         return "source-rights-evidence-stale", None
     checked_timestamp = _evidence_datetime(checked_at)
     sealed_timestamp = _evidence_datetime(pool_sealed_at)
@@ -562,7 +709,10 @@ def _source_yield_result(
         pool_candidates.append(candidate)
 
     selected_pool = _sealed_yield_sample(
-        pool_candidates, cast(str, order_salt)
+        pool_candidates,
+        cast(str, order_salt),
+        stage=stage,
+        source_type=source_type,
     )[:sample_size]
     sampled_by_id: dict[str, Mapping[str, object]] = {}
     for candidate in sampled:
@@ -607,17 +757,29 @@ def _source_yield_result(
     verified_count = len(verified)
     targets = SOURCE_ALLOCATION_TARGETS[source_type]
     total_allocation = sum(targets.values())
-    projected_company_targets = (
-        candidate_pool_size * verified_count // sample_size
-    )
+    pool_by_split = {
+        split: sum(1 for item in pool_candidates if item["split"] == split)
+        for split in CANDIDATE_SPLITS
+    }
+    sampled_by_split = {
+        split: sum(1 for item in checked_sample if item["split"] == split)
+        for split in CANDIDATE_SPLITS
+    }
     verified_by_split = {
         split: sum(1 for item in verified if item["split"] == split)
         for split in CANDIDATE_SPLITS
     }
     projected_by_split = {
-        split: candidate_pool_size * verified_by_split[split] // sample_size
+        split: (
+            pool_by_split[split]
+            * verified_by_split[split]
+            // sampled_by_split[split]
+            if sampled_by_split[split]
+            else 0
+        )
         for split in CANDIDATE_SPLITS
     }
+    projected_company_targets = sum(projected_by_split.values())
     projected_inspection_count = (
         (total_allocation * sample_size + verified_count - 1) // verified_count
         if verified_count
@@ -629,6 +791,8 @@ def _source_yield_result(
         "checked_sample": checked_sample,
         "verified_company_targets": verified_count,
         "verified_by_split": verified_by_split,
+        "candidate_pool_by_split": pool_by_split,
+        "sampled_by_split": sampled_by_split,
         "projected_company_targets": projected_company_targets,
         "projected_by_split": projected_by_split,
         "projected_inspection_count": projected_inspection_count,
@@ -3815,6 +3979,23 @@ class StageRun:
             )
             else "fail"
         )
+        report_decision = copy.deepcopy(dict(decision))
+        report_decision.update(
+            {
+                "blind_comparison": "valid",
+                "non_inferiority_margin": NON_INFERIORITY_MARGIN,
+                "reference_label": "first-human-label",
+                "stage_guardrail": stage_guardrail,
+                "source_guardrail": {
+                    source: value["source_guardrail"]
+                    for source, value in by_source.items()
+                },
+                "superiority": {
+                    source: value["superiority"]
+                    for source, value in by_source.items()
+                },
+            }
+        )
 
         attempts = [
             record
@@ -3854,20 +4035,7 @@ class StageRun:
                 "tested_sources": ordered_sources,
                 "final_staged_decision": stage == FINAL_STAGE,
             },
-            "decision": {
-                "blind_comparison": "valid",
-                "non_inferiority_margin": NON_INFERIORITY_MARGIN,
-                "reference_label": "first-human-label",
-                "stage_guardrail": stage_guardrail,
-                "source_guardrail": {
-                    source: value["source_guardrail"]
-                    for source, value in by_source.items()
-                },
-                "superiority": {
-                    source: value["superiority"]
-                    for source, value in by_source.items()
-                },
-            },
+            "decision": report_decision,
             "counts": {
                 "blind_examples": len(specialist_labels),
                 "blind_examples_by_source": {
@@ -4255,24 +4423,39 @@ class StageRun:
     def _stop(self, run_id: str, reason: str, stage: int) -> dict[str, object]:
         return self._decision(run_id, "no-build", reason, stage=stage)
 
+    def _eligibility_refusal(
+        self,
+        run_id: str,
+        stage: int,
+        identity_kind: str,
+        identity: str,
+        reason: str,
+        evidence: object,
+    ) -> None:
+        """Record one source or route eligibility refusal."""
+        self._decision_log.append(
+            {
+                "event": f"{identity_kind}-eligibility-stopped",
+                "run_id": run_id,
+                "stage": stage,
+                f"{identity_kind}_id": identity,
+                "stop_reason": reason,
+                "evidence_sha256": _evidence_sha256(evidence),
+            }
+        )
+
     def _eligibility_stop(
         self,
         run_id: str,
         stage: int,
-        source_id: str,
+        identity_kind: str,
+        identity: str,
         reason: str,
         evidence: object,
     ) -> dict[str, object]:
-        """Name the source, the reason, and the evidence that failed."""
-        self._decision_log.append(
-            {
-                "event": "source-eligibility-stopped",
-                "run_id": run_id,
-                "stage": stage,
-                "source_id": source_id,
-                "stop_reason": reason,
-                "evidence_sha256": _evidence_sha256(evidence),
-            }
+        """Record one eligibility refusal and stop the stage."""
+        self._eligibility_refusal(
+            run_id, stage, identity_kind, identity, reason, evidence
         )
         return self._decision(
             run_id, "no-build", reason, stage=stage, record=False
@@ -4289,82 +4472,8 @@ class StageRun:
         ):
             return self._stop(run_id, "invalid-manifest", 1)
 
-        # Source rights come first. No later gate can make an unprovable
-        # source eligible.
-        staged_form = isinstance(manifest.get("sources"), list)
-        sources = (
-            cast(list[object], manifest["sources"])
-            if staged_form
-            else [manifest.get("source")]
-        )
-        run_on = _evidence_date(self._clock()) or date.today()
-        source_records: list[Mapping[str, object]] = []
-        source_starts_on: dict[str, date] = {}
-        for item in sources:
-            if not isinstance(item, Mapping):
-                return self._stop(run_id, "source-rights-failed", stage)
-            if not (
-                item.get("source_type") in STAGE_SOURCES[stage]
-                and bool(item.get("source_id"))
-            ):
-                return self._stop(run_id, "source-rights-failed", stage)
-            item_schedule = item.get("schedule") or manifest.get("schedule")
-            starts_on = (
-                _evidence_date(item_schedule.get("starts_on"))
-                if isinstance(item_schedule, Mapping)
-                else None
-            )
-            license_reason = _open_license_stop_reason(
-                item.get("license"), starts_on=starts_on or run_on, run_on=run_on
-            )
-            if license_reason is not None:
-                return self._stop(run_id, license_reason, stage)
-            source_records.append(item)
-            source_starts_on[str(item["source_type"])] = starts_on or run_on
-        source_types = [str(item["source_type"]) for item in source_records]
-        if sorted(source_types) != sorted(STAGE_SOURCES[stage]):
-            return self._stop(run_id, "stage-source-incomplete", stage)
-
-        # Source yield comes after all source rights checks.
-        yield_results: dict[str, dict[str, object]] = {}
-        for item in source_records:
-            source_type = str(item["source_type"])
-            yield_evidence = item.get("yield_evidence")
-            pool_sha256 = (
-                yield_evidence.get("candidate_pool_sha256")
-                if isinstance(yield_evidence, Mapping)
-                else None
-            )
-            pool_record = next(
-                (
-                    record
-                    for record in self.decision_records()
-                    if record.get("event") == "source-yield-pool-sealed"
-                    and record.get("stage") == stage
-                    and record.get("source_id") == item["source_id"]
-                    and record.get("source_type") == source_type
-                    and record.get("candidate_pool_sha256") == pool_sha256
-                ),
-                None,
-            )
-            reason, yield_result = _source_yield_result(
-                yield_evidence,
-                source_type,
-                pool_record.get("candidate_pool") if pool_record else None,
-                pool_record.get("recorded_at") if pool_record else None,
-                starts_on=source_starts_on[source_type],
-                run_on=run_on,
-            )
-            if reason is not None:
-                return self._eligibility_stop(
-                    run_id,
-                    stage,
-                    str(item["source_id"]),
-                    reason,
-                    item.get("yield_evidence"),
-                )
-            yield_results[source_type] = cast(dict[str, object], yield_result)
-
+        # A confirmed semantic value cannot change, including one that would
+        # otherwise fail an earlier eligibility check.
         confirmation = manifest.get("confirmation")
         actual_hash = semantic_manifest_sha256(manifest)
         prior_confirmations = [
@@ -4402,40 +4511,92 @@ class StageRun:
                 record=False,
             )
 
-        if prior_confirmations and isinstance(confirmation, Mapping):
-            prior_confirmation = prior_confirmations[0]
-            confirmation_changed = any(
-                confirmation.get(field) != prior_confirmation.get(field)
-                for field in ("confirmed_by", "confirmed_at", "semantic_sha256")
+        # Source rights come first. No later gate can make an unprovable
+        # source eligible.
+        staged_form = isinstance(manifest.get("sources"), list)
+        sources = (
+            cast(list[object], manifest["sources"])
+            if staged_form
+            else [manifest.get("source")]
+        )
+        run_on = _evidence_date(self._clock()) or date.today()
+        source_records: list[Mapping[str, object]] = []
+        source_starts_on: dict[str, date] = {}
+        for item in sources:
+            if not isinstance(item, Mapping):
+                return self._stop(run_id, "source-rights-failed", stage)
+            if not (
+                item.get("source_type") in STAGE_SOURCES[stage]
+                and bool(item.get("source_id"))
+            ):
+                return self._stop(run_id, "source-rights-failed", stage)
+            item_schedule = item.get("schedule") or manifest.get("schedule")
+            starts_on = (
+                _evidence_date(item_schedule.get("starts_on"))
+                if isinstance(item_schedule, Mapping)
+                else None
             )
-            if confirmation_changed:
-                self._decision_log.append(
-                    {
-                        "event": "confirmation-change-attempted",
-                        "run_id": run_id,
-                        "semantic_sha256": actual_hash,
-                    }
-                )
-                return self._decision(
+            eligibility_reason = _source_eligibility_stop_reason(
+                item.get("eligibility_evidence"),
+                starts_on=starts_on or run_on,
+                run_on=run_on,
+            )
+            if eligibility_reason is not None:
+                return self._eligibility_stop(
                     run_id,
-                    "no-build",
-                    "confirmation-evidence-changed",
-                    stage=stage,
-                    record=False,
+                    stage,
+                    "source",
+                    str(item.get("source_id", "unknown-source")),
+                    eligibility_reason,
+                    item.get("eligibility_evidence"),
                 )
+            source_records.append(item)
+            source_starts_on[str(item["source_type"])] = starts_on or run_on
+        source_types = [str(item["source_type"]) for item in source_records]
+        if sorted(source_types) != sorted(STAGE_SOURCES[stage]):
+            return self._stop(run_id, "stage-source-incomplete", stage)
 
-        if isinstance(confirmation, Mapping) and not prior_confirmations:
-            if not confirmation.get("confirmed_by") or not confirmation.get("confirmed_at"):
-                return self._stop(run_id, "manifest-not-confirmed", stage)
-            self._decision_log.append(
-                {
-                    "event": "manifest-confirmed",
-                    "run_id": run_id,
-                    "semantic_sha256": actual_hash,
-                    "confirmed_by": confirmation["confirmed_by"],
-                    "confirmed_at": confirmation["confirmed_at"],
-                }
+        # Source yield comes after all source rights checks.
+        yield_results: dict[str, dict[str, object]] = {}
+        for item in source_records:
+            source_type = str(item["source_type"])
+            yield_evidence = item.get("yield_evidence")
+            pool_sha256 = (
+                yield_evidence.get("candidate_pool_sha256")
+                if isinstance(yield_evidence, Mapping)
+                else None
             )
+            pool_record = next(
+                (
+                    record
+                    for record in self.decision_records()
+                    if record.get("event") == "source-yield-pool-sealed"
+                    and record.get("stage") == stage
+                    and record.get("source_id") == item["source_id"]
+                    and record.get("source_type") == source_type
+                    and record.get("candidate_pool_sha256") == pool_sha256
+                ),
+                None,
+            )
+            reason, yield_result = _source_yield_result(
+                yield_evidence,
+                source_type,
+                pool_record.get("candidate_pool") if pool_record else None,
+                pool_record.get("recorded_at") if pool_record else None,
+                stage=stage,
+                starts_on=source_starts_on[source_type],
+                run_on=run_on,
+            )
+            if reason is not None:
+                return self._eligibility_stop(
+                    run_id,
+                    stage,
+                    "source",
+                    str(item["source_id"]),
+                    reason,
+                    item.get("yield_evidence"),
+                )
+            yield_results[source_type] = cast(dict[str, object], yield_result)
 
         # The data gate holds each source to its own fixed quota plan.
         for item in source_records:
@@ -4467,29 +4628,60 @@ class StageRun:
             or any(not _is_fixed_route_id(route_id) for route_id in route_ids)
         ):
             return self._stop(run_id, "route-panel-incomplete", stage)
-        eligible_routes = [
-            route
-            for route in routes
-            if isinstance(route, Mapping)
-            and bool(route.get("route_id"))
-            and all(route.get(field) is True for field in ROUTE_ELIGIBILITY_FIELDS)
-            and isinstance(route.get("evidence"), Mapping)
-            and all(
-                route["evidence"].get(field)
-                for field in ("checked_at", "account", "terms_url")
+        route_starts_on = min(source_starts_on.values(), default=run_on)
+        eligible_routes: list[Mapping[str, object]] = []
+        route_checks: dict[str, dict[str, object]] = {}
+        for item in routes:
+            route = cast(Mapping[str, object], item)
+            route_id = str(route["route_id"])
+            route_reason = _route_evidence_reason(
+                route, starts_on=route_starts_on, run_on=run_on
             )
-        ]
+            route_checks[route_id] = {
+                "evidence": copy.deepcopy(route.get("evidence")),
+                "evidence_sha256": _evidence_sha256(route.get("evidence")),
+                "eligible": route_reason is None,
+                "refusal_reason": route_reason,
+            }
+            if route_reason is None:
+                eligible_routes.append(route)
+                continue
+            if route_reason in {
+                "route-identity-unconfirmed",
+                "route-evidence-inconsistent",
+            }:
+                return self._eligibility_stop(
+                    run_id,
+                    stage,
+                    "route",
+                    route_id,
+                    route_reason,
+                    route.get("evidence"),
+                )
+            self._eligibility_refusal(
+                run_id,
+                stage,
+                "route",
+                route_id,
+                route_reason,
+                route.get("evidence"),
+            )
         if len(eligible_routes) < 3:
             return self._stop(run_id, "insufficient-eligible-routes", stage)
 
         # The free capacity of an account does not belong to one source.
         try:
             for route in eligible_routes:
+                account_evidence = cast(Mapping[str, object], route["evidence"])
                 remaining_experiment_requests = int(
                     route["remaining_experiment_requests"]
                 )
-                free_requests_remaining = int(route["free_requests_remaining"])
-                requests_per_day = int(route["requests_per_day"])
+                free_requests_remaining = int(
+                    account_evidence["observed_free_requests_remaining"]
+                )
+                requests_per_day = int(
+                    account_evidence["observed_requests_per_day"]
+                )
                 available_days = int(route["available_days"])
                 if (
                     min(
@@ -4514,12 +4706,17 @@ class StageRun:
             required_days = 0
             try:
                 for route in eligible_routes:
+                    account_evidence = cast(
+                        Mapping[str, object], route["evidence"]
+                    )
                     current_stage_requests = int(
                         requested[str(route["route_id"])]
                         if isinstance(requested, Mapping)
                         else route["current_stage_requests"]
                     )
-                    requests_per_day = int(route["requests_per_day"])
+                    requests_per_day = int(
+                        account_evidence["observed_requests_per_day"]
+                    )
                     available_days = int(route["available_days"])
                     if current_stage_requests < 0:
                         raise ValueError
@@ -4550,8 +4747,44 @@ class StageRun:
                 "available_days": schedule_days,
             }
 
+        if prior_confirmations and isinstance(confirmation, Mapping):
+            prior_confirmation = prior_confirmations[0]
+            confirmation_changed = any(
+                confirmation.get(field) != prior_confirmation.get(field)
+                for field in ("confirmed_by", "confirmed_at", "semantic_sha256")
+            )
+            if confirmation_changed:
+                self._decision_log.append(
+                    {
+                        "event": "confirmation-change-attempted",
+                        "run_id": run_id,
+                        "semantic_sha256": actual_hash,
+                    }
+                )
+                return self._decision(
+                    run_id,
+                    "no-build",
+                    "confirmation-evidence-changed",
+                    stage=stage,
+                    record=False,
+                )
+
         if not isinstance(confirmation, Mapping):
             return self._stop(run_id, "manifest-not-confirmed", stage)
+        if not prior_confirmations:
+            if not confirmation.get("confirmed_by") or not confirmation.get(
+                "confirmed_at"
+            ):
+                return self._stop(run_id, "manifest-not-confirmed", stage)
+            self._decision_log.append(
+                {
+                    "event": "manifest-confirmed",
+                    "run_id": run_id,
+                    "semantic_sha256": actual_hash,
+                    "confirmed_by": confirmation["confirmed_by"],
+                    "confirmed_at": confirmation["confirmed_at"],
+                }
+            )
 
         budget = manifest.get("budget")
         if not isinstance(budget, Mapping) or not budget.get("evidence"):
@@ -4599,8 +4832,10 @@ class StageRun:
             "sources": {
                 str(item["source_type"]): {
                     "source_id": item["source_id"],
-                    "license": item["license"],
-                    "license_sha256": _evidence_sha256(item["license"]),
+                    "eligibility_evidence": item["eligibility_evidence"],
+                    "eligibility_evidence_sha256": _evidence_sha256(
+                        item["eligibility_evidence"]
+                    ),
                     "yield": yield_results[str(item["source_type"])],
                     "planned_commitments_usd": {
                         category: _usd(amount)
@@ -4616,9 +4851,14 @@ class StageRun:
                 "inspection_complete": True,
                 "eligible_route_ids": [route["route_id"] for route in eligible_routes],
                 "evidence": {
-                    str(route["route_id"]): route["evidence"]
-                    for route in eligible_routes
+                    route_id: check["evidence"]
+                    for route_id, check in route_checks.items()
                 },
+                "evidence_sha256": {
+                    route_id: check["evidence_sha256"]
+                    for route_id, check in route_checks.items()
+                },
+                "eligibility": route_checks,
             },
             "schedule": schedule_evidence,
             "confirmation": dict(confirmation),

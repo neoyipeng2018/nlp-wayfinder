@@ -1,0 +1,13 @@
+[project]
+name = "nlp-wayfinder"
+version = "0.1.0"
+description = "Controls for a staged financial aspect classification experiment."
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "crowd-kit==1.4.2",
+    "pandas>=2.2,<3",
+    "transformers>=4.48,<5",
+]
+
+[tool.uv]
+package = false

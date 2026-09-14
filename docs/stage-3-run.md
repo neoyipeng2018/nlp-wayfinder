@@ -18,7 +18,7 @@ python3 -m nlp_wayfinder.stage_run check manifests/stage-3.initial.json \
 ```
 
 The command returns exit code `2`, decision `no-build`, and stop reason
-`source-rights-failed`.
+`source-rights-evidence-incomplete`.
 
 A Stage 3 manifest has `stage` 3 and a `sources` array. The array must hold one
 record for `earnings-calls` and one record for `financial-social-media`. A
