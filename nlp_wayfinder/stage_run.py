@@ -221,30 +221,11 @@ RIGHTS_FIELDS = (
     "weight_release_permitted",
     "text_redistribution_permitted",
 )
-SOURCE_EVIDENCE_FIELDS = (
-    "checked_at",
-    "terms_url",
-    "reviewer",
-    "access_method",
-    "data_portfolio_lane",
-)
-RIGHTS_CLAUSE_FIELDS = (
-    "primary_source_term",
-    "quoted_clause",
-    "retrieved_on",
-    "reviewer",
-    "audited_object",
-)
-AUDITED_OBJECTS = ("passage-text", "data-files", "repository")
-# A license over the repository or the data files grants no passage-text right.
-PASSAGE_TEXT_RIGHTS = (
-    "training_permitted",
-    "weight_release_permitted",
-    "text_redistribution_permitted",
-)
-DATA_PORTFOLIO_LANES = ("clean-core", "restricted-auxiliary")
-CLEAN_CORE_LANE = "clean-core"
 SOURCE_EVIDENCE_FRESHNESS_DAYS = 90
+APPROVED_OPEN_LICENSES = {
+    "CC0-1.0": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "CC-BY-4.0": "https://creativecommons.org/licenses/by/4.0/",
+}
 
 ROUTE_ELIGIBILITY_FIELDS = (
     "model_identity_verified",
@@ -444,6 +425,24 @@ def _evidence_date(value: object) -> date | None:
             return None
 
 
+def _evidence_datetime(value: object) -> datetime | None:
+    """Give one evidence timestamp in UTC."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime.combine(value, datetime.min.time(), timezone.utc)
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _is_fresh_evidence(value: object, *, starts_on: date, run_on: date) -> bool:
     """Hold one evidence date inside the freshness window and out of the future."""
     checked_on = _evidence_date(value)
@@ -455,53 +454,194 @@ def _is_fresh_evidence(value: object, *, starts_on: date, run_on: date) -> bool:
     )
 
 
-def _source_evidence_sha256(evidence: object) -> str:
-    """Return the hash of one source eligibility evidence record."""
+def _evidence_sha256(evidence: object) -> str:
+    """Return the hash of one evidence record."""
     return hashlib.sha256(_canonical_json(evidence).encode("utf-8")).hexdigest()
 
 
-def _is_complete_rights_clause(clause: object, right: str) -> bool:
-    """Hold one rights clause to its quote, its date, and its audited object."""
-    if not isinstance(clause, Mapping) or not all(
-        isinstance(clause.get(field), str) and clause[field].strip()
-        for field in RIGHTS_CLAUSE_FIELDS
-    ):
-        return False
-    audited_object = clause.get("audited_object")
-    if audited_object not in AUDITED_OBJECTS:
-        return False
-    return not (right in PASSAGE_TEXT_RIGHTS and audited_object != "passage-text")
-
-
-def _source_evidence_stop_reason(
-    evidence: object, *, starts_on: date, run_on: date
+def _open_license_stop_reason(
+    license_record: object, *, starts_on: date, run_on: date
 ) -> str | None:
-    """Give the first stop reason of one source eligibility evidence record."""
-    if not isinstance(evidence, Mapping) or not all(
-        isinstance(evidence.get(field), str) and evidence[field].strip()
-        for field in SOURCE_EVIDENCE_FIELDS
+    """Check the minimum open-license record for passage text."""
+    if not isinstance(license_record, Mapping):
+        return "source-rights-failed"
+    license_id = license_record.get("license_id")
+    if (
+        not isinstance(license_id, str)
+        or license_id not in APPROVED_OPEN_LICENSES
+        or license_record.get("license_url")
+        != APPROVED_OPEN_LICENSES[license_id]
+        or license_record.get("covers_passage_text") is not True
     ):
-        return "source-rights-evidence-incomplete"
-    clauses = evidence.get("rights_clauses")
-    if not isinstance(clauses, Mapping) or not all(
-        _is_complete_rights_clause(clauses.get(right), right)
-        for right in RIGHTS_FIELDS
-    ):
-        return "source-rights-evidence-incomplete"
-    if evidence.get("data_portfolio_lane") not in DATA_PORTFOLIO_LANES:
-        return "source-rights-evidence-incomplete"
-    dates = [evidence["checked_at"]] + [
-        cast(Mapping[str, object], clauses[right])["retrieved_on"]
-        for right in RIGHTS_FIELDS
-    ]
-    if not all(
-        _is_fresh_evidence(value, starts_on=starts_on, run_on=run_on)
-        for value in dates
+        return "source-rights-failed"
+    if not _is_fresh_evidence(
+        license_record.get("checked_at"), starts_on=starts_on, run_on=run_on
     ):
         return "source-rights-evidence-stale"
-    if evidence["data_portfolio_lane"] != CLEAN_CORE_LANE:
-        return "source-lane-restricted"
     return None
+
+
+def _sealed_yield_sample(
+    candidates: Sequence[Mapping[str, object]], order_salt: str
+) -> list[dict[str, object]]:
+    """Give one sample in its fixed candidate order."""
+    return [
+        dict(candidate)
+        for candidate in sorted(
+            candidates,
+            key=lambda item: hashlib.sha256(
+                f"{order_salt}:{item['candidate_id']}".encode("utf-8")
+            ).hexdigest(),
+        )
+    ]
+
+
+def _source_yield_result(
+    evidence: object,
+    source_type: str,
+    candidate_pool: object,
+    pool_sealed_at: object,
+    *,
+    starts_on: date,
+    run_on: date,
+) -> tuple[str | None, dict[str, object] | None]:
+    """Check one source yield record and give its calculated result."""
+    if not isinstance(evidence, Mapping):
+        return "source-yield-unproven", None
+    checked_at = evidence.get("checked_at")
+    if not _is_fresh_evidence(checked_at, starts_on=starts_on, run_on=run_on):
+        return "source-rights-evidence-stale", None
+    checked_timestamp = _evidence_datetime(checked_at)
+    sealed_timestamp = _evidence_datetime(pool_sealed_at)
+    if (
+        checked_timestamp is None
+        or sealed_timestamp is None
+        or sealed_timestamp > checked_timestamp
+    ):
+        return "source-yield-unproven", None
+    candidate_pool_size = evidence.get("candidate_pool_size")
+    declared_candidate_pool = evidence.get("candidate_pool")
+    candidate_pool_sha256 = evidence.get("candidate_pool_sha256")
+    sample_size = evidence.get("sample_size")
+    order_salt = evidence.get("order_salt")
+    sampled = evidence.get("sampled_candidates")
+    if (
+        not isinstance(candidate_pool_size, int)
+        or isinstance(candidate_pool_size, bool)
+        or candidate_pool_size < 1
+        or not isinstance(sample_size, int)
+        or isinstance(sample_size, bool)
+        or sample_size < 1
+        or sample_size > candidate_pool_size
+        or order_salt != CANDIDATE_ORDER_SALT
+        or not isinstance(candidate_pool, list)
+        or not isinstance(declared_candidate_pool, list)
+        or declared_candidate_pool != candidate_pool
+        or len(candidate_pool) != candidate_pool_size
+        or not isinstance(candidate_pool_sha256, str)
+        or candidate_pool_sha256 != _evidence_sha256(declared_candidate_pool)
+        or not isinstance(sampled, list)
+        or len(sampled) != sample_size
+    ):
+        return "source-yield-unproven", None
+
+    pool_candidates: list[Mapping[str, object]] = []
+    candidate_ids: set[str] = set()
+    for candidate in candidate_pool:
+        if not isinstance(candidate, Mapping):
+            return "source-yield-unproven", None
+        candidate_id = candidate.get("candidate_id")
+        if (
+            not isinstance(candidate_id, str)
+            or not candidate_id.strip()
+            or candidate_id in candidate_ids
+            or candidate.get("split") not in CANDIDATE_SPLITS
+        ):
+            return "source-yield-unproven", None
+        candidate_ids.add(candidate_id)
+        pool_candidates.append(candidate)
+
+    selected_pool = _sealed_yield_sample(
+        pool_candidates, cast(str, order_salt)
+    )[:sample_size]
+    sampled_by_id: dict[str, Mapping[str, object]] = {}
+    for candidate in sampled:
+        if not isinstance(candidate, Mapping):
+            return "source-yield-unproven", None
+        candidate_id = candidate.get("candidate_id")
+        if (
+            not isinstance(candidate_id, str)
+            or candidate_id in sampled_by_id
+            or candidate.get("split") not in CANDIDATE_SPLITS
+            or not isinstance(candidate.get("verified_company_target"), bool)
+        ):
+            return "source-yield-unproven", None
+        sampled_by_id[candidate_id] = candidate
+
+    if set(sampled_by_id) != {
+        cast(str, candidate["candidate_id"]) for candidate in selected_pool
+    }:
+        return "source-yield-unproven", None
+    if any(
+        sampled_by_id[cast(str, candidate["candidate_id"])]["split"]
+        != candidate["split"]
+        for candidate in selected_pool
+    ):
+        return "source-yield-unproven", None
+
+    checked_sample = [
+        {
+            "candidate_id": candidate["candidate_id"],
+            "split": candidate["split"],
+            "verified_company_target": sampled_by_id[
+                cast(str, candidate["candidate_id"])
+            ]["verified_company_target"],
+        }
+        for candidate in selected_pool
+    ]
+    verified = [
+        candidate
+        for candidate in checked_sample
+        if candidate["verified_company_target"] is True
+    ]
+    verified_count = len(verified)
+    targets = SOURCE_ALLOCATION_TARGETS[source_type]
+    total_allocation = sum(targets.values())
+    projected_company_targets = (
+        candidate_pool_size * verified_count // sample_size
+    )
+    verified_by_split = {
+        split: sum(1 for item in verified if item["split"] == split)
+        for split in CANDIDATE_SPLITS
+    }
+    projected_by_split = {
+        split: candidate_pool_size * verified_by_split[split] // sample_size
+        for split in CANDIDATE_SPLITS
+    }
+    projected_inspection_count = (
+        (total_allocation * sample_size + verified_count - 1) // verified_count
+        if verified_count
+        else None
+    )
+    result: dict[str, object] = {
+        "evidence": copy.deepcopy(dict(evidence)),
+        "evidence_sha256": _evidence_sha256(evidence),
+        "checked_sample": checked_sample,
+        "verified_company_targets": verified_count,
+        "verified_by_split": verified_by_split,
+        "projected_company_targets": projected_company_targets,
+        "projected_by_split": projected_by_split,
+        "projected_inspection_count": projected_inspection_count,
+    }
+    limit = SOURCE_SILVER_CANDIDATE_LIMITS[source_type]
+    if (
+        projected_company_targets < total_allocation
+        or any(projected_by_split[split] < targets[split] for split in targets)
+        or projected_inspection_count is None
+        or projected_inspection_count > limit
+    ):
+        return "source-yield-unproven", result
+    return None, result
 
 
 def _prediction_file_stage(record: Mapping[str, object]) -> int:
@@ -2243,6 +2383,68 @@ class StageRun:
 
     def specialist_records(self) -> list[dict[str, Any]]:
         return self._specialist_log.read()
+
+    def seal_source_yield_pool(
+        self, pool_manifest: Mapping[str, object], sealed_by: str
+    ) -> dict[str, Any]:
+        """Keep one candidate pool before its yield sample is inspected."""
+        stage = pool_manifest.get("stage")
+        source_type = pool_manifest.get("source_type")
+        source_id = pool_manifest.get("source_id")
+        candidate_pool_size = pool_manifest.get("candidate_pool_size")
+        candidate_pool = pool_manifest.get("candidate_pool")
+        if (
+            not sealed_by.strip()
+            or stage not in STAGE_SOURCES
+            or source_type not in STAGE_SOURCES[cast(int, stage)]
+            or not isinstance(source_id, str)
+            or not source_id.strip()
+            or pool_manifest.get("order_salt") != CANDIDATE_ORDER_SALT
+            or not isinstance(candidate_pool_size, int)
+            or isinstance(candidate_pool_size, bool)
+            or candidate_pool_size < 1
+            or not isinstance(candidate_pool, list)
+            or len(candidate_pool) != candidate_pool_size
+        ):
+            raise ValueError("source-yield-pool-invalid")
+        candidate_ids: set[str] = set()
+        for candidate in candidate_pool:
+            if not isinstance(candidate, Mapping):
+                raise ValueError("source-yield-pool-invalid")
+            candidate_id = candidate.get("candidate_id")
+            if (
+                not isinstance(candidate_id, str)
+                or not candidate_id.strip()
+                or candidate_id in candidate_ids
+                or candidate.get("split") not in CANDIDATE_SPLITS
+            ):
+                raise ValueError("source-yield-pool-invalid")
+            candidate_ids.add(candidate_id)
+        pool_sha256 = _evidence_sha256(candidate_pool)
+        matches = [
+            record
+            for record in self.decision_records()
+            if record.get("event") == "source-yield-pool-sealed"
+            and record.get("stage") == stage
+            and record.get("source_id") == source_id
+        ]
+        if matches:
+            if matches[0].get("candidate_pool_sha256") != pool_sha256:
+                raise AuditLogError("The source yield pool is already sealed.")
+            return matches[0]
+        return self._decision_log.append(
+            {
+                "event": "source-yield-pool-sealed",
+                "stage": stage,
+                "source_id": source_id,
+                "source_type": source_type,
+                "candidate_pool_size": candidate_pool_size,
+                "candidate_pool_sha256": pool_sha256,
+                "order_salt": CANDIDATE_ORDER_SALT,
+                "candidate_pool": candidate_pool,
+                "sealed_by": sealed_by,
+            }
+        )
 
     def _retain_raw_body(self, raw_body: bytes) -> tuple[str, str]:
         """Keep the response bytes under their own hash and return the pointer."""
@@ -4069,7 +4271,7 @@ class StageRun:
                 "stage": stage,
                 "source_id": source_id,
                 "stop_reason": reason,
-                "evidence_sha256": _source_evidence_sha256(evidence),
+                "evidence_sha256": _evidence_sha256(evidence),
             }
         )
         return self._decision(
@@ -4097,14 +4299,13 @@ class StageRun:
         )
         run_on = _evidence_date(self._clock()) or date.today()
         source_records: list[Mapping[str, object]] = []
+        source_starts_on: dict[str, date] = {}
         for item in sources:
             if not isinstance(item, Mapping):
                 return self._stop(run_id, "source-rights-failed", stage)
-            item_evidence = item.get("evidence")
             if not (
                 item.get("source_type") in STAGE_SOURCES[stage]
                 and bool(item.get("source_id"))
-                and all(item.get(field) is True for field in RIGHTS_FIELDS)
             ):
                 return self._stop(run_id, "source-rights-failed", stage)
             item_schedule = item.get("schedule") or manifest.get("schedule")
@@ -4113,17 +4314,56 @@ class StageRun:
                 if isinstance(item_schedule, Mapping)
                 else None
             )
-            reason = _source_evidence_stop_reason(
-                item_evidence, starts_on=starts_on or run_on, run_on=run_on
+            license_reason = _open_license_stop_reason(
+                item.get("license"), starts_on=starts_on or run_on, run_on=run_on
             )
-            if reason is not None:
-                return self._eligibility_stop(
-                    run_id, stage, str(item["source_id"]), reason, item_evidence
-                )
+            if license_reason is not None:
+                return self._stop(run_id, license_reason, stage)
             source_records.append(item)
+            source_starts_on[str(item["source_type"])] = starts_on or run_on
         source_types = [str(item["source_type"]) for item in source_records]
         if sorted(source_types) != sorted(STAGE_SOURCES[stage]):
             return self._stop(run_id, "stage-source-incomplete", stage)
+
+        # Source yield comes after all source rights checks.
+        yield_results: dict[str, dict[str, object]] = {}
+        for item in source_records:
+            source_type = str(item["source_type"])
+            yield_evidence = item.get("yield_evidence")
+            pool_sha256 = (
+                yield_evidence.get("candidate_pool_sha256")
+                if isinstance(yield_evidence, Mapping)
+                else None
+            )
+            pool_record = next(
+                (
+                    record
+                    for record in self.decision_records()
+                    if record.get("event") == "source-yield-pool-sealed"
+                    and record.get("stage") == stage
+                    and record.get("source_id") == item["source_id"]
+                    and record.get("source_type") == source_type
+                    and record.get("candidate_pool_sha256") == pool_sha256
+                ),
+                None,
+            )
+            reason, yield_result = _source_yield_result(
+                yield_evidence,
+                source_type,
+                pool_record.get("candidate_pool") if pool_record else None,
+                pool_record.get("recorded_at") if pool_record else None,
+                starts_on=source_starts_on[source_type],
+                run_on=run_on,
+            )
+            if reason is not None:
+                return self._eligibility_stop(
+                    run_id,
+                    stage,
+                    str(item["source_id"]),
+                    reason,
+                    item.get("yield_evidence"),
+                )
+            yield_results[source_type] = cast(dict[str, object], yield_result)
 
         confirmation = manifest.get("confirmation")
         actual_hash = semantic_manifest_sha256(manifest)
@@ -4359,11 +4599,9 @@ class StageRun:
             "sources": {
                 str(item["source_type"]): {
                     "source_id": item["source_id"],
-                    "rights": {field: item[field] for field in RIGHTS_FIELDS},
-                    "evidence": item["evidence"],
-                    "evidence_sha256": _source_evidence_sha256(
-                        cast(Mapping[str, object], item["evidence"])
-                    ),
+                    "license": item["license"],
+                    "license_sha256": _evidence_sha256(item["license"]),
+                    "yield": yield_results[str(item["source_type"])],
                     "planned_commitments_usd": {
                         category: _usd(amount)
                         for category, amount in planned_by_source[
@@ -4447,6 +4685,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     check.add_argument("manifest")
     check.add_argument("--state-dir", required=True)
+
+    seal_yield_pool = commands.add_parser(
+        "seal-yield-pool", help="Seal one source pool before yield inspection."
+    )
+    seal_yield_pool.add_argument("manifest")
+    seal_yield_pool.add_argument("--sealed-by", required=True)
+    seal_yield_pool.add_argument("--state-dir", required=True)
 
     confirm = commands.add_parser("confirm", help="Confirm the current manifest.")
     confirm.add_argument("manifest")
@@ -4535,6 +4780,17 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     try:
+        if args.command == "seal-yield-pool":
+            record = StageRun(args.state_dir).seal_source_yield_pool(
+                _read_manifest(args.manifest), args.sealed_by
+            )
+            _write_json(
+                {
+                    "source_yield_pool": "sealed",
+                    "candidate_pool_sha256": record["candidate_pool_sha256"],
+                }
+            )
+            return 0
         if args.command == "admit-example":
             result = admit_example(
                 _read_manifest(args.example), load_modernbert_tokenizer()

@@ -22,7 +22,6 @@ from nlp_wayfinder.stage_run import (
     MAX_EXAMPLE_TOKENS,
     MODERNBERT_MODEL_ID,
     MODERNBERT_REVISION,
-    PASSAGE_TEXT_RIGHTS,
     SILVER_CALIBRATION_FOLDS,
     SILVER_MIN_PROBABILITY,
     SOURCE_ALLOCATION_TARGETS,
@@ -46,7 +45,6 @@ from nlp_wayfinder.stage_run import (
     project_gpt_blind_cost,
     project_specialist_training_cost,
     _calibration_fold,
-    _source_evidence_sha256,
     _silver_rejection,
     candidate_order_sha256,
     cumulative_sources,
@@ -244,44 +242,113 @@ def route(route_id: str) -> dict[str, object]:
     }
 
 
-def rights_clause(
-    right: str,
-    *,
-    audited_object: str | None = None,
-    retrieved_on: str = "2026-09-10",
-) -> dict[str, object]:
-    """Give one complete rights clause record."""
-    return {
-        "primary_source_term": f"{right} clause of the published terms",
-        "quoted_clause": (
-            f"The licensor grants {right.replace('_', ' ')} for the passage text."
-        ),
-        "retrieved_on": retrieved_on,
-        "reviewer": "fixture-reviewer",
-        "audited_object": audited_object
-        or ("passage-text" if right in PASSAGE_TEXT_RIGHTS else "data-files"),
-    }
-
-
-def source_evidence(
+def source_yield_evidence(
     source_type: str,
     *,
     checked_at: str = "2026-09-10",
-    retrieved_on: str = "2026-09-10",
-    lane: str = "clean-core",
+    candidate_pool_size: int | None = None,
+    sample_size: int = 100,
+    verified_by_split: Mapping[str, int] | None = None,
 ) -> dict[str, object]:
-    """Give one complete source eligibility evidence record."""
-    return {
-        "checked_at": checked_at,
-        "terms_url": f"https://example.test/{source_type}-terms",
-        "reviewer": "fixture-reviewer",
-        "access_method": "Fixed export under the published terms.",
-        "data_portfolio_lane": lane,
-        "rights_clauses": {
-            right: rights_clause(right, retrieved_on=retrieved_on)
-            for right in RIGHTS_FIELDS
-        },
+    """Give one deterministic yield sample for a source."""
+    checked_timestamp = (
+        checked_at if "T" in checked_at else f"{checked_at}T01:00:00Z"
+    )
+    pool_size = (
+        SOURCE_SILVER_CANDIDATE_LIMITS[source_type]
+        if candidate_pool_size is None
+        else candidate_pool_size
+    )
+    order_salt = "20260905"
+    verified_by_split = verified_by_split or {
+        "training": 61,
+        "development": 4 if source_type == "financial-news" else 7,
+        "blind": 7 if source_type == "financial-news" else 13,
     }
+    candidate_pool = [
+        {"candidate_id": f"pool-{index:05d}", "split": "training"}
+        for index in range(pool_size)
+    ]
+    selected = sorted(
+        candidate_pool,
+        key=lambda item: hashlib.sha256(
+            f"{order_salt}:{item['candidate_id']}".encode("utf-8")
+        ).hexdigest(),
+    )[:sample_size]
+    split_values = [
+        split
+        for split, count in verified_by_split.items()
+        for _ in range(count)
+    ]
+    split_values.extend("training" for _ in range(sample_size - len(split_values)))
+    candidates = []
+    for index, candidate in enumerate(selected):
+        candidate["split"] = split_values[index]
+        candidates.append(
+            {
+                **candidate,
+                "verified_company_target": index < sum(verified_by_split.values()),
+            }
+        )
+    pool_sha256 = hashlib.sha256(
+        json.dumps(
+            candidate_pool,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "checked_at": checked_timestamp,
+        "candidate_pool_size": pool_size,
+        "candidate_pool": candidate_pool,
+        "candidate_pool_sha256": pool_sha256,
+        "sample_size": sample_size,
+        "order_salt": order_salt,
+        "sampled_candidates": candidates,
+    }
+
+
+def source_license(*, checked_at: str = "2026-09-10") -> dict[str, object]:
+    """Give one approved open license for passage text."""
+    return {
+        "license_id": "CC-BY-4.0",
+        "license_url": "https://creativecommons.org/licenses/by/4.0/",
+        "covers_passage_text": True,
+        "checked_at": checked_at,
+    }
+
+
+def seal_source_yield_pools(
+    runner: StageRun,
+    manifest: Mapping[str, object],
+    *,
+    sealed_at: str = "2026-09-10T00:00:00Z",
+) -> None:
+    """Seal each source pool before its yield sample is checked."""
+    sealer = StageRun(runner.state_dir, clock=lambda: sealed_at)
+    stage = cast(int, manifest["stage"])
+    sources = manifest.get("sources")
+    source_records = (
+        cast(list[dict[str, Any]], sources)
+        if isinstance(sources, list)
+        else [cast(dict[str, Any], manifest["source"])]
+    )
+    for source in source_records:
+        if source.get("source_type") not in STAGE_SOURCES[stage]:
+            continue
+        evidence = cast(dict[str, Any], source["yield_evidence"])
+        sealer.seal_source_yield_pool(
+            {
+                "stage": stage,
+                "source_id": source["source_id"],
+                "source_type": source["source_type"],
+                "candidate_pool_size": evidence["candidate_pool_size"],
+                "candidate_pool": evidence["candidate_pool"],
+                "order_salt": evidence["order_salt"],
+            },
+            "fixture-owner",
+        )
 
 
 def draft_manifest() -> dict[str, object]:
@@ -292,12 +359,8 @@ def draft_manifest() -> dict[str, object]:
         "source": {
             "source_id": "financial-news-fixture",
             "source_type": "financial-news",
-            "access_permitted": True,
-            "private_evaluation_permitted": True,
-            "training_permitted": True,
-            "weight_release_permitted": True,
-            "text_redistribution_permitted": True,
-            "evidence": source_evidence("financial-news"),
+            "license": source_license(),
+            "yield_evidence": source_yield_evidence("financial-news"),
         },
         "route_panel": {
             "inspection_complete": True,
@@ -505,9 +568,14 @@ class StageRunTests(unittest.TestCase):
             clock=lambda: "2026-09-10T00:00:00Z",
         )
 
+    def evaluate(self, manifest: Mapping[str, object]) -> dict[str, object]:
+        seal_source_yield_pools(self.runner, manifest)
+        return self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+
     def test_failed_source_right_stops_before_any_external_action(self) -> None:
         manifest = draft_manifest()
-        manifest["source"]["training_permitted"] = False  # type: ignore[index]
+        source = cast(dict[str, Any], manifest["source"])
+        source["license"]["covers_passage_text"] = False
 
         decision = self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
 
@@ -520,7 +588,7 @@ class StageRunTests(unittest.TestCase):
         manifest = draft_manifest()
         manifest["route_panel"]["routes"][0]["training_use_permitted"] = False  # type: ignore[index]
 
-        decision = self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+        decision = self.evaluate(manifest)
 
         self.assertEqual("no-build", decision["decision"])
         self.assertEqual("insufficient-eligible-routes", decision["stop_reason"])
@@ -533,15 +601,13 @@ class StageRunTests(unittest.TestCase):
         gpt_route["non_gpt_verified"] = False
         manifest["route_panel"]["routes"].append(gpt_route)  # type: ignore[index]
 
-        decision = self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+        decision = self.evaluate(manifest)
 
         self.assertEqual("no-build", decision["decision"])
         self.assertEqual("insufficient-eligible-routes", decision["stop_reason"])
 
     def test_valid_preflight_records_all_gate_evidence(self) -> None:
-        decision = self.runner.evaluate(
-            confirm_manifest(draft_manifest(), "fixture-owner")
-        )
+        decision = self.evaluate(draft_manifest())
 
         self.assertEqual("build-eligible", decision["decision"])
         self.assertIsNone(decision["stop_reason"])
@@ -563,7 +629,7 @@ class StageRunTests(unittest.TestCase):
         extra_route["current_stage_requests"] = 500
         manifest["route_panel"]["routes"].append(extra_route)  # type: ignore[index]
 
-        decision = self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+        decision = self.evaluate(manifest)
 
         evidence = cast(dict[str, Any], decision["evidence"])
         self.assertEqual("build-eligible", decision["decision"])
@@ -576,18 +642,19 @@ class StageRunTests(unittest.TestCase):
         manifest = draft_manifest()
         manifest["schedule"]["must_finish_by"] = "2026-09-19"  # type: ignore[index]
 
-        decision = self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+        decision = self.evaluate(manifest)
 
         self.assertEqual("no-build", decision["decision"])
         self.assertEqual("route-schedule-infeasible", decision["stop_reason"])
 
     def test_semantic_change_stops_and_appends_a_decision_record(self) -> None:
         manifest = confirm_manifest(draft_manifest(), "fixture-owner")
+        seal_source_yield_pools(self.runner, manifest)
         first = self.runner.evaluate(manifest)
         log_path = self.state_dir / "decision-log.jsonl"
         original_log = log_path.read_text(encoding="utf-8")
         changed = copy.deepcopy(manifest)
-        changed["source"]["source_id"] = "changed-source"  # type: ignore[index]
+        changed["budget"]["evidence"] = "changed budget"  # type: ignore[index]
 
         second = self.runner.evaluate(changed)
 
@@ -601,6 +668,7 @@ class StageRunTests(unittest.TestCase):
 
     def test_confirmation_evidence_cannot_change_after_it_is_recorded(self) -> None:
         manifest = confirm_manifest(draft_manifest(), "fixture-owner")
+        seal_source_yield_pools(self.runner, manifest)
         self.runner.evaluate(manifest)
         changed = copy.deepcopy(manifest)
         changed["confirmation"]["confirmed_by"] = "different-owner"  # type: ignore[index]
@@ -1433,6 +1501,7 @@ class VoteCollectionTests(unittest.TestCase):
             self.state_dir,
             clock=lambda: "2026-09-12T00:00:00Z",
         )
+        seal_source_yield_pools(self.runner, draft_manifest())
 
     def vote_inputs(
         self,
@@ -1583,6 +1652,7 @@ class VoteCollectionTests(unittest.TestCase):
                         clock=lambda: "2026-09-12T00:00:00Z",
                     )
                     stage_manifest, candidates, allocation = self.vote_inputs()
+                    seal_source_yield_pools(runner, stage_manifest)
 
                     result = runner.collect_votes(
                         stage_manifest,
@@ -1697,6 +1767,7 @@ class VoteCollectionTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as state_dir:
                     runner = StageRun(state_dir, clock=lambda: "2026-09-12T00:00:00Z")
                     stage_manifest, candidates, allocation = self.vote_inputs()
+                    seal_source_yield_pools(runner, stage_manifest)
                     transport = SequenceVoteTransport(first_response)
 
                     runner.collect_votes(
@@ -1739,7 +1810,10 @@ class VoteCollectionTests(unittest.TestCase):
                     manifest["route_panel"]["routes"].append(  # type: ignore[index]
                         route(invalid_route_id)
                     )
-                    runner = StageRun(state_dir)
+                    runner = StageRun(
+                        state_dir, clock=lambda: "2026-09-10T00:00:00Z"
+                    )
+                    seal_source_yield_pools(runner, manifest)
 
                     decision = runner.evaluate(
                         confirm_manifest(manifest, "fixture-owner")
@@ -1765,6 +1839,7 @@ class VoteCollectionTests(unittest.TestCase):
                         state_dir, clock=lambda: "2026-09-12T00:00:00Z"
                     )
                     stage_manifest, candidates, allocation = self.vote_inputs()
+                    seal_source_yield_pools(runner, stage_manifest)
                     headers = dict(response.headers)
                     headers.update(changed_headers)
 
@@ -2138,6 +2213,7 @@ class VoteCollectionTests(unittest.TestCase):
                         state_dir, clock=lambda: "2026-09-12T00:00:00Z"
                     )
                     stage_manifest, candidates, allocation = self.vote_inputs()
+                    seal_source_yield_pools(runner, stage_manifest)
 
                     runner.collect_votes(
                         stage_manifest,
@@ -2166,6 +2242,7 @@ class VoteCollectionTests(unittest.TestCase):
                         state_dir, clock=lambda: "2026-09-12T00:00:00Z"
                     )
                     stage_manifest, candidates, allocation = self.vote_inputs()
+                    seal_source_yield_pools(runner, stage_manifest)
                     content = vote_content(
                         SILVER_PASSAGE,
                         label=label,
@@ -2202,6 +2279,7 @@ class SilverAggregationTests(unittest.TestCase):
             clock=lambda: "2026-09-12T00:00:00Z",
         )
         self.stage_manifest = confirm_manifest(draft_manifest(), "fixture-owner")
+        seal_source_yield_pools(self.runner, self.stage_manifest)
         self.candidates = seal_candidate_manifest(
             candidate_manifest(), "fixture-owner"
         )
@@ -2295,6 +2373,7 @@ class SilverAggregationTests(unittest.TestCase):
                 self.runner = StageRun(
                     Path(state_dir), clock=lambda: "2026-09-12T00:00:00Z"
                 )
+                seal_source_yield_pools(self.runner, self.stage_manifest)
                 self.add_development_votes(confidence_band=band)
                 self.add_votes(
                     "silver-1",
@@ -2554,6 +2633,7 @@ class GptBlindPredictionTests(unittest.TestCase):
             self.state_dir,
             clock=lambda: "2026-09-12T00:00:00Z",
         )
+        seal_source_yield_pools(self.runner, draft_manifest())
         self.delays: list[float] = []
 
     def forecast(self, **changes: object) -> dict[str, object]:
@@ -2817,6 +2897,7 @@ class GptBlindPredictionTests(unittest.TestCase):
                     self.runner = StageRun(
                         state_dir, clock=lambda: "2026-09-12T00:00:00Z"
                     )
+                    seal_source_yield_pools(self.runner, draft_manifest())
                     self.delays = []
                     transport = GptTransport(failures=[failure])
 
@@ -2860,6 +2941,7 @@ class GptBlindPredictionTests(unittest.TestCase):
                     self.runner = StageRun(
                         state_dir, clock=lambda: "2026-09-12T00:00:00Z"
                     )
+                    seal_source_yield_pools(self.runner, draft_manifest())
                     transport = GptTransport(failures=[response])
 
                     result = self.predict(transport)
@@ -2884,6 +2966,7 @@ class GptBlindPredictionTests(unittest.TestCase):
                     self.runner = StageRun(
                         state_dir, clock=lambda: "2026-09-12T00:00:00Z"
                     )
+                    seal_source_yield_pools(self.runner, draft_manifest())
                     response = gpt_response()
                     headers = dict(response.headers)
                     headers[header] = value
@@ -2938,6 +3021,8 @@ class GptBlindPredictionTests(unittest.TestCase):
 
     def test_the_cli_seals_one_prediction_file(self) -> None:
         stage_manifest, candidates, allocation = self.gpt_inputs()
+        cli_state_dir = self.state_dir / "cli-state"
+        seal_source_yield_pools(StageRun(cli_state_dir), stage_manifest)
         paths = {}
         for name, value in (
             ("stage.json", stage_manifest),
@@ -2964,7 +3049,7 @@ class GptBlindPredictionTests(unittest.TestCase):
                     "--output",
                     str(output),
                     "--state-dir",
-                    str(self.state_dir / "cli-state"),
+                    str(cli_state_dir),
                 ]
             )
 
@@ -3042,6 +3127,7 @@ class SpecialistTrainingTests(unittest.TestCase):
         self.runner = StageRun(
             Path(self.temp_dir.name), clock=lambda: "2026-09-12T00:00:00Z"
         )
+        seal_source_yield_pools(self.runner, draft_manifest())
 
     def m3_check(self, **changes: object) -> dict[str, object]:
         declared: dict[str, object] = {
@@ -3627,6 +3713,7 @@ class Stage1ReportTests(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.state_dir = Path(self.temp_dir.name)
         self.runner = StageRun(self.state_dir, clock=lambda: "2026-09-12T00:00:00Z")
+        seal_source_yield_pools(self.runner, draft_manifest())
         self.delays: list[float] = []
         self.reference = {
             f"blind-{index:02d}": RESULT_LABELS[index % 4]
@@ -4003,17 +4090,14 @@ class Stage1ReportTests(unittest.TestCase):
         )
 
 
-STAGE_2_RIGHTS = {field: True for field in RIGHTS_FIELDS}
-
-
 def stage_source(source_type: str) -> dict[str, object]:
     """Give the complete gate record of one later-stage source."""
     return {
         "source_id": f"{source_type}-fixture",
         "source_type": source_type,
-        **STAGE_2_RIGHTS,
-        "evidence": source_evidence(
-            source_type, checked_at="2026-09-28", retrieved_on="2026-09-28"
+        "license": source_license(checked_at="2026-09-28"),
+        "yield_evidence": source_yield_evidence(
+            source_type, checked_at="2026-09-28"
         ),
         "data_plan": {
             "silver_candidate_limit": SOURCE_SILVER_CANDIDATE_LIMITS[source_type],
@@ -4064,6 +4148,7 @@ class StageTwoGateTests(unittest.TestCase):
         )
 
     def evaluate(self, manifest: Mapping[str, object]) -> dict[str, object]:
+        seal_source_yield_pools(self.runner, manifest)
         return self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
 
     def test_both_new_sources_pass_their_own_gate(self) -> None:
@@ -4085,9 +4170,8 @@ class StageTwoGateTests(unittest.TestCase):
 
     def test_a_failed_right_of_one_source_stops_the_stage(self) -> None:
         manifest = draft_stage_2_manifest()
-        cast(list[dict[str, object]], manifest["sources"])[1][
-            "training_permitted"
-        ] = False
+        source = cast(list[dict[str, Any]], manifest["sources"])[1]
+        source["license"]["covers_passage_text"] = False
 
         decision = self.evaluate(manifest)
 
@@ -4252,6 +4336,8 @@ class StageTwoCumulativeTests(unittest.TestCase):
                 for stage in range(2, self.stage + 1)
             },
         }
+        for manifest in self.stage_manifests.values():
+            seal_source_yield_pools(self.runner, manifest)
         self.sources = list(cumulative_sources(self.stage))
         self.reference: dict[str, dict[str, str]] = {}
         self.fixtures: dict[str, tuple[dict[str, object], ...]] = {}
@@ -4563,6 +4649,7 @@ class StageThreeGateTests(unittest.TestCase):
         )
 
     def evaluate(self, manifest: Mapping[str, object]) -> dict[str, object]:
+        seal_source_yield_pools(self.runner, manifest)
         return self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
 
     def test_both_final_sources_pass_their_own_gate(self) -> None:
@@ -4594,9 +4681,8 @@ class StageThreeGateTests(unittest.TestCase):
 
     def test_a_failed_right_of_one_final_source_stops_the_stage(self) -> None:
         manifest = draft_stage_manifest(3)
-        cast(list[dict[str, object]], manifest["sources"])[1][
-            "weight_release_permitted"
-        ] = False
+        source = cast(list[dict[str, Any]], manifest["sources"])[1]
+        source["license"]["covers_passage_text"] = False
 
         decision = self.evaluate(manifest)
 
@@ -4648,7 +4734,7 @@ class StageThreeCumulativeTests(StageTwoCumulativeTests):
 
 
 class SourceEligibilityTests(unittest.TestCase):
-    """Another person can check the rights evidence of each source."""
+    """Each source uses one approved open license for passage text."""
 
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -4657,95 +4743,63 @@ class SourceEligibilityTests(unittest.TestCase):
         self.runner = StageRun(self.state_dir, clock=lambda: "2026-09-10T00:00:00Z")
 
     def evaluate(self, manifest: Mapping[str, object]) -> dict[str, object]:
+        seal_source_yield_pools(self.runner, manifest)
         return self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
 
     def source_of(self, manifest: Mapping[str, object]) -> dict[str, Any]:
         return cast(dict[str, Any], manifest["source"])
 
-    def evidence_of(self, manifest: Mapping[str, object]) -> dict[str, Any]:
-        return cast(dict[str, Any], self.source_of(manifest)["evidence"])
+    def license_of(self, manifest: Mapping[str, object]) -> dict[str, Any]:
+        return cast(dict[str, Any], self.source_of(manifest)["license"])
 
-    def test_complete_current_clause_records_return_build_eligible(self) -> None:
+    def test_an_approved_open_license_returns_build_eligible(self) -> None:
         decision = self.evaluate(draft_manifest())
 
         self.assertEqual("build-eligible", decision["decision"])
         evidence = cast(dict[str, Any], decision["evidence"])
         source = evidence["sources"]["financial-news"]
-        self.assertEqual(
-            set(RIGHTS_FIELDS), set(source["evidence"]["rights_clauses"])
-        )
-        self.assertEqual("clean-core", source["evidence"]["data_portfolio_lane"])
-        self.assertEqual(
-            _source_evidence_sha256(source["evidence"]), source["evidence_sha256"]
-        )
+        self.assertEqual("CC-BY-4.0", source["license"]["license_id"])
+        self.assertTrue(source["license"]["covers_passage_text"])
 
-    def test_a_right_without_its_clause_record_stops_the_stage(self) -> None:
+    def test_an_unapproved_open_license_stops_the_stage(self) -> None:
         manifest = draft_manifest()
-        del self.evidence_of(manifest)["rights_clauses"]["training_permitted"][
-            "quoted_clause"
-        ]
+        self.license_of(manifest)["license_id"] = "custom-license"
 
         decision = self.evaluate(manifest)
 
-        self.assertEqual("no-build", decision["decision"])
-        self.assertEqual(
-            "source-rights-evidence-incomplete", decision["stop_reason"]
-        )
+        self.assertEqual("source-rights-failed", decision["stop_reason"])
 
-    def test_a_source_without_an_evidence_record_stops_the_stage(self) -> None:
+    def test_a_non_text_license_id_stops_the_stage(self) -> None:
         manifest = draft_manifest()
-        self.source_of(manifest)["evidence"] = None
+        self.license_of(manifest)["license_id"] = []
 
         decision = self.evaluate(manifest)
 
-        self.assertEqual(
-            "source-rights-evidence-incomplete", decision["stop_reason"]
-        )
-        records = self.runner.decision_records()
-        self.assertEqual(1, len(records))
-        self.assertEqual(
-            _source_evidence_sha256(None), records[0]["evidence_sha256"]
-        )
+        self.assertEqual("source-rights-failed", decision["stop_reason"])
 
-    def test_clause_text_fields_must_contain_text(self) -> None:
+    def test_the_license_must_cover_passage_text(self) -> None:
         manifest = draft_manifest()
-        self.evidence_of(manifest)["rights_clauses"]["access_permitted"][
-            "quoted_clause"
-        ] = True
+        self.license_of(manifest)["covers_passage_text"] = False
 
         decision = self.evaluate(manifest)
 
-        self.assertEqual(
-            "source-rights-evidence-incomplete", decision["stop_reason"]
-        )
+        self.assertEqual("source-rights-failed", decision["stop_reason"])
 
-    def test_one_missing_clause_record_of_five_stops_the_stage(self) -> None:
+    def test_a_missing_license_url_stops_the_stage(self) -> None:
         manifest = draft_manifest()
-        clauses = self.evidence_of(manifest)["rights_clauses"]
-        del clauses["text_redistribution_permitted"]
+        self.license_of(manifest)["license_url"] = ""
 
         decision = self.evaluate(manifest)
 
-        self.assertEqual(4, len(clauses))
-        self.assertEqual(
-            "source-rights-evidence-incomplete", decision["stop_reason"]
-        )
+        self.assertEqual("source-rights-failed", decision["stop_reason"])
 
-    def test_a_repository_clause_cannot_support_a_passage_text_right(self) -> None:
-        for right in PASSAGE_TEXT_RIGHTS:
-            for audited_object in ("repository", "data-files"):
-                with self.subTest(right=right, audited_object=audited_object):
-                    manifest = draft_manifest()
-                    self.evidence_of(manifest)["rights_clauses"][right] = (
-                        rights_clause(right, audited_object=audited_object)
-                    )
+    def test_the_license_url_must_match_the_approved_license(self) -> None:
+        manifest = draft_manifest()
+        self.license_of(manifest)["license_url"] = "https://example.test/license"
 
-                    decision = self.evaluate(manifest)
+        decision = self.evaluate(manifest)
 
-                    self.assertEqual(
-                        "source-rights-evidence-incomplete",
-                        decision["stop_reason"],
-                    )
+        self.assertEqual("source-rights-failed", decision["stop_reason"])
 
     def test_the_freshness_window_holds_exactly_ninety_days(self) -> None:
         starts_on = date.fromisoformat("2026-09-14")
@@ -4758,9 +4812,10 @@ class SourceEligibilityTests(unittest.TestCase):
                     clock=lambda: "2026-09-10T00:00:00Z",
                 )
                 manifest = draft_manifest()
-                self.evidence_of(manifest)["checked_at"] = (
+                self.license_of(manifest)["checked_at"] = (
                     fresh - timedelta(days=offset)
                 ).isoformat()
+                seal_source_yield_pools(runner, manifest)
 
                 decision = runner.evaluate(
                     confirm_manifest(manifest, "fixture-owner")
@@ -4772,91 +4827,39 @@ class SourceEligibilityTests(unittest.TestCase):
                         "source-rights-evidence-stale", decision["stop_reason"]
                     )
 
-    def test_evidence_older_than_the_window_stops_the_stage(self) -> None:
+    def test_a_future_license_check_stops_the_stage(self) -> None:
         manifest = draft_manifest()
-        self.evidence_of(manifest)["checked_at"] = "2026-01-02"
+        self.license_of(manifest)["checked_at"] = "2026-09-11"
 
         decision = self.evaluate(manifest)
 
         self.assertEqual("source-rights-evidence-stale", decision["stop_reason"])
-
-    def test_evidence_dated_after_the_run_date_stops_the_stage(self) -> None:
-        manifest = draft_manifest()
-        self.evidence_of(manifest)["checked_at"] = "2026-09-11"
-
-        decision = self.evaluate(manifest)
-
-        self.assertEqual("source-rights-evidence-stale", decision["stop_reason"])
-
-    def test_a_malformed_timestamp_stops_the_stage(self) -> None:
-        manifest = draft_manifest()
-        self.evidence_of(manifest)["checked_at"] = "2026-09-10-not-a-time"
-
-        decision = self.evaluate(manifest)
-
-        self.assertEqual("source-rights-evidence-stale", decision["stop_reason"])
-
-    def test_a_stale_clause_retrieval_date_stops_the_stage(self) -> None:
-        manifest = draft_manifest()
-        self.evidence_of(manifest)["rights_clauses"]["access_permitted"][
-            "retrieved_on"
-        ] = "2026-01-02"
-
-        decision = self.evaluate(manifest)
-
-        self.assertEqual("source-rights-evidence-stale", decision["stop_reason"])
-
-    def test_a_restricted_auxiliary_lane_stops_the_stage(self) -> None:
-        manifest = draft_manifest()
-        self.evidence_of(manifest)["data_portfolio_lane"] = "restricted-auxiliary"
-
-        decision = self.evaluate(manifest)
-
-        self.assertEqual("source-lane-restricted", decision["stop_reason"])
-
-    def test_one_eligibility_stop_appends_one_decision_record(self) -> None:
-        manifest = draft_manifest()
-        self.evidence_of(manifest)["data_portfolio_lane"] = "restricted-auxiliary"
-
-        decision = self.evaluate(manifest)
-
-        records = self.runner.decision_records()
-        self.assertEqual(1, len(records))
-        self.assertEqual("source-eligibility-stopped", records[0]["event"])
-        self.assertEqual("stage-1-fixture", records[0]["run_id"])
-        self.assertEqual(1, records[0]["stage"])
-        self.assertEqual("financial-news-fixture", records[0]["source_id"])
-        self.assertEqual(decision["stop_reason"], records[0]["stop_reason"])
-        self.assertEqual(
-            _source_evidence_sha256(self.evidence_of(manifest)),
-            records[0]["evidence_sha256"],
-        )
 
     def test_source_rights_run_before_every_other_gate(self) -> None:
         manifest = draft_manifest()
-        self.evidence_of(manifest)["data_portfolio_lane"] = "restricted-auxiliary"
+        seal_source_yield_pools(self.runner, manifest)
+        self.license_of(manifest)["license_id"] = "custom-license"
+        self.source_of(manifest)["yield_evidence"] = None
         cast(dict[str, Any], manifest["budget"])["evidence"] = ""
         cast(dict[str, Any], manifest["schedule"])["must_finish_by"] = "2026-09-15"
         cast(dict[str, Any], manifest["route_panel"])["routes"] = []
 
-        decision = self.evaluate(manifest)
+        decision = self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
 
-        self.assertEqual("source-lane-restricted", decision["stop_reason"])
+        self.assertEqual("source-rights-failed", decision["stop_reason"])
 
-    def test_a_later_stage_source_keeps_the_same_evidence_rule(self) -> None:
+    def test_a_later_stage_source_uses_the_same_license_rule(self) -> None:
         runner = StageRun(
             Path(self.temp_dir.name) / "stage-2", clock=lambda: "2026-09-28T00:00:00Z"
         )
         manifest = draft_stage_manifest(2)
         sources = cast(list[dict[str, Any]], manifest["sources"])
-        evidence = cast(dict[str, Any], sources[1]["evidence"])
-        evidence["access_method"] = ""
+        license_record = cast(dict[str, Any], sources[1]["license"])
+        license_record["covers_passage_text"] = False
 
         decision = runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
 
-        self.assertEqual(
-            "source-rights-evidence-incomplete", decision["stop_reason"]
-        )
+        self.assertEqual("source-rights-failed", decision["stop_reason"])
 
     def test_each_initial_manifest_still_returns_no_build(self) -> None:
         for stage in (1, 2, 3):
@@ -4874,3 +4877,339 @@ class SourceEligibilityTests(unittest.TestCase):
 
                 self.assertEqual("no-build", decision["decision"])
                 self.assertEqual("source-rights-failed", decision["stop_reason"])
+
+
+class SourceYieldTests(unittest.TestCase):
+    """The staged gate checks one deterministic yield sample for each source."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.runner = StageRun(
+            Path(self.temp_dir.name), clock=lambda: "2026-09-10T00:00:00Z"
+        )
+
+    def evaluate(
+        self, manifest: Mapping[str, object], runner: StageRun | None = None
+    ) -> dict[str, object]:
+        selected_runner = runner or self.runner
+        seal_source_yield_pools(selected_runner, manifest)
+        return selected_runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+
+    def test_the_cli_seals_the_pool_before_yield_inspection(self) -> None:
+        manifest = draft_manifest()
+        source = cast(dict[str, Any], manifest["source"])
+        evidence = cast(dict[str, Any], source["yield_evidence"])
+        pool_path = Path(self.temp_dir.name) / "yield-pool.json"
+        pool_path.write_text(
+            json.dumps(
+                {
+                    "stage": manifest["stage"],
+                    "source_id": source["source_id"],
+                    "source_type": source["source_type"],
+                    "candidate_pool_size": evidence["candidate_pool_size"],
+                    "candidate_pool": evidence["candidate_pool"],
+                    "order_salt": evidence["order_salt"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        code = stage_run_main(
+            [
+                "seal-yield-pool",
+                str(pool_path),
+                "--sealed-by",
+                "fixture-owner",
+                "--state-dir",
+                self.temp_dir.name,
+            ]
+        )
+
+        self.assertEqual(0, code)
+        records = self.runner.decision_records()
+        self.assertEqual("source-yield-pool-sealed", records[0]["event"])
+        self.assertEqual(
+            evidence["candidate_pool_sha256"],
+            records[0]["candidate_pool_sha256"],
+        )
+
+    def test_a_valid_yield_sample_is_kept_in_the_build_decision(self) -> None:
+        manifest = draft_manifest()
+
+        decision = self.evaluate(manifest)
+
+        source = cast(dict[str, Any], decision["evidence"])["sources"][
+            "financial-news"
+        ]
+        manifest_source = cast(dict[str, Any], manifest["source"])
+        self.assertEqual("build-eligible", decision["decision"])
+        self.assertEqual(
+            manifest_source["yield_evidence"], source["yield"]["evidence"]
+        )
+        self.assertEqual(6_389, source["yield"]["projected_inspection_count"])
+        self.assertEqual(72, source["yield"]["verified_company_targets"])
+        self.assertEqual(
+            {"training": 61, "development": 4, "blind": 7},
+            source["yield"]["verified_by_split"],
+        )
+
+    def test_input_order_cannot_change_the_checked_sample(self) -> None:
+        first = draft_manifest()
+        reordered = draft_manifest()
+        sample = cast(
+            list[dict[str, object]],
+            cast(dict[str, Any], reordered["source"])["yield_evidence"][
+                "sampled_candidates"
+            ],
+        )
+        sample.reverse()
+
+        first_decision = self.evaluate(first)
+        other_runner = StageRun(
+            Path(self.temp_dir.name) / "reordered",
+            clock=lambda: "2026-09-10T00:00:00Z",
+        )
+        reordered_decision = self.evaluate(reordered, other_runner)
+
+        first_yield = cast(dict[str, Any], first_decision["evidence"])["sources"][
+            "financial-news"
+        ]["yield"]
+        reordered_yield = cast(dict[str, Any], reordered_decision["evidence"])[
+            "sources"
+        ]["financial-news"]["yield"]
+        self.assertEqual(
+            first_yield["checked_sample"], reordered_yield["checked_sample"]
+        )
+
+    def test_a_hand_picked_candidate_cannot_replace_the_sealed_sample(self) -> None:
+        manifest = draft_manifest()
+        evidence = cast(dict[str, Any], manifest["source"])["yield_evidence"]
+        seal_source_yield_pools(self.runner, manifest)
+        sampled_ids = {
+            candidate["candidate_id"] for candidate in evidence["sampled_candidates"]
+        }
+        replacement = next(
+            candidate
+            for candidate in evidence["candidate_pool"]
+            if candidate["candidate_id"] not in sampled_ids
+        )
+        evidence["sampled_candidates"][0]["candidate_id"] = replacement[
+            "candidate_id"
+        ]
+
+        decision = self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+
+        self.assertEqual("source-yield-unproven", decision["stop_reason"])
+
+    def test_a_change_to_the_sealed_pool_stops_the_stage(self) -> None:
+        manifest = draft_manifest()
+        evidence = cast(dict[str, Any], manifest["source"])["yield_evidence"]
+        seal_source_yield_pools(self.runner, manifest)
+        sampled_ids = {
+            candidate["candidate_id"] for candidate in evidence["sampled_candidates"]
+        }
+        candidate = next(
+            item
+            for item in evidence["candidate_pool"]
+            if item["candidate_id"] not in sampled_ids
+        )
+        candidate["split"] = "blind"
+        evidence["candidate_pool_sha256"] = hashlib.sha256(
+            json.dumps(
+                evidence["candidate_pool"],
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+
+        decision = self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+
+        self.assertEqual("source-yield-unproven", decision["stop_reason"])
+
+    def test_a_changed_pool_with_the_old_hash_stops_the_stage(self) -> None:
+        manifest = draft_manifest()
+        evidence = cast(dict[str, Any], manifest["source"])["yield_evidence"]
+        seal_source_yield_pools(self.runner, manifest)
+        sampled_ids = {
+            candidate["candidate_id"] for candidate in evidence["sampled_candidates"]
+        }
+        candidate = next(
+            item
+            for item in evidence["candidate_pool"]
+            if item["candidate_id"] not in sampled_ids
+        )
+        candidate["split"] = "blind"
+
+        decision = self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+
+        self.assertEqual("source-yield-unproven", decision["stop_reason"])
+
+    def test_the_pool_must_be_sealed_before_the_yield_check(self) -> None:
+        manifest = draft_manifest()
+
+        decision = self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+
+        self.assertEqual("source-yield-unproven", decision["stop_reason"])
+
+    def test_a_pool_sealed_after_the_yield_check_stops_the_stage(self) -> None:
+        manifest = draft_manifest()
+        runner = StageRun(
+            Path(self.temp_dir.name) / "late-seal",
+            clock=lambda: "2026-09-10T02:00:00Z",
+        )
+        seal_source_yield_pools(
+            runner, manifest, sealed_at="2026-09-10T02:00:00Z"
+        )
+
+        decision = runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+
+        self.assertEqual("source-yield-unproven", decision["stop_reason"])
+
+    def test_the_order_salt_is_fixed(self) -> None:
+        manifest = draft_manifest()
+        evidence = cast(dict[str, Any], manifest["source"])["yield_evidence"]
+        seal_source_yield_pools(self.runner, manifest)
+        evidence["order_salt"] = "chosen-after-inspection"
+
+        decision = self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+
+        self.assertEqual("source-yield-unproven", decision["stop_reason"])
+
+    def test_projected_yield_at_the_allocation_passes(self) -> None:
+        manifest = draft_manifest()
+        source = cast(dict[str, Any], manifest["source"])
+        source["yield_evidence"] = source_yield_evidence(
+            "financial-news",
+            candidate_pool_size=4_600,
+            sample_size=115,
+            verified_by_split={"training": 100, "development": 5, "blind": 10},
+        )
+
+        decision = self.evaluate(manifest)
+
+        checked = cast(dict[str, Any], decision["evidence"])["sources"][
+            "financial-news"
+        ]["yield"]
+        self.assertEqual("build-eligible", decision["decision"])
+        self.assertEqual(4_600, checked["projected_company_targets"])
+
+    def test_projected_yield_one_below_the_allocation_stops_the_stage(self) -> None:
+        manifest = draft_manifest()
+        source = cast(dict[str, Any], manifest["source"])
+        source["yield_evidence"] = source_yield_evidence(
+            "financial-news",
+            candidate_pool_size=4_599,
+            sample_size=115,
+            verified_by_split={"training": 100, "development": 5, "blind": 10},
+        )
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("source-yield-unproven", decision["stop_reason"])
+
+    def test_one_split_below_its_allocation_stops_the_stage(self) -> None:
+        manifest = draft_manifest()
+        evidence = cast(dict[str, Any], manifest["source"])["yield_evidence"]
+        development = [
+            candidate
+            for candidate in evidence["sampled_candidates"]
+            if candidate["split"] == "development"
+        ]
+        development[0]["verified_company_target"] = False
+        development[1]["verified_company_target"] = False
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("source-yield-unproven", decision["stop_reason"])
+
+    def test_projected_inspection_at_the_source_limit_passes(self) -> None:
+        manifest = draft_manifest()
+        source = cast(dict[str, Any], manifest["source"])
+        source["yield_evidence"] = source_yield_evidence(
+            "financial-news",
+            candidate_pool_size=7_000,
+            sample_size=1_667,
+            verified_by_split={
+                "training": 1_000,
+                "development": 50,
+                "blind": 100,
+            },
+        )
+
+        decision = self.evaluate(manifest)
+
+        checked = cast(dict[str, Any], decision["evidence"])["sources"][
+            "financial-news"
+        ]["yield"]
+        self.assertEqual("build-eligible", decision["decision"])
+        self.assertEqual(6_668, checked["projected_inspection_count"])
+
+    def test_projected_inspection_above_the_source_limit_stops_the_stage(self) -> None:
+        manifest = draft_manifest()
+        source = cast(dict[str, Any], manifest["source"])
+        source["yield_evidence"] = source_yield_evidence(
+            "financial-news",
+            candidate_pool_size=7_000,
+            sample_size=1_667,
+            verified_by_split={
+                "training": 999,
+                "development": 50,
+                "blind": 100,
+            },
+        )
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("source-yield-unproven", decision["stop_reason"])
+
+    def test_a_yield_stop_appends_exactly_one_audit_record(self) -> None:
+        manifest = draft_manifest()
+        evidence = cast(dict[str, Any], manifest["source"])["yield_evidence"]
+        seal_source_yield_pools(self.runner, manifest)
+        evidence["candidate_pool_size"] = 10
+        before = len(self.runner.decision_records())
+
+        decision = self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+
+        records = self.runner.decision_records()
+        expected_hash = hashlib.sha256(
+            json.dumps(
+                evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual("source-yield-unproven", decision["stop_reason"])
+        self.assertEqual(1, len(records) - before)
+        record = records[-1]
+        self.assertEqual("source-eligibility-stopped", record["event"])
+        self.assertEqual("stage-1-fixture", record["run_id"])
+        self.assertEqual(1, record["stage"])
+        self.assertEqual("financial-news-fixture", record["source_id"])
+        self.assertEqual("source-yield-unproven", record["stop_reason"])
+        self.assertEqual(expected_hash, record["evidence_sha256"])
+
+    def test_stale_yield_evidence_uses_the_source_staleness_reason(self) -> None:
+        manifest = draft_manifest()
+        evidence = cast(dict[str, Any], manifest["source"])["yield_evidence"]
+        seal_source_yield_pools(self.runner, manifest)
+        evidence["checked_at"] = "2026-01-01"
+
+        decision = self.runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+
+        self.assertEqual("source-rights-evidence-stale", decision["stop_reason"])
+
+    def test_all_source_rights_run_before_any_source_yield(self) -> None:
+        manifest = draft_stage_manifest(2)
+        sources = cast(list[dict[str, Any]], manifest["sources"])
+        runner = StageRun(
+            Path(self.temp_dir.name) / "rights-first",
+            clock=lambda: "2026-09-28T00:00:00Z",
+        )
+        seal_source_yield_pools(runner, manifest)
+        sources[0]["yield_evidence"] = None
+        sources[1]["license"]["license_id"] = "custom-license"
+
+        decision = runner.evaluate(confirm_manifest(manifest, "fixture-owner"))
+
+        self.assertEqual("source-rights-failed", decision["stop_reason"])

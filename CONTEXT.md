@@ -193,13 +193,13 @@ The USD 100 cap assigns USD 0 to silver-label calls, USD 35 to specialist traini
 _Avoid_: Soft budget, paid label overflow, shared untracked balance
 
 **Staged feasibility gate**:
-Before one stage starts, each source in that stage must have a recorded access method and permission for private evaluation, model training, and the planned release. All accepted free non-GPT label routes must show account-specific free limits and permission for training use. At least three routes must pass, and the complete accepted route set must stay fixed during the stage. A later-stage failure does not block an earlier approved stage.
-_Avoid_: Global five-source preflight, public-access assumption, web-crawl license, estimated account quota, exactly-three-route rule, mid-stage route change
+Before one stage starts, each source in that stage must use an approved open license that covers the passage text. Each source must also show from a fixed-order sample that it can fill its frozen allocation inside its source inspection limit. All accepted free non-GPT label routes must show account-specific free limits and permission for training use. At least three routes must pass, and the complete accepted route set must stay fixed during the stage. A later-stage failure does not block an earlier approved stage.
+_Avoid_: Global five-source preflight, repository-only license, hand-picked yield sample, estimated account quota, exactly-three-route rule, mid-stage route change
 
 **Frozen staged build specification**:
 The complete confirmed experiment design and its stop rules. It gives a credible conditional path to the source-specific non-inferiority test, but it does not give permission to start a stage whose feasibility gate has not passed.
 _Avoid_: Build authorization, guaranteed completion, unconditional build plan
 
 **Build eligibility**:
-Permission to start one experiment stage after that stage's source rights, free label routes, quotas, schedule, and cost preflight checks pass. Stage 1 is not build-eligible while its financial-news source or the minimum free route panel fails these checks.
+Permission to start one experiment stage after that stage's open-license, source-yield, free label route, quota, schedule, and cost preflight checks pass. Stage 1 is not build-eligible while its financial-news source or the minimum free route panel fails these checks.
 _Avoid_: Build-ready specification, planning completion, later-stage readiness

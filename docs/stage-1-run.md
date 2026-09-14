@@ -40,24 +40,52 @@ planned cost in `budget.planned_commitments_usd`. A later stage gives a `sources
 array instead, and each record in that array holds its own data plan, route
 demand, schedule, and planned cost. `docs/stage-2-run.md` gives that form.
 
-Each source must contain one `evidence` record. The record must contain
-`checked_at`, `terms_url`, `reviewer`, `access_method`, and
-`data_portfolio_lane`. The lane must be `clean-core` or
-`restricted-auxiliary`. A restricted auxiliary source cannot supply training
-data.
+Each source must contain one `license` record. The record must contain
+`license_id`, `license_url`, `covers_passage_text`, and `checked_at`. The
+approved license IDs are `CC0-1.0` and `CC-BY-4.0`.
 
-The evidence record must also contain `rights_clauses`. This object must contain
-one record for each of the five source rights. Each clause record must contain
-`primary_source_term`, `quoted_clause`, `retrieved_on`, `reviewer`, and
-`audited_object`. The audited object must be `passage-text`, `data-files`, or
-`repository`. A repository or data-files clause cannot permit training, weight
-release, or text redistribution. The check date and each retrieval date must not
-be later than the run date. They must be within 90 days of `starts_on`.
+`CC0-1.0` must use
+`https://creativecommons.org/publicdomain/zero/1.0/`. `CC-BY-4.0` must use
+`https://creativecommons.org/licenses/by/4.0/`.
 
-Incomplete clause evidence returns `source-rights-evidence-incomplete`. Old or
-future evidence returns `source-rights-evidence-stale`. A restricted auxiliary
-lane returns `source-lane-restricted`. The decision log records the source, the
-reason, and the SHA-256 hash of the source evidence.
+The license must cover the passage text. A license for only a repository or a
+data file is not sufficient. The check date must not be later than the run date.
+It must be within 90 days of `starts_on`. A missing or unapproved license returns
+`source-rights-failed`. Old or future evidence returns
+`source-rights-evidence-stale`.
+
+Each source must also contain one `yield_evidence` record. The record must
+contain `checked_at`, `candidate_pool_size`, `candidate_pool`,
+`candidate_pool_sha256`, `sample_size`, `order_salt`, and
+`sampled_candidates`. Each candidate-pool item must contain a unique
+`candidate_id` and one `split`. The pool length must equal
+`candidate_pool_size`, and its hash must equal `candidate_pool_sha256`. The pool
+must be in the append-only state before inspection starts. Each sampled candidate
+must contain the same fields and `verified_company_target`. The split must be
+`training`, `development`, or `blind`.
+
+The `order_salt` must be `20260905`. The gate puts the complete candidate pool
+in the fixed order from this salt and `candidate_id`. It selects the first
+`sample_size` candidates. The supplied sample must contain exactly these
+candidates. The gate calculates the company-target yield, the yield of each
+split, and the number of candidates that collection must inspect. The check
+passes only when the source can fill its fixed allocation inside its source
+inspection limit. A failed check returns `source-yield-unproven` and adds one
+source stop record to the decision log. Old or future yield evidence returns
+`source-rights-evidence-stale`.
+
+Before you inspect the yield sample, seal the pool in the append-only state:
+
+```sh
+python3 -m nlp_wayfinder.stage_run seal-yield-pool yield-pool.json \
+  --sealed-by NAME --state-dir .wayfinder-state
+```
+
+The pool file must contain `stage`, `source_id`, `source_type`,
+`candidate_pool_size`, `candidate_pool`, and `order_salt`. The later source
+record must use the SHA-256 value that this command returns. The gate rejects a
+pool that has no prior matching seal. The yield `checked_at` timestamp must not
+be earlier than the seal record timestamp.
 
 Admit one target–aspect example before you send it to a person or a model:
 

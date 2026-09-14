@@ -21,18 +21,23 @@
   },
   "schema_version": 1,
   "source": {
-    "access_permitted": false,
-    "evidence": {
+    "license": {
       "checked_at": "",
-      "reviewer": "",
-      "terms_url": ""
+      "covers_passage_text": false,
+      "license_id": "",
+      "license_url": ""
     },
-    "private_evaluation_permitted": false,
     "source_id": "unapproved-financial-news-source",
     "source_type": "financial-news",
-    "text_redistribution_permitted": false,
-    "training_permitted": false,
-    "weight_release_permitted": false
+    "yield_evidence": {
+      "candidate_pool": [],
+      "candidate_pool_sha256": "",
+      "candidate_pool_size": 0,
+      "checked_at": "",
+      "order_salt": "",
+      "sample_size": 0,
+      "sampled_candidates": []
+    }
   },
   "stage": 1
 }
