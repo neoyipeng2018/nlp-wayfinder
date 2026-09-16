@@ -1,0 +1,64 @@
+{
+  "archive_dataset": "common-pile/news",
+  "archive_revision": "13e76bdc8d49ed14d710fac7e3b61186cf74c8d3",
+  "built_on": "2026-09-16",
+  "candidate_pool_sha256": "a1822a549da659c163c5f2d4fecbba298f0bc8f5d87610ebbf22ef03550d88a8",
+  "candidate_pool_size": 43486,
+  "exclusion_counts": {
+    "article-notice-conflicts": 1763,
+    "attribution-incomplete": 2561,
+    "direct-or-block-quotation": 261953,
+    "marked-third-party-or-media-text": 120033,
+    "navigation-or-page-furniture": 1503,
+    "no-eligible-consecutive-passage": 102912,
+    "no-eligible-publisher-created-passage": 71965,
+    "outside-selected-consecutive-passage": 710119,
+    "publication-date-outside-fixed-periods": 4606,
+    "publisher-rights-not-approved": 47927,
+    "unclear-short-fragment": 56186
+  },
+  "license_counts": {
+    "CC-BY-3.0": 33196,
+    "CC-BY-4.0": 10269,
+    "CC-BY-SA-4.0": 21
+  },
+  "output_sha256": {
+    "candidate-pool.json": "8fb633797ea2894964a48489e88f8d6e89b61cb743c707b227f48624087bb0cc",
+    "exclusions.jsonl.gz": "c53bfb0a268327a76c0bf3c03b8867ad9def594883cbe96465d0f9dec4dc0907",
+    "filtered-source.jsonl.gz": "5f9f963072e84f971e3e317a7d9caa8f442408b9b0ab565b82c4ab162efc8f48"
+  },
+  "passage_counts_by_source": {
+    "news-360info": 1353,
+    "news-altnews": 6,
+    "news-balkandiskurs": 1226,
+    "news-factly": 8181,
+    "news-freedom": 735,
+    "news-globalvoices": 31964,
+    "news-thepublicrecord": 21
+  },
+  "record_counts_by_source": {
+    "news-360info": 1673,
+    "news-altnews": 4172,
+    "news-balkandiskurs": 1385,
+    "news-educeleb": 5280,
+    "news-factly": 11380,
+    "news-freedom": 1060,
+    "news-globalvoices": 102552,
+    "news-libertytvradio": 10358,
+    "news-mekongeye": 425,
+    "news-milwaukeenns": 26867,
+    "news-minorityafrica": 197,
+    "news-newcanadianmedia": 3055,
+    "news-oxpeckers": 432,
+    "news-propastop": 1212,
+    "news-solutionsjournalism": 5,
+    "news-thepublicrecord": 1727,
+    "news-zimfact": 528
+  },
+  "source_id": "common-pile-news-rights-filtered-v1",
+  "split_counts": {
+    "blind": 5070,
+    "development": 3299,
+    "training": 35117
+  }
+}
