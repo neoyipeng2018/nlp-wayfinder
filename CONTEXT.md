@@ -12,6 +12,10 @@ _Avoid_: Generic financial sentiment, document sentiment, end-to-end aspect extr
 A bounded English excerpt from financial news, a company announcement, an earnings call, a regulatory filing, or financial social media.
 _Avoid_: Document, article
 
+**Financial-news passage**:
+A financial passage of journalistic news text that discusses a publicly traded company target. The passage decides the source type, not the outlet: a general news outlet can supply it. Issuer-authored text and regulator text are company announcements or regulatory filings, not financial news.
+_Avoid_: Business-outlet-only news, press release, regulator release
+
 **Evidence-preserving bounded input**:
 One target–aspect input of no more than 1,024 ModernBERT tokens, including the passage, company, aspect, and special tokens. It uses consecutive complete sentences, stays identical for every human and model, and is rejected when its target and required label evidence do not fit.
 _Avoid_: Full document, post-label truncation, model-specific passage
@@ -143,6 +147,10 @@ _Avoid_: Mixed-license training pool, commercially clean dataset
 **Clean-core checkpoint**:
 A specialist-model checkpoint trained without non-commercial, unlicensed, or otherwise restricted auxiliary material and eligible for downstream use under the recorded data and model terms.
 _Avoid_: Main checkpoint, unrestricted checkpoint
+
+**Open-rights passage text**:
+Passage text that first-party evidence shows is under an open license covering that text, such as CC BY, CC BY-SA, or CC0, or is in the public domain. Public domain meets the open-license requirement. Non-commercial and no-derivatives licenses do not.
+_Avoid_: Repository license, dataset license, NC or ND license
 
 **Quarantined dataset**:
 A dataset that has a license for its repository or data files but has no completed rights audit for the underlying passage text. It cannot enter the clean core until the audit clears its required uses.
