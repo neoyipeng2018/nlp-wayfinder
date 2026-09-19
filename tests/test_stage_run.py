@@ -46,7 +46,10 @@ from nlp_wayfinder.stage_run import (
     project_gpt_blind_cost,
     project_specialist_training_cost,
     _calibration_fold,
+    _gpt_prompt,
     _silver_rejection,
+    _specialist_input,
+    _vote_prompt,
     candidate_order_sha256,
     cumulative_sources,
     seal_candidate_manifest,
@@ -472,6 +475,14 @@ def draft_manifest() -> dict[str, object]:
             },
             "evidence": "fixture cost projection",
         },
+    }
+
+
+def soft_label(label: str, probability: float) -> dict[str, float]:
+    """Give one calibrated silver distribution with the rest spread evenly."""
+    rest = (1.0 - probability) / (len(RESULT_LABELS) - 1)
+    return {
+        item: probability if item == label else rest for item in RESULT_LABELS
     }
 
 
@@ -1059,6 +1070,28 @@ class CandidateManifestTests(unittest.TestCase):
         self.assertEqual(
             "fixture-owner", sealed["seal"]["sealed_by"]  # type: ignore[index]
         )
+
+    def test_seal_rejects_a_candidate_without_a_company_name(self) -> None:
+        manifest = candidate_manifest()
+        del manifest["candidates"][0]["company"]  # type: ignore[index]
+
+        with self.assertRaisesRegex(ValueError, "candidate-company-name-missing"):
+            seal_candidate_manifest(manifest, "fixture-owner")
+
+    def test_every_model_receives_the_company_name_not_the_id(self) -> None:
+        candidate = {
+            "candidate_id": "c-1",
+            "normalized_passage": SILVER_PASSAGE,
+            "company_id": "harbor-grid",
+            "company": company_record("harbor-grid"),
+            "aspect": STAGE_1_ASPECTS[0],
+        }
+
+        for prompt in (_vote_prompt(candidate), _gpt_prompt(candidate)):
+            self.assertEqual(
+                "harbor-grid Ltd", json.loads(prompt[1]["content"])["company"]
+            )
+        self.assertEqual("harbor-grid Ltd", _specialist_input(candidate)["target"])
 
     def test_seal_rejects_an_incomplete_source_annex(self) -> None:
         manifest = candidate_manifest()
@@ -2495,6 +2528,11 @@ class SilverAggregationTests(unittest.TestCase):
         self.assertGreaterEqual(
             cast(float, accepted["probability"]), SILVER_MIN_PROBABILITY
         )
+        # The accepted record keeps the full calibrated soft label for training.
+        distribution = cast(Mapping[str, float], accepted["distribution"])
+        self.assertEqual(set(RESULT_LABELS), set(distribution))
+        self.assertAlmostEqual(1.0, sum(distribution.values()))
+        self.assertEqual(accepted["probability"], distribution["positive"])
         self.assertEqual(64, len(cast(str, result["aggregation_sha256"])))
 
     def test_the_confidence_band_is_not_an_aggregation_weight(self) -> None:
@@ -3372,11 +3410,13 @@ class SpecialistTrainingTests(unittest.TestCase):
                     "candidate_id": "training-0",
                     "label": "positive",
                     "probability": 0.91,
+                    "distribution": soft_label("positive", 0.91),
                 },
                 {
                     "candidate_id": "training-1",
                     "label": "negative",
                     "probability": 0.86,
+                    "distribution": soft_label("negative", 0.86),
                 },
             ],
         }
@@ -3446,10 +3486,14 @@ class SpecialistTrainingTests(unittest.TestCase):
             training = cast(list[Mapping[str, object]], config["training"])
             self.assertEqual(2, len(training))
             self.assertEqual(
-                {"candidate_id", "passage", "target", "aspect", "label"},
+                {"candidate_id", "passage", "target", "aspect", "label_distribution"},
                 set(training[0]),
             )
-            self.assertEqual("positive", training[0]["label"])
+            # Training uses the calibrated soft label, not only its top class.
+            self.assertEqual(
+                soft_label("positive", 0.91), training[0]["label_distribution"]
+            )
+            self.assertEqual("soft-cross-entropy", config["loss"])
 
     def test_the_development_input_never_carries_a_human_label(self) -> None:
         backend = FakeTrainingBackend(development_labels=self.development_labels())
@@ -3650,6 +3694,17 @@ class SpecialistTrainingTests(unittest.TestCase):
 
         self.assertEqual("silver-labels-not-accepted", result["stop_reason"])
 
+    def test_a_silver_label_without_a_distribution_stops_the_run(self) -> None:
+        inputs = self.specialist_inputs(
+            accepted_silver=[
+                {"candidate_id": "training-0", "label": "positive", "probability": 0.91}
+            ]
+        )
+
+        result = self.train(FakeTrainingBackend(), inputs=inputs)
+
+        self.assertEqual("silver-labels-not-accepted", result["stop_reason"])
+
     def test_a_missing_blind_prediction_stops_the_run(self) -> None:
         backend = FakeTrainingBackend(blind_labels={"blind-0": "positive"})
 
@@ -3836,8 +3891,18 @@ def report_source_fixture(
         "candidate_manifest_sha256": manifest_sha256,
         "accepted_silver_count": 2,
         "accepted_silver": [
-            {"candidate_id": f"{prefix}training-0", "label": "positive", "probability": 0.91},
-            {"candidate_id": f"{prefix}training-1", "label": "negative", "probability": 0.86},
+            {
+                "candidate_id": f"{prefix}training-0",
+                "label": "positive",
+                "probability": 0.91,
+                "distribution": soft_label("positive", 0.91),
+            },
+            {
+                "candidate_id": f"{prefix}training-1",
+                "label": "negative",
+                "probability": 0.86,
+                "distribution": soft_label("negative", 0.86),
+            },
         ],
     }
     return sealed, allocation, aggregation

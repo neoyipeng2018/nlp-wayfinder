@@ -161,6 +161,8 @@ these fields:
 - `candidate_id`
 - `event_group_id`
 - `company_id`, for the same publicly traded company in related records
+- `company`, with the `name` that the human labeler sees. Each voter, GPT, and
+  the specialist receive this name as the company target, not `company_id`.
 - `aspect`, from the Stage 1 aspect set
 - `published_at`
 - `normalized_passage`
@@ -372,7 +374,7 @@ The operation rejects a training candidate for one of these reasons:
 The operation seals the fit and the posterior artifacts in
 `silver-aggregation-log.jsonl`. A later change of the fit or the posteriors
 returns `frozen-aggregation-changed`. The result contains the accepted silver
-labels, the rejection counts, the artifact hashes, and its own SHA-256 hash.
+labels with their calibrated distributions, the rejection counts, the artifact hashes, and its own SHA-256 hash.
 
 Seal the GPT blind prediction file for the source:
 
@@ -457,7 +459,10 @@ decrease, `specialist-pilot-cost-exceeded` for a pilot above USD 5, or
 
 Each seed run uses the pinned ModernBERT revision, a new four-class head, and
 explicit `passage`, `target`, and `aspect` fields. The training rows carry the
-accepted silver labels. The development rows carry no label, because the human
+calibrated four-class distribution of each accepted silver label as
+`label_distribution`, and the run trains with soft cross-entropy. An accepted
+silver label without a valid distribution stops the run with
+`silver-labels-not-accepted`. The development rows carry no label, because the human
 development labels stay in the selection code. The run stops with
 `specialist-training-invalid` when a checkpoint reports another initialization,
 another token limit, another head, or an incomplete development prediction set.

@@ -1038,6 +1038,13 @@ def seal_candidate_manifest(
         normalized_passage = candidate_copy.get("normalized_passage")
         if not isinstance(normalized_passage, str) or not normalized_passage.strip():
             raise ValueError("A normalized passage must contain text.")
+        company = candidate_copy.get("company")
+        if (
+            not isinstance(company, Mapping)
+            or not isinstance(company.get("name"), str)
+            or not company["name"].strip()
+        ):
+            raise ValueError("candidate-company-name-missing")
         content_sha256 = hashlib.sha256(
             normalized_passage.encode("utf-8")
         ).hexdigest()
@@ -1805,7 +1812,7 @@ def _vote_prompt(candidate: Mapping[str, object]) -> list[dict[str, str]]:
     user_prompt = _canonical_json(
         {
             "passage": candidate["normalized_passage"],
-            "company": candidate["company_id"],
+            "company": _company_name(candidate),
             "aspect": candidate["aspect"],
         }
     )
@@ -1853,7 +1860,7 @@ def _gpt_prompt(candidate: Mapping[str, object]) -> list[dict[str, str]]:
     user_prompt = _canonical_json(
         {
             "passage": candidate["normalized_passage"],
-            "company": candidate["company_id"],
+            "company": _company_name(candidate),
             "aspect": candidate["aspect"],
         }
     )
@@ -2217,11 +2224,16 @@ def _contains_gpt_artifact(value: object) -> bool:
     return isinstance(value, str) and GPT_ROUTE_ID in value
 
 
+def _company_name(candidate: Mapping[str, object]) -> str:
+    """Give every model the company name that the human labeler sees."""
+    return str(cast(Mapping[str, object], candidate["company"])["name"]).strip()
+
+
 def _specialist_input(candidate: Mapping[str, object]) -> dict[str, object]:
     return {
         "candidate_id": candidate["candidate_id"],
         "passage": candidate["normalized_passage"],
-        "target": candidate["company_id"],
+        "target": _company_name(candidate),
         "aspect": candidate["aspect"],
     }
 
@@ -2820,7 +2832,7 @@ class StageRun:
                         {
                             "candidate_id": "",
                             "normalized_passage": "",
-                            "company_id": "",
+                            "company": {"name": ""},
                             "aspect": "",
                         },
                     )
@@ -3051,6 +3063,7 @@ class StageRun:
                         "candidate_id": candidate_id,
                         "label": top_label,
                         "probability": calibrated[top_label],
+                        "distribution": calibrated,
                     }
                 )
             else:
@@ -3229,7 +3242,7 @@ class StageRun:
                         {
                             "candidate_id": "",
                             "normalized_passage": "",
-                            "company_id": "",
+                            "company": {"name": ""},
                             "aspect": "",
                         }
                     )
@@ -3454,7 +3467,7 @@ class StageRun:
                 return self._specialist_stop("frozen-specialist-run-changed")
             return prior
 
-        silver_labels: dict[str, str] = {}
+        silver_labels: dict[str, dict[str, float]] = {}
         for source in ordered_sources:
             aggregation = bundles[source].get("aggregation")
             if (
@@ -3468,12 +3481,27 @@ class StageRun:
             if not isinstance(accepted_silver, list) or not accepted_silver:
                 return self._specialist_stop("silver-labels-not-accepted")
             for item in accepted_silver:
+                distribution = (
+                    item.get("distribution") if isinstance(item, Mapping) else None
+                )
                 if (
                     not isinstance(item, Mapping)
                     or item.get("label") not in RESULT_LABELS
+                    or not isinstance(distribution, Mapping)
+                    or set(distribution) != set(RESULT_LABELS)
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not 0.0 <= value <= 1.0
+                        for value in distribution.values()
+                    )
+                    or abs(sum(distribution.values()) - 1.0) > 1e-6
                 ):
                     return self._specialist_stop("silver-labels-not-accepted")
-                silver_labels[str(item["candidate_id"])] = str(item["label"])
+                # The calibrated soft label is the training target, not its top class.
+                silver_labels[str(item["candidate_id"])] = {
+                    label: float(distribution[label]) for label in RESULT_LABELS
+                }
 
         # GPT supplies no training, development, calibration, or selection input.
         # The stage manifest is not in this list. Its budget has one permitted
@@ -3574,7 +3602,9 @@ class StageRun:
             training_rows.extend(
                 {
                     **_specialist_input(candidate),
-                    "label": silver_labels[str(candidate["candidate_id"])],
+                    "label_distribution": silver_labels[
+                        str(candidate["candidate_id"])
+                    ],
                 }
                 for candidate in source_training
                 if str(candidate["candidate_id"]) in silver_labels
@@ -3603,6 +3633,8 @@ class StageRun:
             "new_head": True,
             "head_labels": list(RESULT_LABELS),
             "input_fields": ["passage", "target", "aspect"],
+            "training_target": "label_distribution",
+            "loss": "soft-cross-entropy",
             "max_sequence_tokens": MAX_EXAMPLE_TOKENS,
         }
         freeze = {
