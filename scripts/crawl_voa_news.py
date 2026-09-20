@@ -71,13 +71,28 @@ class RateLimiter:
             time.sleep(delay)
 
 
+REQUEST_DEADLINE = 45.0
+
+
+def read_with_deadline(response: Any, deadline: float) -> bytes:
+    """Read one response body, but give up when the server only trickles it."""
+    chunks = []
+    while True:
+        if time.monotonic() > deadline:
+            raise TimeoutError("response-deadline")
+        chunk = response.read(65_536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
 def fetch(url: str, limiter: RateLimiter, user_agent: str) -> dict[str, object]:
     for attempt in range(5):
         limiter.wait()
         request = urllib.request.Request(url, headers={"User-Agent": user_agent})
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                body = response.read()
+            with urllib.request.urlopen(request, timeout=30) as response:
+                body = read_with_deadline(response, time.monotonic() + REQUEST_DEADLINE)
                 status, final_url = response.status, response.geturl()
         except urllib.error.HTTPError as error:
             if error.code in (429, 500, 502, 503, 504) and attempt < 4:
@@ -86,7 +101,7 @@ def fetch(url: str, limiter: RateLimiter, user_agent: str) -> dict[str, object]:
             body, status, final_url = b"", error.code, url
         except (urllib.error.URLError, TimeoutError, ConnectionError):
             if attempt < 4:
-                time.sleep(30 * (attempt + 1))
+                time.sleep(5 * (attempt + 1))
                 continue
             body, status, final_url = b"", 0, url
         return {
@@ -123,7 +138,20 @@ def main() -> int:
             if shard.exists():
                 continue
             batch = targets[start : start + SHARD_SIZE]
-            pages = list(pool.map(lambda u: fetch(u, limiter, args.user_agent), batch))
+            done = [0]
+            counter_lock = threading.Lock()
+
+            def fetch_one(url: str) -> dict[str, object]:
+                page = fetch(url, limiter, args.user_agent)
+                with counter_lock:
+                    done[0] += 1
+                    count = done[0]
+                if count % 250 == 0:
+                    stamp = datetime.now().strftime("%H:%M:%S")
+                    print(f"  {stamp} {shard.name}: {count}/{len(batch)}", flush=True)
+                return page
+
+            pages = list(pool.map(fetch_one, batch))
             partial = shard.with_suffix(".partial")
             with gzip.open(partial, "wt", encoding="utf-8") as handle:
                 for page in pages:
