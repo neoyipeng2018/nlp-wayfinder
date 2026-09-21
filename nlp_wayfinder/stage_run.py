@@ -171,6 +171,18 @@ GPT_FORECAST_FIELDS = (
 BLIND_LABEL_FIELDS = ("label", "reference_label", "silver_label", "labeled_at")
 
 SPECIALIST_SEEDS = (1, 2, 3)
+# Frozen before the run, so `training_config_sha256` covers them and no
+# development or silver number can select them.
+SPECIALIST_TRAINING_SETTINGS: dict[str, object] = {
+    "learning_rate": 5e-5,
+    "epochs": 3,
+    "batch_size": 32,
+    "optimizer": "adamw",
+    "lr_schedule": "linear-decay",
+    "warmup_ratio": 0.1,
+    "weight_decay": 0.01,
+}
+SPECIALIST_PRIOR_TAU = 1.0
 SPECIALIST_OPERATIONAL_REPEATS = 1
 SPECIALIST_PILOT_LIMIT_USD = Decimal("5.00")
 SPECIALIST_COMPATIBILITY_TOKENS = 512
@@ -213,6 +225,7 @@ SPECIALIST_TRAIN_RESULT_FIELDS = (
     "max_sequence_tokens",
     "head_labels",
     "development_predictions",
+    "training_settings",
 )
 
 RIGHTS_FIELDS = (
@@ -2360,6 +2373,50 @@ def _temperature_scaled(
     return {label: value / total for label, value in powered.items()}
 
 
+def _aspect_prior(distributions: Sequence[Mapping[str, float]]) -> dict[str, float]:
+    """Give the mean accepted silver distribution of one aspect."""
+    if not distributions:
+        # No accepted silver in this aspect leaves nothing to correct.
+        return {label: 1.0 / len(RESULT_LABELS) for label in RESULT_LABELS}
+    mean = {
+        label: max(
+            sum(item[label] for item in distributions) / len(distributions),
+            SILVER_PROBABILITY_FLOOR,
+        )
+        for label in RESULT_LABELS
+    }
+    total = sum(mean.values())
+    return {label: value / total for label, value in mean.items()}
+
+
+def _prior_adjusted_label(
+    probabilities: Mapping[str, float], prior: Mapping[str, float]
+) -> str:
+    """Take the argmax after the fixed post-hoc logit adjustment."""
+    adjusted = {
+        label: math.log(max(probabilities[label], SILVER_PROBABILITY_FLOOR))
+        - SPECIALIST_PRIOR_TAU * math.log(prior[label])
+        for label in RESULT_LABELS
+    }
+    return sorted(adjusted.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
+def _valid_probabilities(value: object) -> dict[str, float] | None:
+    """Read one four-class probability row, or None when it is not one."""
+    if not isinstance(value, Mapping) or set(value) != set(RESULT_LABELS):
+        return None
+    if any(
+        isinstance(item, bool) or not isinstance(item, (int, float))
+        or not 0.0 <= item <= 1.0
+        for item in value.values()
+    ):
+        return None
+    if abs(sum(cast(Mapping[str, float], value).values()) - 1.0) > 1e-6:
+        return None
+    row = cast(Mapping[str, float], value)
+    return {label: float(row[label]) for label in RESULT_LABELS}
+
+
 def _ranked_labels(calibrated: Mapping[str, float]) -> list[tuple[str, float]]:
     """Rank the labels by decreasing probability, then by name."""
     return sorted(calibrated.items(), key=lambda item: (-item[1], item[0]))
@@ -3033,7 +3090,29 @@ class StageRun:
         }
         fold_temperatures: list[float] = []
         out_of_fold: dict[str, dict[str, float]] = {}
+        # A refit on four folds predicting the fifth. The fit above sees every
+        # development label, so a macro-F1 from it would be in-sample.
+        out_of_fold_labels: dict[str, str] = {}
         for fold in range(SILVER_CALIBRATION_FOLDS):
+            try:
+                fold_confusion, fold_prior, _ = _dawid_skene_fit(
+                    fit_rows,
+                    {
+                        candidate_id: label
+                        for candidate_id, label in development_labels.items()
+                        if folds[candidate_id] != fold
+                    },
+                    route_ids,
+                )
+            except RuntimeError as error:
+                return self._aggregation_stop(str(error))
+            for candidate_id in development_labels:
+                if folds[candidate_id] == fold:
+                    out_of_fold_labels[candidate_id] = _ranked_labels(
+                        _dawid_skene_posterior(
+                            votes.get(candidate_id, {}), fold_confusion, fold_prior
+                        )
+                    )[0][0]
             temperature = _fit_temperature(
                 [
                     (posteriors[candidate_id], label)
@@ -3048,6 +3127,10 @@ class StageRun:
                         posteriors[candidate_id], temperature
                     )
         temperature = sum(fold_temperatures) / SILVER_CALIBRATION_FOLDS
+        # Report only. No stop rule reads this number.
+        development_out_of_fold_macro_f1 = _macro_f1(
+            out_of_fold_labels, development_labels
+        )
 
         accepted: list[dict[str, object]] = []
         rejected_counts: Counter[str] = Counter()
@@ -3098,6 +3181,7 @@ class StageRun:
             "fold_temperatures": fold_temperatures,
             "temperature": temperature,
             "development_class_counts": dict(class_counts),
+            "development_out_of_fold_macro_f1": development_out_of_fold_macro_f1,
         }
         posterior_artifact: dict[str, object] = {
             "event": "silver-posteriors-sealed",
@@ -3136,6 +3220,7 @@ class StageRun:
             "rejected_counts": dict(sorted(rejected_counts.items())),
             "accepted_silver": accepted,
             "temperature": temperature,
+            "development_out_of_fold_macro_f1": development_out_of_fold_macro_f1,
             "fit_sha256": hashlib.sha256(
                 _canonical_json(fit_artifact).encode("utf-8")
             ).hexdigest(),
@@ -3482,26 +3567,18 @@ class StageRun:
                 return self._specialist_stop("silver-labels-not-accepted")
             for item in accepted_silver:
                 distribution = (
-                    item.get("distribution") if isinstance(item, Mapping) else None
+                    _valid_probabilities(item.get("distribution"))
+                    if isinstance(item, Mapping)
+                    else None
                 )
                 if (
                     not isinstance(item, Mapping)
                     or item.get("label") not in RESULT_LABELS
-                    or not isinstance(distribution, Mapping)
-                    or set(distribution) != set(RESULT_LABELS)
-                    or any(
-                        isinstance(value, bool)
-                        or not isinstance(value, (int, float))
-                        or not 0.0 <= value <= 1.0
-                        for value in distribution.values()
-                    )
-                    or abs(sum(distribution.values()) - 1.0) > 1e-6
+                    or distribution is None
                 ):
                     return self._specialist_stop("silver-labels-not-accepted")
                 # The calibrated soft label is the training target, not its top class.
-                silver_labels[str(item["candidate_id"])] = {
-                    label: float(distribution[label]) for label in RESULT_LABELS
-                }
+                silver_labels[str(item["candidate_id"])] = distribution
 
         # GPT supplies no training, development, calibration, or selection input.
         # The stage manifest is not in this list. Its budget has one permitted
@@ -3545,6 +3622,7 @@ class StageRun:
         development_labels: dict[str, str] = {}
         development_source_of: dict[str, str] = {}
         source_of_blind: dict[str, str] = {}
+        silver_by_aspect: dict[str, list[Mapping[str, float]]] = {}
         seen_candidate_ids: set[str] = set()
         for source in ordered_sources:
             candidate_manifest = cast(
@@ -3599,17 +3677,22 @@ class StageRun:
                 for candidate in split_rows
             )
 
-            training_rows.extend(
-                {
-                    **_specialist_input(candidate),
-                    "label_distribution": silver_labels[
-                        str(candidate["candidate_id"])
-                    ],
-                }
-                for candidate in source_training
-                if str(candidate["candidate_id"]) in silver_labels
-            )
-            # The development labels stay with the selection code. Only inputs
+            for candidate in source_training:
+                distribution = silver_labels.get(str(candidate["candidate_id"]))
+                if distribution is None:
+                    continue
+                training_rows.append(
+                    {
+                        **_specialist_input(candidate),
+                        "label_distribution": distribution,
+                    }
+                )
+                # The class prior of an aspect is the mean of its accepted
+                # silver distributions, so only training rows feed it.
+                silver_by_aspect.setdefault(str(candidate["aspect"]), []).append(
+                    distribution
+                )
+            # The development labels stay with the scoring code. Only inputs
             # go to the backend.
             development_rows.extend(
                 _specialist_input(candidate) for candidate in source_development
@@ -3636,6 +3719,7 @@ class StageRun:
             "training_target": "label_distribution",
             "loss": "soft-cross-entropy",
             "max_sequence_tokens": MAX_EXAMPLE_TOKENS,
+            "training_settings": dict(SPECIALIST_TRAINING_SETTINGS),
         }
         freeze = {
             "event": "specialist-run-frozen",
@@ -3688,9 +3772,12 @@ class StageRun:
                 or any(label not in RESULT_LABELS for label in predictions.values())
             ):
                 return self._specialist_stop("specialist-training-invalid")
+            # The frozen settings are only frozen if the backend reports them back.
+            if result["training_settings"] != SPECIALIST_TRAINING_SETTINGS:
+                return self._specialist_stop("specialist-training-settings-mismatch")
             predicted = {str(key): str(value) for key, value in predictions.items()}
-            # The cumulative development set selects the checkpoint. The record
-            # also keeps the result of each source, so an audit can see it.
+            # The development set selects nothing. This is a diagnostic only.
+            # The record keeps the result of each source, so an audit can see it.
             macro_f1 = _macro_f1(predicted, development_labels)
             macro_f1_by_source = {
                 source: _macro_f1(
@@ -3727,33 +3814,49 @@ class StageRun:
                 }
             )
 
-        # The human development labels select the checkpoint. A tie takes the
-        # lowest seed.
-        selected = min(
-            checkpoints,
-            key=lambda item: (
-                -cast(float, item["development_macro_f1"]),
-                cast(int, item["seed"]),
-            ),
-        )
-        inference = backend.predict(str(selected["checkpoint_id"]), blind_rows)
-        device_id = inference.get("device_id") if isinstance(inference, Mapping) else None
-        if device_id != m3_check["device_id"]:
-            return self._specialist_stop("local-inference-device-mismatch")
-        labels = inference.get("predictions")
-        if not isinstance(labels, Mapping):
-            return self._specialist_stop("specialist-inference-invalid")
+        # The specialist is the average of the three seed probabilities. The
+        # development set selects no checkpoint.
+        summed: dict[str, dict[str, float]] = {
+            str(row["candidate_id"]): {label: 0.0 for label in RESULT_LABELS}
+            for row in blind_rows
+        }
+        device_id: object = m3_check["device_id"]
+        for checkpoint in checkpoints:
+            inference = backend.predict(str(checkpoint["checkpoint_id"]), blind_rows)
+            if (
+                not isinstance(inference, Mapping)
+                or inference.get("device_id") != m3_check["device_id"]
+            ):
+                return self._specialist_stop("local-inference-device-mismatch")
+            probabilities = inference.get("probabilities")
+            if not isinstance(probabilities, Mapping):
+                return self._specialist_stop("specialist-inference-invalid")
+            for candidate_id, total in summed.items():
+                row_probabilities = _valid_probabilities(
+                    probabilities.get(candidate_id)
+                )
+                if row_probabilities is None:
+                    return self._specialist_stop("missing-prediction")
+                for label in RESULT_LABELS:
+                    total[label] += row_probabilities[label] / len(checkpoints)
+
+        aspect_priors = {
+            aspect: _aspect_prior(distributions)
+            for aspect, distributions in sorted(silver_by_aspect.items())
+        }
+        uniform_prior = _aspect_prior([])
         predictions_out: list[dict[str, object]] = []
         for row in blind_rows:
             candidate_id = str(row["candidate_id"])
-            label = labels.get(candidate_id)
-            if label not in RESULT_LABELS:
-                return self._specialist_stop("missing-prediction")
+            averaged = summed[candidate_id]
             predictions_out.append(
                 {
                     "candidate_id": row["candidate_id"],
                     "source": source_of_blind[candidate_id],
-                    "label": label,
+                    "label": _prior_adjusted_label(
+                        averaged,
+                        aspect_priors.get(str(row["aspect"]), uniform_prior),
+                    ),
                 }
             )
 
@@ -3766,9 +3869,14 @@ class StageRun:
             "revision": MODERNBERT_REVISION,
             "candidate_manifest_sha256s": manifest_sha256s,
             "training_config_sha256": freeze["training_config_sha256"],
-            "checkpoint_id": selected["checkpoint_id"],
-            "selected_seed": selected["seed"],
+            "specialist": "three-seed-probability-ensemble",
+            "checkpoint_ids": [
+                checkpoint["checkpoint_id"] for checkpoint in checkpoints
+            ],
+            "seeds": list(SPECIALIST_SEEDS),
             "checkpoints": checkpoints,
+            "prior_tau": SPECIALIST_PRIOR_TAU,
+            "aspect_priors": aspect_priors,
             "inference_device_id": device_id,
             "projection": projection,
             "software_versions": _software_versions(),
@@ -4049,6 +4157,11 @@ class StageRun:
             ),
             {},
         )
+        silver_fits: dict[str, Mapping[str, object]] = {
+            record_source(record): record
+            for record in self.silver_aggregation_records()
+            if record.get("event") == "silver-fit-sealed"
+        }
 
         report: dict[str, object] = {
             "report": "complete",
@@ -4087,8 +4200,8 @@ class StageRun:
             "identities": {
                 "specialist_model_id": specialist_file["model_id"],
                 "specialist_revision": specialist_file["revision"],
-                "checkpoint_id": specialist_file["checkpoint_id"],
-                "selected_seed": specialist_file["selected_seed"],
+                "checkpoint_ids": specialist_file["checkpoint_ids"],
+                "seeds": specialist_file["seeds"],
                 "inference_device_id": specialist_file["inference_device_id"],
                 "gpt_route_id": {
                     source: gpt_file["route_id"]
@@ -4150,6 +4263,13 @@ class StageRun:
             },
             "metrics": {
                 "by_source": by_source,
+                # Report only. No stop rule reads these numbers.
+                "silver_development_out_of_fold_macro_f1": {
+                    source: silver_fits.get(source, {}).get(
+                        "development_out_of_fold_macro_f1"
+                    )
+                    for source in ordered_sources
+                },
                 "pooled": {
                     "diagnostic_only": True,
                     "specialist_macro_f1": pooled_macro_f1["specialist"],
