@@ -1,0 +1,79 @@
+{
+  "built_on": "2026-09-19",
+  "candidate_pool_sha256": "03b7221d9534ea0a119d8c9115fad9406b0904e29a5b0e7f1580d68c1c70689e",
+  "candidate_pool_size": 266,
+  "company_names_in_filter": 6020,
+  "eligible_articles_by_split": {
+    "blind": 9146,
+    "development": 5503,
+    "training": 1665
+  },
+  "exclusion_counts": {
+    "byline-missing": 3118,
+    "byline-names-wire-agency": 24038,
+    "direct-or-block-quotation": 159452,
+    "marked-third-party-or-media-text": 3747,
+    "navigation-or-page-furniture": 28,
+    "no-eligible-listed-company-passage": 321859,
+    "not-text-article": 81088,
+    "not-voa-english-article-url": 42422,
+    "outside-selected-consecutive-passage": 5447,
+    "publication-date-outside-fixed-periods": 470,
+    "sentence-credits-wire-agency": 7522,
+    "third-party-copyright-or-license-notice": 28,
+    "unclear-short-fragment": 12044
+  },
+  "input_page_shard_sha256": {
+    "00000.jsonl.gz": "3667c1af0ba34fb740a5a2e29eb3662fa9c4d9d825999df720bc44e9fa148eeb",
+    "00001.jsonl.gz": "040d236d995e6d019189f071db6ed3be027ba67858f4bc46e8b2b7ddbe439b5b",
+    "00002.jsonl.gz": "ee263a9df2537a176497494e292151f09c1bc8831765995970fd368032feffc4",
+    "00003.jsonl.gz": "f28975dc5a6d0dd4ebc6b299cef58026fb88bdbd67bf6787f4edd2b4993d829c",
+    "00004.jsonl.gz": "afcca5dd2c71bca6d4b2247334f4b7f89e16e5fb4e74a32793df9e731c331784",
+    "00005.jsonl.gz": "d419c8da36b5f7a8d6678b414e46ea6150ddf8f6c6a2c6f25c884cfd1e8f4cab",
+    "00006.jsonl.gz": "8d5734cd5b49a88e16ade0ba8429618743b07fa8f71c0a5e7409060688ccbbdf",
+    "00007.jsonl.gz": "96c56db03046836beadd74c5f386870c1ba5dd13e03338860c72aeb35bab8602",
+    "00008.jsonl.gz": "ae55c00452b50c8c75db13f88a0e8d0bb547d8fb09e4da8caef306c3fc987fd9",
+    "00009.jsonl.gz": "9ae58cf4847e71ef45b37ddd063d65b3e6a63652bc0164920b9e9072780247c3",
+    "00010.jsonl.gz": "d3b5a1c8942f86fb65ab5b60f88492a0d9b6ea9322b334df720bc77427fbca7c",
+    "00011.jsonl.gz": "2b6fd608ba7f3b11c03562bc850be180d788f0fa83ce13f0d468b4b378dd1e8e",
+    "00012.jsonl.gz": "4e9baa6e1f5a8ba28950df77df262581ab6a836a5af7021b7057604a266ee5bd",
+    "00013.jsonl.gz": "df4ff5036e57d86f0fc794fef4c98d868fc988cebb938d35ff2a51cf78cf2b9f",
+    "00014.jsonl.gz": "1f79bd066f6e315872fcac94224416f8ee36571a39b66e1425e09275f06ac41d",
+    "00015.jsonl.gz": "e149202041deabcd45e5de7ff0560ea87cdd7fb11975b9bd9807da7f760c5213",
+    "00016.jsonl.gz": "03514faea339c54abd2cd9c04fa891d6e039c248e98f3c9bf91b052e8bd657cb",
+    "00017.jsonl.gz": "eb3d78652d050998b11f0d8c8ca9fae20b6ca22a783624ddfff72f4f04b01157",
+    "00018.jsonl.gz": "29a8644368cc5d871dca657929762ffb7e4c1c08bc9f89eceaac5a975925d4aa",
+    "00019.jsonl.gz": "e2a8d6a16c399248d4581692ad2726f21c038c4870a3bf77cc3a7c965be6e45a",
+    "00020.jsonl.gz": "436b884c2f3ed59752cd1476ff1e53671e2c2009bd2ae48f8bf3f500844e5277",
+    "00021.jsonl.gz": "b7732f25862faf746e0e25753bce207389ec7ab542d9008db52cd130dd6f0e49",
+    "00022.jsonl.gz": "fc37c7540e25d645eb183d094a846007dd8cc7f1867c263437c933c14e41b520",
+    "00023.jsonl.gz": "af6d85251d026afd4ea409ba940853ad8414a77e0fef32a2ec4d034addad2cbb",
+    "00024.jsonl.gz": "885811e5835a3298d875064008fe307e2b9b05fc93047a3345153f76bbe51738",
+    "00025.jsonl.gz": "e984a57b2c3e31c898a5124d506846622479de21fc2f03cc77e8e8d26b8f03ab",
+    "00026.jsonl.gz": "28603fb2e56303d599403a24cb51ea7753146078fa32a99c893787e72034393f",
+    "00027.jsonl.gz": "e0c89b4692275ed8693cdb92ebb7b410bba834fb495a843ec91dbf6ab5b6798b",
+    "00028.jsonl.gz": "c28cb53de188783e77f6a43094912dff1f11a638212fee5146b87b31065417e2",
+    "00029.jsonl.gz": "4dca33ed1802e31fe8dc5f703d05a67a2e96955c035e0d7efa3a74e24a7ab8b0",
+    "00030.jsonl.gz": "1841bba7781e1cd2cc509c03ca8e5f2d900946e3fb546b939fb93199351d14ba",
+    "00031.jsonl.gz": "1053722c2ac49a1838d5e9ff4a0c915a99b565db2c447ce0eda91e370809c162",
+    "00032.jsonl.gz": "dd485784679e5dd58bde725fc5ec031b84b81dff20a890e295d8deba970d0117",
+    "00033.jsonl.gz": "c806ecea405a9f8badc8328ba62a0928fe97785391ec25193caddf9a7267efad",
+    "00034.jsonl.gz": "d5e63f77557d359cdb4a6863aac752642c4f27176ba130ff3b44463b2a1ca9c4"
+  },
+  "output_sha256": {
+    "candidate-pool.json": "13f3580495c12ba949626b565b0a204dc5187df26e4c61a04571a21c2ec6df81",
+    "exclusions.jsonl.gz": "03b180371012227597488703694907cfcb3e75bfc2e30ec4065689c4f5666b31",
+    "filtered-source.jsonl.gz": "aa6fd2c517512c325723a8a05fba8934a58f723a62dd91f31de2a2ae8325761f"
+  },
+  "source_id": "voa-news-staff-listed-company-v1",
+  "split_counts": {
+    "blind": 156,
+    "development": 85,
+    "training": 25
+  },
+  "thresholds_met": {
+    "blind": false,
+    "development": false,
+    "training": false
+  }
+}

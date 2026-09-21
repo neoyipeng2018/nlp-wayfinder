@@ -1,0 +1,125 @@
+{
+  "archive": {
+    "dataset": "common-pile/news",
+    "revision": "13e76bdc8d49ed14d710fac7e3b61186cf74c8d3",
+    "files": {
+      "v0/documents/00000_360info.jsonl.gz": "6b2f94dd7f79fb72c9765067f6c96549d7e43fe2bc42329ca1fabbe38a78a78c",
+      "v0/documents/00000_altnews.jsonl.gz": "9444b1b222e7e74a37eba04058f770d01802e29ed445b42bc5c44cb242909fba",
+      "v0/documents/00000_balkandiskurs.jsonl.gz": "d0f7376037deb4ca1674cf21b3d1472b29f51428d4f2050f14195e0b0efbb176",
+      "v0/documents/00000_educeleb.jsonl.gz": "0932b921c454c307b098bc4bc92c9c45913bb15e338f8aafeeb771082ef68b0b",
+      "v0/documents/00000_factly.jsonl.gz": "01cf0c0129b2ff99ab4ea778b56d5f1d72ddb6e124f687b4431c0a54690aff7c",
+      "v0/documents/00000_freedom.jsonl.gz": "d05be7256830eef3dded07d1ce393130e0532c4ba434edd892af22f98632a9b4",
+      "v0/documents/00000_globalvoices.jsonl.gz": "466ee4e91c531a550b5f1edcd25848003ddc7a05b800cd7cafc188b588c05a7f",
+      "v0/documents/00000_libertytvradio.jsonl.gz": "7b791dc5e1ff19e33b62eb73d56a1da32dc0ebe15e81a48b5f174f4a920a0f99",
+      "v0/documents/00000_mekongeye.jsonl.gz": "d0954d7b845848560bd21c3e8aad748334b6e1f10a2cce336a28244880364595",
+      "v0/documents/00000_milwaukeenns.jsonl.gz": "7fb59cfd27f53d440b46ce7d1cd2e317fe8089a8119681a5479d5f71ab237e7b",
+      "v0/documents/00000_minorityafrica.jsonl.gz": "7d1543a07b220a1cb76f8b37007e8ec49214193ea4c4187a4d2069dba7070da4",
+      "v0/documents/00000_newcanadianmedia.jsonl.gz": "87442c2e2f783358dc61b6383e4a503077abaf3a8d604a0f04fd596f215cf81a",
+      "v0/documents/00000_oxpeckers.jsonl.gz": "6676e6a46bb09c8534c761ed33231f3ebfe5d5cd40ba6908bdc18d306cedb3a0",
+      "v0/documents/00000_propastop.jsonl.gz": "d33975bccd612d30668b982b887d80ac1943f94bfa5c58baed2e98493f17587b",
+      "v0/documents/00000_solutionsjournalism.jsonl.gz": "0c669401064452d31c7d846056f68b7ce0081989b11c65cfba3a84b593be5b8e",
+      "v0/documents/00000_thepublicrecord.jsonl.gz": "1d3ddacb2c14e4e6b5309dec1719e67721bbce828e680cfa842a177e816e82b3",
+      "v0/documents/00000_zimfact.jsonl.gz": "56497ba76fc483f44181cfb3192a165be7daaa72b2bb27b0c2edba45d260663a"
+    }
+  },
+  "built_on": "2026-09-16",
+  "order_salt": "20260905",
+  "source_id": "common-pile-news-rights-filtered-v1",
+  "source_type": "financial-news",
+  "split_periods": {
+    "blind": {
+      "end": "2024-12-31",
+      "start": "2023-01-01"
+    },
+    "development": {
+      "end": "2022-12-31",
+      "start": "2022-01-01"
+    },
+    "training": {
+      "end": "2021-12-31",
+      "start": "2000-01-01"
+    }
+  },
+  "publishers": {
+    "news-360info": {
+      "allowed_hosts": ["360info.org"],
+      "evidence_excerpt": "Except where otherwise noted, site content uses the Creative Commons Attribution 4.0 International license.",
+      "evidence_response_sha256": "fa5e38fa9fc4567b987516aa79d2774ef552619fdf866454bab9291c6494d2a7",
+      "evidence_retrieved_at": "2026-09-16T00:00:00Z",
+      "evidence_url": "https://360info.org/how-to-use-our-content/",
+      "license_id": "CC-BY-4.0",
+      "license_url": "https://creativecommons.org/licenses/by/4.0/",
+      "publisher": "360info"
+    },
+    "news-altnews": {
+      "allowed_hosts": ["altnews.in"],
+      "evidence_excerpt": "Alt News website content uses the Creative Commons Attribution 3.0 Unported license unless another rule is stated.",
+      "evidence_response_sha256": "1c32bf455e84ea0f2cf17b2e0329074ce725521309664b645a33a1f1902c3097",
+      "evidence_retrieved_at": "2026-09-16T00:00:00Z",
+      "evidence_url": "https://www.altnews.in/about/",
+      "license_id": "CC-BY-3.0",
+      "license_url": "https://creativecommons.org/licenses/by/3.0/",
+      "publisher": "Alt News"
+    },
+    "news-balkandiskurs": {
+      "allowed_hosts": ["balkandiskurs.com"],
+      "evidence_excerpt": "Balkan Diskurs permits republication of its stories under the Creative Commons Attribution 3.0 license.",
+      "evidence_response_sha256": "b298b10c1a547012f3b10b5ee32daafc49d775aa0d50ff333dec813f598fed31",
+      "evidence_retrieved_at": "2026-09-16T00:00:00Z",
+      "evidence_url": "https://balkandiskurs.com/en/republishing-guidelines/",
+      "license_id": "CC-BY-3.0",
+      "license_url": "https://creativecommons.org/licenses/by/3.0/",
+      "publisher": "Balkan Diskurs"
+    },
+    "news-factly": {
+      "allowed_hosts": ["factly.in"],
+      "evidence_excerpt": "Factly site content other than video uses the Creative Commons Attribution 4.0 license.",
+      "evidence_response_sha256": "11793490a082f68cdad694cee6da84a7ab45d12086049a1d4c946c98451aaf80",
+      "evidence_retrieved_at": "2026-09-16T00:00:00Z",
+      "evidence_url": "https://factly.in/",
+      "license_id": "CC-BY-4.0",
+      "license_url": "https://creativecommons.org/licenses/by/4.0/",
+      "publisher": "Factly"
+    },
+    "news-freedom": {
+      "allowed_hosts": ["freedom.press"],
+      "evidence_excerpt": "Freedom of the Press Foundation site content uses the Creative Commons Attribution 4.0 license unless stated otherwise.",
+      "evidence_response_sha256": "48ada1433737d50fb55c90484b3655bb4fd92647e0fba1a20f819259dbe016ac",
+      "evidence_retrieved_at": "2026-09-16T00:00:00Z",
+      "evidence_url": "https://freedom.press/about/",
+      "license_id": "CC-BY-4.0",
+      "license_url": "https://creativecommons.org/licenses/by/4.0/",
+      "publisher": "Freedom of the Press Foundation"
+    },
+    "news-globalvoices": {
+      "allowed_hosts": ["globalvoices.org"],
+      "evidence_excerpt": "Unless otherwise stated, Global Voices-created content uses the Creative Commons Attribution 3.0 license.",
+      "evidence_response_sha256": "883e1245f6315cddb088936360d5f368802c4455ef6aefe827d94ee3424fc0ab",
+      "evidence_retrieved_at": "2026-09-16T00:00:00Z",
+      "evidence_url": "https://globalvoices.org/about/global-voices-attribution-policy/",
+      "license_id": "CC-BY-3.0",
+      "license_url": "https://creativecommons.org/licenses/by/3.0/",
+      "publisher": "Global Voices"
+    },
+    "news-oxpeckers": {
+      "allowed_hosts": ["oxpeckers.org"],
+      "evidence_excerpt": "Oxpeckers-created site content uses the Creative Commons Attribution-ShareAlike 4.0 license.",
+      "evidence_response_sha256": "f19675b1e100a6a12326e52d3bcfd7c6242845610b964ed077d1e90882d1182b",
+      "evidence_retrieved_at": "2026-09-16T00:00:00Z",
+      "evidence_url": "https://oxpeckers.org/contribute/",
+      "license_id": "CC-BY-SA-4.0",
+      "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+      "publisher": "Oxpeckers"
+    },
+    "news-thepublicrecord": {
+      "allowed_hosts": ["thepublicrecord.ca"],
+      "evidence_excerpt": "The Public Record permits reuse of its original work under the Creative Commons Attribution-ShareAlike 4.0 license.",
+      "evidence_response_sha256": "3be8b5009914705e26f17afc3251fa141a3a679e91b594314e997394af2a10cd",
+      "evidence_retrieved_at": "2026-09-16T00:00:00Z",
+      "evidence_url": "https://thepublicrecord.ca/use-our-content-our-licensing/",
+      "license_id": "CC-BY-SA-4.0",
+      "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+      "publisher": "The Public Record"
+    }
+  }
+}
