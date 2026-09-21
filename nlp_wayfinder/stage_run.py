@@ -130,11 +130,11 @@ SPLIT_BOUNDARY_FIELDS = tuple(
 )
 
 BUDGET_LIMITS = {
-    "paid-silver-labels": Decimal("0.00"),
+    "paid-silver-labels": Decimal("20.00"),
     "specialist": Decimal("35.00"),
     "gpt": Decimal("25.00"),
     "data-and-storage": Decimal("20.00"),
-    "contingency": Decimal("20.00"),
+    "contingency": Decimal("0.00"),
 }
 TOTAL_BUDGET_LIMIT = Decimal("100.00")
 
@@ -267,6 +267,25 @@ ROUTE_ELIGIBILITY_FIELDS = (
     "audit_fields_supported",
     "no_paid_overflow",
 )
+# A capped paid route proves a hard stop instead of a free limit. It replaces
+# the free-limit fields and the no-overflow fields with a prepaid cap.
+CAPPED_PAID_ROUTE_KIND = "capped-paid"
+CAPPED_PAID_ELIGIBILITY_FIELDS = (
+    "model_identity_verified",
+    "non_gpt_verified",
+    "training_use_permitted",
+    "audit_fields_supported",
+    "cap_verified",
+)
+CAPPED_PAID_PRICE_FIELDS = (
+    "input_usd_per_million",
+    "output_usd_per_million",
+)
+# The frozen per-route request fields. The panel freezes thinking off for Kimi,
+# because a thinking answer breaks the 300-token cap and the strict schema.
+ROUTE_REQUEST_EXTRA_FIELDS: dict[str, dict[str, object]] = {
+    "moonshot/kimi-k2.6": {"thinking": {"type": "disabled"}},
+}
 
 FORBIDDEN_ROUTE_PARTS = {"auto", "free", "fusion", "fallback", "latest"}
 
@@ -562,6 +581,71 @@ def _source_eligibility_stop_reason(
     return None
 
 
+def _positive_usd(value: object) -> Decimal | None:
+    """Read one money field. Give None for anything but a positive amount."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, Decimal)):
+        return None
+    try:
+        amount = Decimal(str(value))
+    except InvalidOperation:
+        return None
+    if not amount.is_finite() or amount <= 0:
+        return None
+    return amount
+
+
+def _route_request_capacity(
+    route: Mapping[str, object], evidence: Mapping[str, object]
+) -> int:
+    """Give the requests a route can still pay for: free limit or prepaid cap."""
+    if route.get("kind") != CAPPED_PAID_ROUTE_KIND:
+        return int(evidence["observed_free_requests_remaining"])
+    cap = _positive_usd(evidence["observed_cap_usd"])
+    worst_case = _positive_usd(route["worst_case_request_cost_usd"])
+    if cap is None or worst_case is None:
+        raise ValueError("The capped route gives no usable cap.")
+    return int(cap // worst_case)
+
+
+def _capped_paid_evidence_reason(
+    route: Mapping[str, object], evidence: Mapping[str, object]
+) -> str | None:
+    """Check the prepaid hard stop that stands in for a free limit."""
+    if any(
+        evidence.get(field) is not True
+        for field in ("account_no_auto_recharge", "account_no_stored_card")
+    ):
+        return "route-evidence-incomplete"
+    cap = _positive_usd(evidence.get("observed_cap_usd"))
+    balance = _positive_usd(evidence.get("observed_prepaid_balance_usd"))
+    # The worst-case request cost is declared, not derived: the bounded prompt
+    # has no frozen token ceiling to derive it from.
+    worst_case = _positive_usd(route.get("worst_case_request_cost_usd"))
+    prices = evidence.get("prices")
+    if (
+        cap is None
+        or balance is None
+        or worst_case is None
+        or not isinstance(prices, Mapping)
+        or any(
+            _positive_usd(prices.get(field)) is None
+            for field in CAPPED_PAID_PRICE_FIELDS
+        )
+    ):
+        return "route-evidence-incomplete"
+    requests_per_day = evidence.get("observed_requests_per_day")
+    if not isinstance(requests_per_day, int) or isinstance(requests_per_day, bool):
+        return "route-evidence-incomplete"
+    if route.get("requests_per_day") != requests_per_day:
+        return "route-evidence-inconsistent"
+    declared_cap = _positive_usd(route.get("cap_usd"))
+    if declared_cap != cap or balance < cap or cap > BUDGET_LIMITS["paid-silver-labels"]:
+        return "route-evidence-inconsistent"
+    if not all(route.get(field) is True for field in CAPPED_PAID_ELIGIBILITY_FIELDS):
+        return "route-evidence-incomplete"
+    return None
+
+
 def _route_evidence_reason(
     route: Mapping[str, object], *, starts_on: date, run_on: date
 ) -> str | None:
@@ -583,7 +667,8 @@ def _route_evidence_reason(
         return "route-evidence-stale"
     if evidence.get("observed_route_id") != route.get("route_id"):
         return "route-identity-unconfirmed"
-    if evidence.get("account_no_paid_overflow") is not True:
+    capped = route.get("kind") == CAPPED_PAID_ROUTE_KIND
+    if not capped and evidence.get("account_no_paid_overflow") is not True:
         return "route-evidence-incomplete"
     training_use = evidence.get("training_use")
     if not isinstance(training_use, Mapping) or any(
@@ -600,6 +685,8 @@ def _route_evidence_reason(
         freshness_days=ROUTE_EVIDENCE_FRESHNESS_DAYS,
     ):
         return "route-evidence-stale"
+    if capped:
+        return _capped_paid_evidence_reason(route, evidence)
     observed_fields = (
         "observed_free_requests_remaining",
         "observed_requests_per_day",
@@ -1865,6 +1952,7 @@ def _vote_request(
             },
         },
         "user": candidate["candidate_id"],
+        **ROUTE_REQUEST_EXTRA_FIELDS.get(route_id, {}),
     }
 
 
@@ -1928,6 +2016,65 @@ def _software_versions() -> dict[str, str]:
         "python": sys.version.split()[0],
         "nlp-wayfinder": package_version,
     }
+
+
+class _ExhaustedTransport:
+    """Stand in for a capped route that has reached its cap."""
+
+    def complete(
+        self, request: Mapping[str, object], timeout_seconds: float
+    ) -> OmniRouteResponse:
+        raise OSError("capped-paid-balance-exhausted")
+
+
+def _capped_paid_meters(
+    stage_manifest: Mapping[str, object], route_ids: Sequence[str]
+) -> dict[str, dict[str, Decimal]]:
+    """Give the frozen cap and prices of each capped route in the panel."""
+    panel = stage_manifest.get("route_panel")
+    routes = panel.get("routes") if isinstance(panel, Mapping) else None
+    meters: dict[str, dict[str, Decimal]] = {}
+    for route in routes if isinstance(routes, list) else []:
+        if (
+            not isinstance(route, Mapping)
+            or route.get("kind") != CAPPED_PAID_ROUTE_KIND
+            or str(route.get("route_id")) not in route_ids
+        ):
+            continue
+        evidence = cast(Mapping[str, object], route["evidence"])
+        prices = cast(Mapping[str, object], evidence["prices"])
+        meter = {
+            "cap": _positive_usd(evidence["observed_cap_usd"]),
+            "worst_case": _positive_usd(route["worst_case_request_cost_usd"]),
+            "input": _positive_usd(prices["input_usd_per_million"]),
+            "output": _positive_usd(prices["output_usd_per_million"]),
+        }
+        # The eligibility gate already proved each of these.
+        assert all(value is not None for value in meter.values())
+        meters[str(route["route_id"])] = cast(dict[str, Decimal], meter)
+    return meters
+
+
+def _metered_request_cost(
+    record: Mapping[str, object], meter: Mapping[str, Decimal]
+) -> Decimal:
+    """Price one attempt from its own usage and the frozen peak prices."""
+    if record.get("status_code") == 0:
+        # No response arrived, so the provider billed nothing.
+        return Decimal(0)
+    tokens = record.get("token_use")
+    if not isinstance(tokens, Mapping):
+        return meter["worst_case"]
+    try:
+        prompt = int(cast(int, tokens["prompt_tokens"]))
+        completion = int(cast(int, tokens["completion_tokens"]))
+    except (KeyError, TypeError, ValueError):
+        return meter["worst_case"]
+    if prompt < 0 or completion < 0:
+        return meter["worst_case"]
+    return (
+        prompt * meter["input"] + completion * meter["output"]
+    ) / Decimal(1_000_000)
 
 
 def _transport_error_response(
@@ -2709,6 +2856,7 @@ class StageRun:
         retry_ordinal: int,
         transport: VoteTransport,
         timeout_seconds: float,
+        capped_paid: bool = False,
     ) -> dict[str, Any]:
         """Make one attempt at one vote and return its raw-vote record."""
         request = _vote_request(route_id, candidate)
@@ -2744,7 +2892,13 @@ class StageRun:
                 None,
             )
         elif _is_free_limit(response):
-            outcome, abstention_reason, label = "abstention", "free-limit", None
+            # A capped route has no free quota to wait for. A refused call is a
+            # spent balance, so it is a kept abstention, not a retry.
+            outcome, abstention_reason, label = (
+                "abstention",
+                "transport-error" if capped_paid else "free-limit",
+                None,
+            )
         elif response.status_code != 200:
             outcome, abstention_reason, label = "abstention", "transport-error", None
         elif (
@@ -2767,7 +2921,9 @@ class StageRun:
             )
         except InvalidOperation:
             paid_overflow = True
-        if paid_overflow:
+        # A capped route is paid by design. Its spend is metered from `usage`
+        # and the frozen prices, never from this header.
+        if paid_overflow and not capped_paid:
             outcome, abstention_reason, label = (
                 "abstention",
                 "paid-overflow",
@@ -2933,11 +3089,19 @@ class StageRun:
                     return self._collection_stop("vote-candidate-invalid", route_ids)
                 scheduled.append(candidate)
 
+        meters = _capped_paid_meters(stage_manifest, route_ids)
+        # The spend survives a restart, because every attempt is in the log.
+        spent = {route_id: Decimal(0) for route_id in meters}
         logged: dict[tuple[object, object], list[Mapping[str, Any]]] = {}
         kept: dict[tuple[object, object], list[Mapping[str, Any]]] = {}
         for record in self.raw_vote_records():
             key = (record.get("candidate_id"), record.get("requested_route_id"))
             logged.setdefault(key, []).append(record)
+            meter = meters.get(str(record.get("requested_route_id")))
+            if meter is not None:
+                spent[str(record["requested_route_id"])] += _metered_request_cost(
+                    record, meter
+                )
             # A spent free quota resets. That attempt must not block the later vote.
             if record.get("abstention_reason") != "free-limit":
                 kept.setdefault(key, []).append(record)
@@ -2954,15 +3118,25 @@ class StageRun:
                     continue
                 # The ordinal is the position of the attempt in the log.
                 retry_ordinal = len(logged.get(key, []))
+                meter = meters.get(route_id)
                 while True:
+                    # Stop one worst-case request short of the cap. An exhausted
+                    # route abstains and the panel carries on with the rest.
+                    exhausted = (
+                        meter is not None
+                        and spent[route_id] + meter["worst_case"] > meter["cap"]
+                    )
                     record = self._vote_attempt(
                         candidate,
                         route_id,
                         retry_ordinal,
-                        transport,
+                        _ExhaustedTransport() if exhausted else transport,
                         timeout_seconds,
+                        capped_paid=meter is not None,
                     )
                     self._raw_vote_log.append(record)
+                    if meter is not None:
+                        spent[route_id] += _metered_request_cost(record, meter)
                     reason = record["abstention_reason"]
                     if reason == "free-limit":
                         return self._collection_stop("free-limit-failure", route_ids)
@@ -4828,8 +5002,8 @@ class StageRun:
                 remaining_experiment_requests = int(
                     route["remaining_experiment_requests"]
                 )
-                free_requests_remaining = int(
-                    account_evidence["observed_free_requests_remaining"]
+                free_requests_remaining = _route_request_capacity(
+                    route, account_evidence
                 )
                 requests_per_day = int(
                     account_evidence["observed_requests_per_day"]
@@ -4848,6 +5022,29 @@ class StageRun:
                     raise ValueError
                 if free_requests_remaining < remaining_experiment_requests:
                     return self._stop(run_id, "route-demand-exceeds-free-capacity", stage)
+            # Routes on one account share one daily grant. Each must declare its
+            # own share of it, or two routes count the same pool twice.
+            shared: dict[str, list[Mapping[str, object]]] = {}
+            for route in eligible_routes:
+                account_evidence = cast(Mapping[str, object], route["evidence"])
+                shared.setdefault(
+                    str(account_evidence["account"]), []
+                ).append(account_evidence)
+            for account_records in shared.values():
+                if len(account_records) < 2:
+                    continue
+                grant = {
+                    int(record["account_requests_per_day_grant"])
+                    for record in account_records
+                }
+                claimed = sum(
+                    int(record["observed_requests_per_day"])
+                    for record in account_records
+                )
+                if len(grant) != 1 or claimed > grant.pop():
+                    return self._stop(
+                        run_id, "route-demand-exceeds-free-capacity", stage
+                    )
         except (KeyError, TypeError, ValueError):
             return self._stop(run_id, "invalid-route-demand", stage)
 

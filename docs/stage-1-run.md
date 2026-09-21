@@ -259,6 +259,22 @@ other valid routes can still pass. An identity or free-limit mismatch stops the
 stage. The build decision records each evidence record, its SHA-256 value, and
 the accepted route set.
 
+A route with `kind` set to `capped-paid` is a paid route with a prepaid hard
+stop. It gives no free-limit evidence and no `account_no_paid_overflow` field.
+In their place it gives `account_no_auto_recharge`, `account_no_stored_card`,
+`observed_prepaid_balance_usd`, `observed_cap_usd`, and a `prices` record with
+`input_usd_per_million` and `output_usd_per_million`. The route itself gives
+`cap_usd`, `cap_verified`, and `worst_case_request_cost_usd`. The cap must equal
+the declared cap, the prepaid balance must be no less than the cap, and the cap
+must be no more than the USD 20.00 `paid-silver-labels` limit. The capacity of a
+capped route is `floor(cap / worst-case request cost)` in place of the free
+limit. All other route rules do not change.
+
+Two routes on one account share one daily grant. Each such route must give
+`account_requests_per_day_grant`, and the sum of their
+`observed_requests_per_day` values must be no more than that grant. If it is
+more, the stage returns `route-demand-exceeds-free-capacity`.
+
 The route refusal reasons are `route-evidence-incomplete` and
 `route-evidence-stale`. If fewer than three routes remain, the stage returns
 `insufficient-eligible-routes`. A free-limit mismatch returns
@@ -325,6 +341,18 @@ so the route gets its repair again after the quota resets.
 
 A free-limit failure or a paid response stops collection. The command returns
 exit code `2` with stop reason `free-limit-failure` or `paid-overflow-detected`.
+A capped paid route is the one exception. A paid answer on such a route is a
+valid vote. Collection measures its own cost from the `usage` record and the
+frozen prices, and it does not use the `x-omniroute-response-cost` header. The
+cost of each attempt in `raw-votes.jsonl` counts, so a new run does not lose the
+spend. An attempt that gives no response costs nothing. An attempt with no
+`usage` record costs the worst-case amount. Collection stops the route one
+worst-case request before the cap. After that stop, and also if the provider
+refuses the route for a spent balance, each later attempt on that route is a
+kept `transport-error` abstention, and collection continues with the other
+routes. The panel then has three voters and does not fail the three-route gate.
+A capped route carries its frozen request fields. The Kimi route sends
+`thinking` with type `disabled`.
 Run the command again after the free quota resets. Collection does not repeat a
 vote that is already in the log, but it does collect again each vote that stopped
 on the free limit.
