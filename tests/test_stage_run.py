@@ -186,6 +186,20 @@ class ScriptedVoteTransport(FixedVoteTransport):
         return self.scripted.pop(0)
 
 
+class PaidVoteTransport(FixedVoteTransport):
+    """Bill each capped-route answer, the way a paid provider does."""
+
+    def complete(
+        self, request: Mapping[str, object], timeout_seconds: float
+    ) -> OmniRouteResponse:
+        response = super().complete(request, timeout_seconds)
+        if not str(request["model"]).startswith("moonshot/"):
+            return response
+        headers = dict(response.headers)
+        headers["x-omniroute-response-cost"] = "0.0001000000"
+        return response._replace(headers=headers)
+
+
 class MalformedVoteTransport(FixedVoteTransport):
     """Answer every fixed route with a bare label that no schema accepts."""
 
@@ -242,7 +256,7 @@ def route(route_id: str) -> dict[str, object]:
         "available_days": 7,
         "evidence": {
             "checked_at": "2026-09-10T00:00:00Z",
-            "account": "fixture-account",
+            "account": f"fixture-account-{route_id}",
             "terms_url": "https://example.test/terms",
             "observed_route_id": route_id,
             "observed_free_requests_remaining": 21000,
@@ -256,6 +270,41 @@ def route(route_id: str) -> dict[str, object]:
             },
         },
     }
+
+
+def capped_paid_route(
+    route_id: str = "moonshot/kimi-k2.6",
+    *,
+    cap_usd: str = "20.00",
+    worst_case_usd: str = "0.0020",
+    prices: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    """Give one capped paid route: a prepaid hard stop, not a free limit."""
+    record = route(route_id)
+    evidence = cast(dict[str, Any], record["evidence"])
+    for field in ("no_paid_overflow", "account_free_limit_verified"):
+        record.pop(field)
+    record.pop("free_requests_remaining")
+    for field in ("account_no_paid_overflow", "observed_free_requests_remaining"):
+        evidence.pop(field)
+    record["kind"] = "capped-paid"
+    record["cap_verified"] = True
+    record["cap_usd"] = cap_usd
+    record["worst_case_request_cost_usd"] = worst_case_usd
+    record["current_stage_requests"] = 500
+    record["remaining_experiment_requests"] = 500
+    evidence["account_no_auto_recharge"] = True
+    evidence["account_no_stored_card"] = True
+    evidence["observed_cap_usd"] = cap_usd
+    evidence["observed_prepaid_balance_usd"] = cap_usd
+    evidence["prices"] = dict(
+        prices
+        or {
+            "input_usd_per_million": "0.60",
+            "output_usd_per_million": "2.50",
+        }
+    )
+    return record
 
 
 def source_yield_evidence(
@@ -749,6 +798,68 @@ class StageRunTests(unittest.TestCase):
         self.assertEqual(
             [*ROUTE_IDS, "provider/fixed-extra-model"],
             evidence["routes"]["eligible_route_ids"],
+        )
+
+    def test_capped_paid_route_joins_the_panel_on_its_prepaid_cap(self) -> None:
+        manifest = draft_manifest()
+        manifest["route_panel"]["routes"].append(capped_paid_route())  # type: ignore[index]
+
+        decision = self.evaluate(manifest)
+
+        evidence = cast(dict[str, Any], decision["evidence"])
+        self.assertEqual("build-eligible", decision["decision"])
+        self.assertEqual(
+            [*ROUTE_IDS, "moonshot/kimi-k2.6"],
+            evidence["routes"]["eligible_route_ids"],
+        )
+
+    def test_capped_route_capacity_is_the_cap_over_the_worst_case_cost(self) -> None:
+        manifest = draft_manifest()
+        # 500 requests need USD 25.00 at this worst case, above the USD 20 cap.
+        manifest["route_panel"]["routes"].append(  # type: ignore[index]
+            capped_paid_route(worst_case_usd="0.0500")
+        )
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("no-build", decision["decision"])
+        self.assertEqual(
+            "route-demand-exceeds-free-capacity", decision["stop_reason"]
+        )
+
+    def test_capped_route_without_a_hard_stop_is_not_eligible(self) -> None:
+        manifest = draft_manifest()
+        extra = capped_paid_route()
+        cast(dict[str, Any], extra["evidence"]).pop("account_no_auto_recharge")
+        manifest["route_panel"]["routes"].append(extra)  # type: ignore[index]
+
+        decision = self.evaluate(manifest)
+
+        evidence = cast(dict[str, Any], decision["evidence"])
+        self.assertEqual("build-eligible", decision["decision"])
+        self.assertNotIn(
+            "moonshot/kimi-k2.6", evidence["routes"]["eligible_route_ids"]
+        )
+        self.assertEqual(
+            "route-evidence-incomplete",
+            evidence["routes"]["eligibility"]["moonshot/kimi-k2.6"][
+                "refusal_reason"
+            ],
+        )
+
+    def test_two_routes_cannot_claim_one_daily_grant_twice(self) -> None:
+        manifest = draft_manifest()
+        routes = cast(list[dict[str, Any]], manifest["route_panel"]["routes"])
+        # Two Cloudflare routes on one account, each claiming the whole grant.
+        for record in routes[:2]:
+            record["evidence"]["account"] = "one-cloudflare-account"
+            record["evidence"]["account_requests_per_day_grant"] = 1000
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("no-build", decision["decision"])
+        self.assertEqual(
+            "route-demand-exceeds-free-capacity", decision["stop_reason"]
         )
 
     def test_schedule_window_must_hold_the_slowest_route(self) -> None:
@@ -1676,9 +1787,11 @@ class VoteCollectionTests(unittest.TestCase):
         seal_source_yield_pools(self.runner, draft_manifest())
 
     def vote_inputs(
-        self,
+        self, *extra_routes: Mapping[str, object]
     ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
-        stage_manifest = confirm_manifest(draft_manifest(), "fixture-owner")
+        draft = draft_manifest()
+        cast(dict[str, Any], draft["route_panel"])["routes"].extend(extra_routes)
+        stage_manifest = confirm_manifest(draft, "fixture-owner")
         candidates = candidate_manifest()
         candidates["candidates"] = [
             {
@@ -2303,6 +2416,67 @@ class VoteCollectionTests(unittest.TestCase):
         self.assertEqual("abstention", vote["outcome"])
         self.assertEqual("paid-overflow", vote["abstention_reason"])
 
+
+    def test_a_paid_answer_on_a_capped_route_is_a_valid_vote(self) -> None:
+        stage_manifest, candidates, allocation = self.vote_inputs(
+            capped_paid_route()
+        )
+        transport = PaidVoteTransport()
+
+        result = self.runner.collect_votes(
+            stage_manifest, candidates, allocation, transport
+        )
+
+        self.assertEqual("complete", result["collection"])
+        self.assertEqual(8, result["raw_vote_count"])
+        self.assertEqual(
+            {"valid"},
+            {record["outcome"] for record in self.runner.raw_vote_records()},
+        )
+        thinking = {
+            str(request["model"]): request.get("thinking")
+            for request, _ in transport.requests
+        }
+        self.assertEqual(
+            {"type": "disabled"}, thinking["moonshot/kimi-k2.6"]
+        )
+        self.assertIsNone(thinking[ROUTE_IDS[0]])
+
+    def test_a_capped_route_stops_before_its_cap_and_keeps_voting(self) -> None:
+        # Each answer costs USD 0.0096 at these prices, so the cap holds one.
+        capped = capped_paid_route(
+            cap_usd="0.0150",
+            worst_case_usd="0.0100",
+            prices={
+                "input_usd_per_million": "100.00",
+                "output_usd_per_million": "100.00",
+            },
+        )
+        capped["current_stage_requests"] = 1
+        capped["remaining_experiment_requests"] = 1
+        stage_manifest, candidates, allocation = self.vote_inputs(capped)
+        transport = PaidVoteTransport()
+
+        result = self.runner.collect_votes(
+            stage_manifest, candidates, allocation, transport
+        )
+
+        self.assertEqual("complete", result["collection"])
+        self.assertEqual(8, result["raw_vote_count"])
+        capped_votes = [
+            record
+            for record in self.runner.raw_vote_records()
+            if record["requested_route_id"] == "moonshot/kimi-k2.6"
+        ]
+        self.assertEqual(["valid", "abstention"], [
+            record["outcome"] for record in capped_votes
+        ])
+        self.assertEqual("transport-error", capped_votes[1]["abstention_reason"])
+        self.assertEqual(0, capped_votes[1]["status_code"])
+        # The cap spends no request it cannot pay for.
+        self.assertEqual(
+            7, len([request for request, _ in transport.requests])
+        )
 
     def test_the_vote_request_holds_the_full_auditable_vote_schema(self) -> None:
         stage_manifest, candidates, allocation = self.vote_inputs()
@@ -4318,7 +4492,8 @@ class Stage1ReportTests(unittest.TestCase):
         self.assertEqual(64, len(source["yield"]["evidence_sha256"]))
         for route_id in ROUTE_IDS:
             self.assertEqual(
-                "fixture-account", route_evidence["evidence"][route_id]["account"]
+                f"fixture-account-{route_id}",
+                route_evidence["evidence"][route_id]["account"],
             )
             self.assertEqual(
                 64, len(route_evidence["evidence_sha256"][route_id])
