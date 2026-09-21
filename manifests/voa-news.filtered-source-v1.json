@@ -1,0 +1,68 @@
+{
+  "built_on": "2026-09-19",
+  "company_filter": {
+    "exchanges": [
+      "NYSE",
+      "Nasdaq"
+    ],
+    "min_name_chars": 3,
+    "rule": "Strip legal-form suffixes, filing tags, and a leading 'The' from each EDGAR name (NYSE and Nasdaq rows, at least 3 characters). A hit is a whole-word, case-insensitive match of a stripped name in one sentence where every hit word starts with a capital letter or digit. The hit must not touch another capitalized word, except a legal-form word after it or the first word of the sentence before it. A legal-form word must follow the hit, or a company cue word must be within 60 characters of it. Sentences split at . ! ? but not after initials or common abbreviations. Select the longest safe consecutive window (at least 3 sentences and 400 characters, at most 6,000 characters) that has a hit.",
+    "rule_code": "scripts/build_filtered_voa_news.py: CompanyMatcher, split_sentences, select_passage",
+    "rule_tuning_data": "Tuned only on training-period (2021) pages in crawl shard 00000 before any count. No 2022-2024 page was inspected.",
+    "snapshot_file": "company_tickers_exchange.json",
+    "snapshot_last_modified": "2026-09-18T11:55:14Z",
+    "snapshot_retrieved_at": "2026-09-19",
+    "snapshot_sha256": "a4aa20329b32644f7ac3b50ef5fa431343ada802f91286c58423afa88c8f0e55",
+    "snapshot_url": "https://www.sec.gov/files/company_tickers_exchange.json"
+  },
+  "crawl": {
+    "full_id_window": [
+      6300000,
+      7960000
+    ],
+    "requests_per_second": 4,
+    "sitemap_index_sha256": "1eddb683f7b6a4857a71945d2ba2a1abd27d53a90ae7e83099f6a83779f63f35",
+    "sitemap_index_url": "https://www.voanews.com/sitemap.xml",
+    "sitemap_retrieved_at": "2026-09-19",
+    "sitemap_url_list_sha256": "da17cfbac577979d586570594714f6ef13da973fa2237f509850bc070deff039",
+    "subset_fraction": 0.2,
+    "subset_salt": "voa-news-training-subset-v1"
+  },
+  "minimum_passages": {
+    "blind": 600,
+    "development": 300,
+    "training": 4000
+  },
+  "order_salt": "20260905",
+  "rights": {
+    "evidence_excerpt": "All text, audio and video material produced exclusively by the Voice of America is in the public domain.",
+    "evidence_response_sha256": "b2b12710fd5facdb788813579ab467a4249bb2782be615bf19cec757bd63db29",
+    "evidence_retrieved_at": "2026-09-19",
+    "evidence_url": "https://www.voanews.com/p/5338.html",
+    "license_id": "public-domain-voa-produced",
+    "stated_uncertainty": "17 U.S.C. 105 covers works of federal employees; many VOA journalists are contractors. This source relies on VOA's first-party statement that material produced exclusively by VOA is in the public domain.",
+    "wire_copy_exclusion_excerpt": "VOA has individual licenses from Agence France Presse (AFP), the Associated Press (AP) and Reuters to use their text, video, audio, photos and graphics on our website. All three agencies’ material is copyrighted and the property of AFP, AP and Reuters respectively, and may not be copied, published or redistributed without the written permission of each agency."
+  },
+  "source_id": "voa-news-staff-listed-company-v1",
+  "source_type": "financial-news",
+  "split_periods": {
+    "blind": {
+      "end": "2024-12-31",
+      "start": "2023-01-01"
+    },
+    "development": {
+      "end": "2022-12-31",
+      "start": "2022-01-01"
+    },
+    "training": {
+      "end": "2021-12-31",
+      "start": "2000-01-01"
+    }
+  },
+  "staff_rules": {
+    "byline": "At least one /author/ byline link; no byline names Reuters, Associated Press, AP, AFP, or Agence France-Presse.",
+    "text_article": "Only /a/ pages with an h1.pg-title headline and direct paragraphs in the article-content .wsw body. Video, audio, and gallery pages have no such body.",
+    "third_party_notice": "Reject the article if article-content text has a copyright sign, 'copyright', 'all rights reserved', 'used with permission', 'originally published/appeared', 'republished with/under', 'Creative Commons', or 'licensed under'.",
+    "wire_credit": "Reject the article if any article-content text names Reuters, Associated Press, AP, AFP, or Agence France-Presse (case-sensitive)."
+  }
+}

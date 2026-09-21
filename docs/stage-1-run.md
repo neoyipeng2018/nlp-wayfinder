@@ -52,16 +52,37 @@ python3 -m nlp_wayfinder.stage_run check confirmed.json \
 A valid result is `build-eligible`. This result does not start work. Get separate
 approval before you use an external service.
 
-A Stage 1 manifest gives its one financial-news source in a `source` object. It
-gives the route demand in `route_panel`, the schedule in `schedule`, and the
-planned cost in `budget.planned_commitments_usd`. A later stage gives a `sources`
-array instead, and each record in that array holds its own data plan, route
-demand, schedule, and planned cost. `docs/stage-2-run.md` gives that form.
+A Stage 1 manifest gives its financial-news source in a `source` object, or it
+gives a `sources` array of no more than two records. It gives the route demand in
+`route_panel`, the schedule in `schedule`, and the planned cost in
+`budget.planned_commitments_usd`. Each record of a `sources` array holds its own
+data plan, route demand, schedule, and planned cost. `docs/stage-2-run.md` gives
+that form. A later stage gives one record for each source type of the stage.
+
+Stage 1 may give two sources of the one `financial-news` type, one for each
+data-portfolio lane. Each source keeps its own eligibility evidence, its own
+sealed yield pool, its own fixed-order inspection, and its own annex. Each source
+gives its own share of the allocation and of the inspection limit in `data_plan`.
+The shares of one source type must add up to the frozen allocation of 4,000
+training, 200 development, and 400 blind examples, and to the frozen inspection
+limit of 6,668 candidates. A share that does not add up returns
+`source-data-plan-invalid`. More than two Stage 1 sources, a repeated `source_id`,
+or a missing source type returns `stage-source-incomplete`.
 
 Each source must contain one `eligibility_evidence` record. The record must give
 `checked_at`, `terms_url`, `reviewer`, `access_method`,
-`data_portfolio_lane`, and `rights`. The lane must be `clean-core`. A
-`restricted-auxiliary` source cannot supply cumulative-checkpoint training data.
+`data_portfolio_lane`, and `rights`. The lane must be `clean-core` or
+`restricted-auxiliary`.
+
+A `restricted-auxiliary` source may supply **blind** passages only. Its
+`data_plan` must give 0 training and 0 development examples. Another value returns
+`source-lane-restricted`. Such a source supplies manifest-only blind passages: it
+stores the source identifier, URL, timestamp, content hash, and labels, and it
+does not redistribute passage text. It must prove `access_permitted` and
+`private_evaluation_permitted`. The three passage-text rights may be false,
+because the blind split is read one time and scored one time. A training or
+development source keeps the full five-right, clause-level `passage-text` audit
+and the `clean-core` lane.
 
 `rights` must contain one record for each of the five fixed rights. Each record
 must give `permitted`, `primary_source_term_url`, `exact_clause`,
@@ -165,7 +186,10 @@ these fields:
 
 - `candidate_id`
 - `event_group_id`
-- `company_id`, for the same publicly traded company in related records
+- `company_id`, for the same named company in related records. The company can be
+  listed, formerly listed, foreign listed, or privately held. The human labeler
+  sets the canonical company at inspection, because the widened target rule holds
+  no company list to give a stable identifier.
 - `company`, with the `name` that the human labeler sees. Each voter, GPT, and
   the specialist receive this name as the company target, not `company_id`.
 - `aspect`, from the Stage 1 aspect set

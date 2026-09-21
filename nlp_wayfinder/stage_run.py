@@ -258,6 +258,21 @@ PASSAGE_TEXT_RIGHTS = {
     "weight_release_permitted",
     "text_redistribution_permitted",
 }
+# A `restricted-auxiliary` source may supply blind passages only. The blind
+# split is read one time and scored one time, so it exercises neither the
+# training rights nor redistribution. It must still prove these two rights.
+# See decision 3 of https://github.com/neoyipeng2018/nlp-wayfinder/issues/78.
+BLIND_ONLY_RIGHTS = {
+    "access_permitted",
+    "private_evaluation_permitted",
+}
+BLIND_ONLY_LANE = "restricted-auxiliary"
+CLEAN_CORE_LANE = "clean-core"
+# A `restricted-auxiliary` source supplies no training and no development
+# passage, whatever its yield.
+BLIND_ONLY_FORBIDDEN_SPLITS = ("training", "development")
+# Stage 1 takes at most two sources: one for each data-portfolio lane.
+STAGE_MAX_SOURCES = {1: 2}
 
 ROUTE_ELIGIBILITY_FIELDS = (
     "model_identity_verified",
@@ -532,13 +547,9 @@ def _source_eligibility_stop_reason(
         for field in SOURCE_ELIGIBILITY_FIELDS
     ):
         return "source-rights-evidence-incomplete"
-    if evidence.get("data_portfolio_lane") not in {
-        "clean-core",
-        "restricted-auxiliary",
-    }:
+    lane = evidence.get("data_portfolio_lane")
+    if lane not in {CLEAN_CORE_LANE, BLIND_ONLY_LANE}:
         return "source-rights-evidence-incomplete"
-    if evidence.get("data_portfolio_lane") == "restricted-auxiliary":
-        return "source-lane-restricted"
     if not _is_http_url(evidence.get("terms_url")):
         return "source-rights-evidence-incomplete"
     if not _is_fresh_evidence(
@@ -551,6 +562,11 @@ def _source_eligibility_stop_reason(
     rights = evidence.get("rights")
     if not isinstance(rights, Mapping) or set(rights) != set(RIGHTS_FIELDS):
         return "source-rights-evidence-incomplete"
+    # The blind-only lane must prove access and private evaluation. It must
+    # still give a complete, attributable clause for each of the five rights.
+    required_rights = (
+        BLIND_ONLY_RIGHTS if lane == BLIND_ONLY_LANE else set(RIGHTS_FIELDS)
+    )
     for right in RIGHTS_FIELDS:
         clause = rights.get(right)
         if not isinstance(clause, Mapping) or any(
@@ -562,7 +578,9 @@ def _source_eligibility_stop_reason(
             for field in RIGHTS_CLAUSE_FIELDS
         ):
             return "source-rights-evidence-incomplete"
-        if clause.get("permitted") is not True:
+        if right in required_rights and clause.get("permitted") is not True:
+            return "source-rights-evidence-incomplete"
+        if not isinstance(clause.get("permitted"), bool):
             return "source-rights-evidence-incomplete"
         if not _is_http_url(clause.get("primary_source_term_url")):
             return "source-rights-evidence-incomplete"
@@ -575,6 +593,7 @@ def _source_eligibility_stop_reason(
             return "source-rights-evidence-stale"
         if (
             right in PASSAGE_TEXT_RIGHTS
+            and right in required_rights
             and clause.get("audited_object") != "passage-text"
         ):
             return "source-rights-evidence-incomplete"
@@ -746,8 +765,15 @@ def _source_yield_result(
     stage: int,
     starts_on: date,
     run_on: date,
+    targets: Mapping[str, int] | None = None,
+    limit: int | None = None,
 ) -> tuple[str | None, dict[str, object] | None]:
-    """Check one source yield record and give its calculated result."""
+    """Check one source yield record and give its calculated result.
+
+    `targets` and `limit` give the share of the fixed allocation and of the
+    fixed inspection limit that this one source must carry. A stage with one
+    source for each source type carries the whole share.
+    """
     if not isinstance(evidence, Mapping):
         return "source-yield-unproven", None
     checked_at = evidence.get("checked_at")
@@ -855,7 +881,8 @@ def _source_yield_result(
         if candidate["verified_company_target"] is True
     ]
     verified_count = len(verified)
-    targets = SOURCE_ALLOCATION_TARGETS[source_type]
+    if targets is None:
+        targets = SOURCE_ALLOCATION_TARGETS[source_type]
     total_allocation = sum(targets.values())
     pool_by_split = {
         split: sum(1 for item in pool_candidates if item["split"] == split)
@@ -897,7 +924,8 @@ def _source_yield_result(
         "projected_by_split": projected_by_split,
         "projected_inspection_count": projected_inspection_count,
     }
-    limit = SOURCE_SILVER_CANDIDATE_LIMITS[source_type]
+    if limit is None:
+        limit = SOURCE_SILVER_CANDIDATE_LIMITS[source_type]
     if (
         projected_company_targets < total_allocation
         or any(projected_by_split[split] < targets[split] for split in targets)
@@ -906,6 +934,81 @@ def _source_yield_result(
     ):
         return "source-yield-unproven", result
     return None, result
+
+
+def _apportioned_source_plans(
+    source_records: Sequence[Mapping[str, object]], staged_form: bool
+) -> tuple[str | None, dict[str, dict[str, object]]]:
+    """Give the allocation share and inspection share of each source.
+
+    Stage 1 may split one source type across two sources, one for each
+    data-portfolio lane. The shares of one source type must add up to the
+    frozen allocation and to the frozen inspection limit of that type. A
+    `restricted-auxiliary` source may carry a blind share only.
+    """
+    plans: dict[str, dict[str, object]] = {}
+    for item in source_records:
+        source_id = str(item["source_id"])
+        source_type = str(item["source_type"])
+        targets = SOURCE_ALLOCATION_TARGETS[source_type]
+        limit = SOURCE_SILVER_CANDIDATE_LIMITS[source_type]
+        evidence = item.get("eligibility_evidence")
+        lane = (
+            evidence.get("data_portfolio_lane")
+            if isinstance(evidence, Mapping)
+            else None
+        )
+        plan = item.get("data_plan")
+        if plan is None and not staged_form:
+            # The one-source Stage 1 form carries the whole share, so a
+            # blind-only source cannot fill it.
+            if lane == BLIND_ONLY_LANE and any(
+                targets[split] for split in BLIND_ONLY_FORBIDDEN_SPLITS
+            ):
+                return "source-lane-restricted", {}
+            plans[source_id] = {
+                "source_type": source_type,
+                "targets": dict(targets),
+                "silver_candidate_limit": limit,
+            }
+            continue
+        if not isinstance(plan, Mapping):
+            return "source-data-plan-invalid", {}
+        share_limit = plan.get("silver_candidate_limit")
+        if (
+            not isinstance(share_limit, int)
+            or isinstance(share_limit, bool)
+            or share_limit < 0
+        ):
+            return "source-data-plan-invalid", {}
+        share: dict[str, int] = {}
+        for split in CANDIDATE_SPLITS:
+            count = plan.get(split)
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                return "source-data-plan-invalid", {}
+            share[split] = count
+        if lane == BLIND_ONLY_LANE and any(
+            share[split] for split in BLIND_ONLY_FORBIDDEN_SPLITS
+        ):
+            return "source-lane-restricted", {}
+        plans[source_id] = {
+            "source_type": source_type,
+            "targets": share,
+            "silver_candidate_limit": share_limit,
+        }
+    for source_type in {str(item["source_type"]) for item in source_records}:
+        shares = [
+            plan for plan in plans.values() if plan["source_type"] == source_type
+        ]
+        targets = SOURCE_ALLOCATION_TARGETS[source_type]
+        if any(
+            sum(cast(dict, plan["targets"])[split] for plan in shares) != count
+            for split, count in targets.items()
+        ) or sum(
+            cast(int, plan["silver_candidate_limit"]) for plan in shares
+        ) != SOURCE_SILVER_CANDIDATE_LIMITS[source_type]:
+            return "source-data-plan-invalid", {}
+    return None, plans
 
 
 def _prediction_file_stage(record: Mapping[str, object]) -> int:
@@ -4877,15 +4980,32 @@ class StageRun:
                     item.get("eligibility_evidence"),
                 )
             source_records.append(item)
-            source_starts_on[str(item["source_type"])] = starts_on or run_on
+            source_starts_on[str(item["source_id"])] = starts_on or run_on
         source_types = [str(item["source_type"]) for item in source_records]
-        if sorted(source_types) != sorted(STAGE_SOURCES[stage]):
+        source_ids = [str(item["source_id"]) for item in source_records]
+        # Stage 1 may take two sources of the one stage source type, one for
+        # each data-portfolio lane. Every stage source type must be covered.
+        if (
+            len(set(source_ids)) != len(source_ids)
+            or set(source_types) != set(STAGE_SOURCES[stage])
+            or len(source_records)
+            > STAGE_MAX_SOURCES.get(stage, len(STAGE_SOURCES[stage]))
+        ):
             return self._stop(run_id, "stage-source-incomplete", stage)
+
+        # The share of the fixed allocation and of the fixed inspection limit
+        # that each source carries. The shares of one source type must add up
+        # to the frozen totals of that type.
+        plan_reason, plans = _apportioned_source_plans(source_records, staged_form)
+        if plan_reason is not None:
+            return self._stop(run_id, plan_reason, stage)
 
         # Source yield comes after all source rights checks.
         yield_results: dict[str, dict[str, object]] = {}
         for item in source_records:
             source_type = str(item["source_type"])
+            source_id = str(item["source_id"])
+            plan = plans[source_id]
             yield_evidence = item.get("yield_evidence")
             pool_sha256 = (
                 yield_evidence.get("candidate_pool_sha256")
@@ -4910,33 +5030,21 @@ class StageRun:
                 pool_record.get("candidate_pool") if pool_record else None,
                 pool_record.get("recorded_at") if pool_record else None,
                 stage=stage,
-                starts_on=source_starts_on[source_type],
+                starts_on=source_starts_on[source_id],
                 run_on=run_on,
+                targets=cast(dict, plan["targets"]),
+                limit=cast(int, plan["silver_candidate_limit"]),
             )
             if reason is not None:
                 return self._eligibility_stop(
                     run_id,
                     stage,
                     "source",
-                    str(item["source_id"]),
+                    source_id,
                     reason,
                     item.get("yield_evidence"),
                 )
-            yield_results[source_type] = cast(dict[str, object], yield_result)
-
-        # The data gate holds each source to its own fixed quota plan.
-        for item in source_records:
-            plan = item.get("data_plan")
-            if plan is None and not staged_form:
-                continue
-            targets = SOURCE_ALLOCATION_TARGETS[str(item["source_type"])]
-            limit = SOURCE_SILVER_CANDIDATE_LIMITS[str(item["source_type"])]
-            if (
-                not isinstance(plan, Mapping)
-                or plan.get("silver_candidate_limit") != limit
-                or any(plan.get(split) != count for split, count in targets.items())
-            ):
-                return self._stop(run_id, "source-data-plan-invalid", stage)
+            yield_results[source_id] = cast(dict[str, object], yield_result)
 
         panel = manifest.get("route_panel")
         if not isinstance(panel, Mapping) or panel.get("inspection_complete") is not True:
@@ -5090,7 +5198,7 @@ class StageRun:
             schedule_days = (must_finish_by - starts_on).days + 1
             if schedule_days < required_days:
                 return self._stop(run_id, "route-schedule-infeasible", stage)
-            schedule_evidence[str(item["source_type"])] = {
+            schedule_evidence[str(item["source_id"])] = {
                 **dict(schedule),
                 "required_days": required_days,
                 "available_days": schedule_days,
@@ -5157,7 +5265,7 @@ class StageRun:
                 return self._stop(run_id, "invalid-budget-evidence", stage)
             if source_planned["contingency"] != 0:
                 return self._stop(run_id, "contingency-not-authorized", stage)
-            planned_by_source[str(item["source_type"])] = source_planned
+            planned_by_source[str(item["source_id"])] = source_planned
         planned = {
             category: sum(
                 (value[category] for value in planned_by_source.values()),
@@ -5179,20 +5287,23 @@ class StageRun:
 
         evidence = {
             "sources": {
-                str(item["source_type"]): {
+                # Two Stage 1 sources share one source type, so the record
+                # of each source is kept under its own source id.
+                str(item["source_id"]): {
                     "source_id": item["source_id"],
+                    "source_type": item["source_type"],
                     "eligibility_evidence": item["eligibility_evidence"],
                     "eligibility_evidence_sha256": _evidence_sha256(
                         item["eligibility_evidence"]
                     ),
-                    "yield": yield_results[str(item["source_type"])],
+                    "yield": yield_results[str(item["source_id"])],
                     "planned_commitments_usd": {
                         category: _usd(amount)
                         for category, amount in planned_by_source[
-                            str(item["source_type"])
+                            str(item["source_id"])
                         ].items()
                     },
-                    "schedule": schedule_evidence[str(item["source_type"])],
+                    "schedule": schedule_evidence[str(item["source_id"])],
                 }
                 for item in source_records
             },
