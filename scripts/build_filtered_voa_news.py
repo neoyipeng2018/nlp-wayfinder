@@ -30,6 +30,7 @@ from build_filtered_common_pile_news import (  # noqa: E402
     write_json_line,
     write_pool_manifest,
 )
+from claim_company_matcher import ClaimCompanyMatcher  # noqa: E402
 from crawl_voa_news import ARTICLE_ID  # noqa: E402
 
 AGENCY_AUTHOR = re.compile(
@@ -320,7 +321,10 @@ def select_passage(
             scored, key=lambda item: (len(item[1]), -item[0][0][0])
         )
         selected_positions = {pos for pos, _ in window}
-    reason = "outside-selected-consecutive-passage" if scored else "no-eligible-listed-company-passage"
+    no_hit_reason = getattr(
+        matcher, "no_hit_reason", "no-eligible-listed-company-passage"
+    )
+    reason = "outside-selected-consecutive-passage" if scored else no_hit_reason
     for run in runs:
         for pos, sentence in run:
             if pos not in selected_positions:
@@ -328,10 +332,17 @@ def select_passage(
                     {"kind": "sentence", "position": pos, "reason": reason,
                      "sha256": sha256_text(sentence)}
                 )
-    unique = {hit["cik"]: hit for hit in companies}
-    return passage, sorted(unique.values(), key=lambda h: int(h["cik"])), sorted(
+    # A v1 hit carries a CIK from the pinned snapshot. A v2 hit has no CIK,
+    # because the widened rule holds no company list.
+    unique = {company_key(hit): hit for hit in companies}
+    return passage, [unique[key] for key in sorted(unique)], sorted(
         exclusions, key=lambda item: int(item["position"])
     )
+
+
+def company_key(hit: Mapping[str, str]) -> str:
+    """Give the identity of one company hit, for both matcher rules."""
+    return hit["cik"] if "cik" in hit else hit["name"].casefold()
 
 
 def article_stop_reason(page: Mapping[str, Any], parsed: Mapping[str, Any]) -> str | None:
@@ -354,18 +365,34 @@ def article_stop_reason(page: Mapping[str, Any], parsed: Mapping[str, Any]) -> s
     return None
 
 
-def build(config_path: Path, data_dir: Path, output_dir: Path) -> dict[str, Any]:
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    rights = config["rights"]
-    company_filter = config["company_filter"]
+def build_matcher(company_filter: Mapping[str, Any], data_dir: Path):
+    """Give the company matcher of one pinned rule.
+
+    The `pinned-listed-company-snapshot` mode is the first Stage 1 rule. The
+    `any-named-company-claim` mode is the widened rule of issue #78. The
+    widened rule holds no company list, so its code file is hashed instead.
+    """
+    mode = company_filter.get("mode", "pinned-listed-company-snapshot")
+    if mode == "any-named-company-claim":
+        rule_path = Path(__file__).resolve().parent / "claim_company_matcher.py"
+        if file_sha256(rule_path) != company_filter["rule_code_sha256"]:
+            raise ValueError("company-rule-code-mismatch")
+        return ClaimCompanyMatcher(claim_window=company_filter["claim_window"])
     snapshot_path = data_dir / company_filter["snapshot_file"]
     if file_sha256(snapshot_path) != company_filter["snapshot_sha256"]:
         raise ValueError("company-snapshot-mismatch")
-    matcher = CompanyMatcher(
+    return CompanyMatcher(
         json.loads(snapshot_path.read_text(encoding="utf-8")),
         company_filter["exchanges"],
         company_filter["min_name_chars"],
     )
+
+
+def build(config_path: Path, data_dir: Path, output_dir: Path) -> dict[str, Any]:
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    rights = config["rights"]
+    company_filter = config["company_filter"]
+    matcher = build_matcher(company_filter, data_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     source_path = output_dir / "filtered-source.jsonl.gz"
     exclusion_path = output_dir / "exclusions.jsonl.gz"
@@ -399,7 +426,11 @@ def build(config_path: Path, data_dir: Path, output_dir: Path) -> dict[str, Any]
                             exclusion_counts[str(removal["reason"])] += 1
                             write_json_line(excluded, {"article_url": url, **removal})
                         if passage is None:
-                            reason = "no-eligible-listed-company-passage"
+                            reason = getattr(
+                                matcher,
+                                "no_hit_reason",
+                                "no-eligible-listed-company-passage",
+                            )
                     if reason is not None:
                         exclusion_counts[reason] += 1
                         write_json_line(
@@ -427,7 +458,7 @@ def build(config_path: Path, data_dir: Path, output_dir: Path) -> dict[str, Any]
                         "contractor_authorship_uncertainty": rights["stated_uncertainty"],
                         "filtered_text_sha256": filtered_sha256,
                         "license_id": rights["license_id"],
-                        "listed_company_matches": companies,
+                        "company_targets": companies,
                         "normalized_passage": passage,
                         "page_fetched_at": page["fetched_at"],
                         "page_response_sha256": page["response_sha256"],
@@ -460,7 +491,8 @@ def build(config_path: Path, data_dir: Path, output_dir: Path) -> dict[str, Any]
         "built_on": config["built_on"],
         "candidate_pool_sha256": sha256_text(canonical_json(candidate_pool)),
         "candidate_pool_size": len(candidate_pool),
-        "company_names_in_filter": len(matcher.names),
+        "company_filter_rule": getattr(matcher, "name", "pinned-listed-company-snapshot"),
+        "company_names_in_filter": len(getattr(matcher, "names", ())),
         "eligible_articles_by_split": dict(sorted(pages_by_split.items())),
         "exclusion_counts": dict(sorted(exclusion_counts.items())),
         "input_page_shard_sha256": shard_hashes,

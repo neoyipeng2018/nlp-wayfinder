@@ -314,8 +314,13 @@ def source_yield_evidence(
     candidate_pool_size: int | None = None,
     sample_size: int = 100,
     verified_by_split: Mapping[str, int] | None = None,
+    allocation: Mapping[str, int] | None = None,
 ) -> dict[str, object]:
-    """Give one deterministic yield sample for a source."""
+    """Give one deterministic yield sample for a source.
+
+    `allocation` gives the share of the fixed allocation that this one source
+    carries. A source that carries the whole share passes None.
+    """
     checked_timestamp = (
         checked_at if "T" in checked_at else f"{checked_at}T01:00:00Z"
     )
@@ -335,7 +340,7 @@ def source_yield_evidence(
         for stage_number, source_types in STAGE_SOURCES.items()
         if source_type in source_types
     )
-    allocation = SOURCE_ALLOCATION_TARGETS[source_type]
+    allocation = allocation or SOURCE_ALLOCATION_TARGETS[source_type]
     allocation_total = sum(allocation.values())
     selected_counts = {
         split: int(verified_by_split.get(split, 0)) for split in CANDIDATE_SPLITS
@@ -777,10 +782,10 @@ class StageRunTests(unittest.TestCase):
         evidence = cast(dict[str, Any], decision["evidence"])
         self.assertEqual(
             "financial-news-fixture",
-            evidence["sources"]["financial-news"]["source_id"],
+            evidence["sources"]["financial-news-fixture"]["source_id"],
         )
         self.assertEqual(list(ROUTE_IDS), evidence["routes"]["eligible_route_ids"])
-        self.assertEqual(7, evidence["schedule"]["financial-news"]["required_days"])
+        self.assertEqual(7, evidence["schedule"]["financial-news-fixture"]["required_days"])
         self.assertEqual("fixture-owner", evidence["confirmation"]["confirmed_by"])
         self.assertEqual("100.00", evidence["budget"]["total_limit_usd"])
         self.assertEqual("75.00", evidence["budget"]["planned_total_usd"])
@@ -4468,7 +4473,7 @@ class Stage1ReportTests(unittest.TestCase):
 
         decision = cast(Mapping[str, Any], result["decision"])
         evidence = cast(Mapping[str, Any], decision["evidence"])
-        source = cast(Mapping[str, Any], evidence["sources"])["financial-news"]
+        source = cast(Mapping[str, Any], evidence["sources"])["financial-news-fixture"]
         source_eligibility = source["eligibility_evidence"]
         route_evidence = cast(Mapping[str, Any], evidence["routes"])
         self.assertNotIn("eligibility", result)
@@ -4673,13 +4678,16 @@ class StageTwoGateTests(unittest.TestCase):
         self.assertEqual(2, decision["stage"])
         self.assertEqual(["stage-2-build"], decision["permitted_external_actions"])
         evidence = cast(dict[str, Any], decision["evidence"])
-        self.assertEqual(set(STAGE_SOURCES[2]), set(evidence["sources"]))
         self.assertEqual(
-            "company-announcements-fixture",
-            evidence["sources"]["company-announcements"]["source_id"],
+            {f"{source}-fixture" for source in STAGE_SOURCES[2]},
+            set(evidence["sources"]),
         )
         self.assertEqual(
-            4, evidence["schedule"]["regulatory-filings"]["required_days"]
+            "company-announcements-fixture",
+            evidence["sources"]["company-announcements-fixture"]["source_id"],
+        )
+        self.assertEqual(
+            4, evidence["schedule"]["regulatory-filings-fixture"]["required_days"]
         )
         self.assertEqual("10.00", evidence["budget"]["planned_commitments_usd"]["gpt"])
 
@@ -5178,7 +5186,10 @@ class StageThreeGateTests(unittest.TestCase):
         self.assertEqual(3, decision["stage"])
         self.assertEqual(["stage-3-build"], decision["permitted_external_actions"])
         evidence = cast(dict[str, Any], decision["evidence"])
-        self.assertEqual(set(STAGE_SOURCES[3]), set(evidence["sources"]))
+        self.assertEqual(
+            {f"{source}-fixture" for source in STAGE_SOURCES[3]},
+            set(evidence["sources"]),
+        )
 
     def test_one_final_source_alone_cannot_start_the_stage(self) -> None:
         manifest = draft_stage_manifest(3)
@@ -5282,7 +5293,7 @@ class SourceEligibilityTests(unittest.TestCase):
 
         self.assertEqual("build-eligible", decision["decision"])
         evidence = cast(dict[str, Any], decision["evidence"])
-        source = evidence["sources"]["financial-news"]
+        source = evidence["sources"]["financial-news-fixture"]
         eligibility = source["eligibility_evidence"]
         self.assertEqual("clean-core", eligibility["data_portfolio_lane"])
         self.assertEqual(set(RIGHTS_FIELDS), set(eligibility["rights"]))
@@ -5356,6 +5367,134 @@ class SourceEligibilityTests(unittest.TestCase):
         decision = self.evaluate(manifest)
 
         self.assertEqual("source-lane-restricted", decision["stop_reason"])
+
+    def two_lane_manifest(
+        self,
+        *,
+        blind_share: Mapping[str, int] | None = None,
+        clean_share: Mapping[str, int] | None = None,
+    ) -> dict[str, Any]:
+        """Give a Stage 1 manifest with one source for each lane.
+
+        The clean-core source carries training and development. The
+        blind-only source carries the blind split, as manifest-only passages.
+        """
+        targets = SOURCE_ALLOCATION_TARGETS["financial-news"]
+        limit = SOURCE_SILVER_CANDIDATE_LIMITS["financial-news"]
+        clean = dict(
+            clean_share
+            or {
+                "training": targets["training"],
+                "development": targets["development"],
+                "blind": 0,
+            }
+        )
+        blind = dict(
+            blind_share
+            or {"training": 0, "development": 0, "blind": targets["blind"]}
+        )
+        clean_limit = limit - 1_000
+        blind_evidence = source_eligibility_evidence()
+        blind_evidence["data_portfolio_lane"] = "restricted-auxiliary"
+        for right in ("training_permitted", "weight_release_permitted",
+                      "text_redistribution_permitted"):
+            blind_evidence["rights"][right]["permitted"] = False
+            blind_evidence["rights"][right]["audited_object"] = "service-terms"
+        manifest = draft_manifest()
+        del manifest["source"]
+        manifest["sources"] = [
+            {
+                "source_id": "financial-news-clean-core",
+                "source_type": "financial-news",
+                "eligibility_evidence": source_eligibility_evidence(),
+                "yield_evidence": source_yield_evidence(
+                    "financial-news",
+                    allocation=clean,
+                    verified_by_split={
+                        "training": 72,
+                        "development": 4,
+                        "blind": 0,
+                    },
+                ),
+                "data_plan": {
+                    "silver_candidate_limit": clean_limit,
+                    **clean,
+                },
+                "route_requests": {route_id: 5_700 for route_id in ROUTE_IDS},
+                "schedule": manifest["schedule"],
+                "planned_commitments_usd": {
+                    "paid-silver-labels": "0.00",
+                    "specialist": "30.00",
+                    "gpt": "20.00",
+                    "data-and-storage": "15.00",
+                    "contingency": "0.00",
+                },
+            },
+            {
+                "source_id": "financial-news-manifest-only-blind",
+                "source_type": "financial-news",
+                "eligibility_evidence": blind_evidence,
+                "yield_evidence": source_yield_evidence(
+                    "financial-news",
+                    allocation=blind,
+                    verified_by_split={
+                        "training": 0,
+                        "development": 0,
+                        "blind": 42,
+                    },
+                ),
+                "data_plan": {
+                    "silver_candidate_limit": limit - clean_limit,
+                    **blind,
+                },
+                "route_requests": {route_id: 0 for route_id in ROUTE_IDS},
+                "schedule": manifest["schedule"],
+                "planned_commitments_usd": {
+                    "paid-silver-labels": "0.00",
+                    "specialist": "0.00",
+                    "gpt": "5.00",
+                    "data-and-storage": "5.00",
+                    "contingency": "0.00",
+                },
+            },
+        ]
+        return manifest
+
+    def test_stage_one_takes_one_source_for_each_lane(self) -> None:
+        decision = self.evaluate(self.two_lane_manifest())
+
+        self.assertEqual("build-eligible", decision["decision"])
+
+    def test_a_blind_only_source_cannot_carry_training(self) -> None:
+        manifest = self.two_lane_manifest(
+            clean_share={"training": 3_000, "development": 200, "blind": 0},
+            blind_share={"training": 1_000, "development": 0, "blind": 400},
+        )
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("source-lane-restricted", decision["stop_reason"])
+
+    def test_the_shares_must_add_up_to_the_frozen_allocation(self) -> None:
+        manifest = self.two_lane_manifest()
+        cast(list[dict[str, Any]], manifest["sources"])[0]["data_plan"][
+            "development"
+        ] = 199
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("source-data-plan-invalid", decision["stop_reason"])
+
+    def test_stage_one_takes_no_more_than_two_sources(self) -> None:
+        manifest = self.two_lane_manifest()
+        sources = cast(list[dict[str, Any]], manifest["sources"])
+        third = copy.deepcopy(sources[1])
+        third["source_id"] = "financial-news-third"
+        sources.append(third)
+
+        decision = self.evaluate(manifest)
+
+        self.assertEqual("stage-source-incomplete", decision["stop_reason"])
 
     def test_the_freshness_window_holds_exactly_ninety_days(self) -> None:
         starts_on = date.fromisoformat("2026-09-14")
@@ -5687,7 +5826,7 @@ class SourceYieldTests(unittest.TestCase):
         decision = self.evaluate(manifest)
 
         source = cast(dict[str, Any], decision["evidence"])["sources"][
-            "financial-news"
+            "financial-news-fixture"
         ]
         manifest_source = cast(dict[str, Any], manifest["source"])
         self.assertEqual("build-eligible", decision["decision"])
@@ -5720,11 +5859,11 @@ class SourceYieldTests(unittest.TestCase):
         reordered_decision = self.evaluate(reordered, other_runner)
 
         first_yield = cast(dict[str, Any], first_decision["evidence"])["sources"][
-            "financial-news"
+            "financial-news-fixture"
         ]["yield"]
         reordered_yield = cast(dict[str, Any], reordered_decision["evidence"])[
             "sources"
-        ]["financial-news"]["yield"]
+        ]["financial-news-fixture"]["yield"]
         self.assertEqual(
             first_yield["checked_sample"], reordered_yield["checked_sample"]
         )
@@ -5837,7 +5976,7 @@ class SourceYieldTests(unittest.TestCase):
         decision = self.evaluate(manifest)
 
         checked = cast(dict[str, Any], decision["evidence"])["sources"][
-            "financial-news"
+            "financial-news-fixture"
         ]["yield"]
         self.assertEqual("build-eligible", decision["decision"])
         self.assertEqual(4_600, checked["projected_company_targets"])
@@ -5888,7 +6027,7 @@ class SourceYieldTests(unittest.TestCase):
         decision = self.evaluate(manifest)
 
         checked = cast(dict[str, Any], decision["evidence"])["sources"][
-            "financial-news"
+            "financial-news-fixture"
         ]["yield"]
         self.assertEqual("build-eligible", decision["decision"])
         self.assertEqual(6_668, checked["projected_inspection_count"])

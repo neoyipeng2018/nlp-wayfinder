@@ -33,12 +33,12 @@ An earnings-call transcript published on the company website, or a project trans
 _Avoid_: Automatically licensed transcript, third-party transcript
 
 **Financial target**:
-The explicitly supplied publicly traded company whose named aspect is being evaluated. Securities, assets, governments, macro indicators, and institutions treated independently of a company are outside the scope.
-_Avoid_: Target entity, subject, topic
+The explicitly supplied named company whose named aspect is being evaluated. The company can be listed, formerly listed, foreign listed, or privately held. Securities, assets, governments, macro indicators, and institutions treated independently of a company are outside the scope.
+_Avoid_: Target entity, subject, topic, listed-only target
 
 **Company target**:
-A publicly traded issuer, including a bank, insurer, exchange, or other financial firm when treated as a company. The company's shares, bonds, and other securities are distinct instrument targets and are outside the first experiment.
-_Avoid_: Issuer security, stock target, institution target
+A named company that the bounded passage makes a financial claim about, including a bank, insurer, exchange, or other financial firm when treated as a company. Listing status does not matter. A mention of the name is not sufficient: the passage must make a financial claim about the company. A state body, a central or policy bank, a court, a nonprofit, a place, and a person are not company targets. The company's shares, bonds, and other securities are distinct instrument targets and are outside the first experiment.
+_Avoid_: Issuer security, stock target, institution target, named mention
 
 **Aspect**:
 The explicitly supplied facet of a financial target against which sentiment is evaluated.

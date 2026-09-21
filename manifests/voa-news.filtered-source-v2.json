@@ -1,0 +1,62 @@
+{
+  "built_on": "2026-09-21",
+  "company_filter": {
+    "claim_window": 120,
+    "mode": "any-named-company-claim",
+    "rule": "The target is any named company the bounded passage makes a financial claim about, whether listed, formerly listed, foreign listed, or privately held. No company list is used. A hit must pass a company test and a claim test. The company test needs one of: an attached legal-form word, a company-type word inside the span, a company descriptor before or after the span, a possessive company role, or a share reference. Guards refuse a place, a person, a state or policy bank, a nonprofit or advocacy body, and a government or court body. One capitalized span gives at most one company: its longest qualifying tail. The claim test needs a financial-claim word within 120 characters of the span, outside the span itself.",
+    "rule_code": "scripts/claim_company_matcher.py",
+    "rule_code_sha256": "e3979e7d17ef980a06f8816842a3142f3bd3b287dd49c1e99f2f84046a7d9346",
+    "rule_tuning_data": "Tuned only on training-period (2000-2021) pages in crawl shard 00000, 507 eligible articles, before any count. No 2022-2024 page was inspected. Article-level precision on the 17 tuning hits was 13 of 17 strictly, and 15 of 17 when a named media company counts as a company."
+  },
+  "crawl": {
+    "full_id_window": [
+      6300000,
+      7960000
+    ],
+    "requests_per_second": 4,
+    "sitemap_index_sha256": "1eddb683f7b6a4857a71945d2ba2a1abd27d53a90ae7e83099f6a83779f63f35",
+    "sitemap_index_url": "https://www.voanews.com/sitemap.xml",
+    "sitemap_retrieved_at": "2026-09-19",
+    "sitemap_url_list_sha256": "da17cfbac577979d586570594714f6ef13da973fa2237f509850bc070deff039",
+    "subset_fraction": 0.2,
+    "subset_salt": "voa-news-training-subset-v1"
+  },
+  "minimum_passages": {
+    "blind": 600,
+    "development": 300,
+    "training": 4000
+  },
+  "order_salt": "20260905",
+  "rights": {
+    "evidence_excerpt": "All text, audio and video material produced exclusively by the Voice of America is in the public domain.",
+    "evidence_response_sha256": "b2b12710fd5facdb788813579ab467a4249bb2782be615bf19cec757bd63db29",
+    "evidence_retrieved_at": "2026-09-19",
+    "evidence_url": "https://www.voanews.com/p/5338.html",
+    "license_id": "public-domain-voa-produced",
+    "stated_uncertainty": "17 U.S.C. 105 covers works of federal employees; many VOA journalists are contractors. This source relies on VOA's first-party statement that material produced exclusively by VOA is in the public domain.",
+    "wire_copy_exclusion_excerpt": "VOA has individual licenses from Agence France Presse (AFP), the Associated Press (AP) and Reuters to use their text, video, audio, photos and graphics on our website. All three agencies’ material is copyrighted and the property of AFP, AP and Reuters respectively, and may not be copied, published or redistributed without the written permission of each agency."
+  },
+  "source_id": "voa-news-staff-company-target-v2",
+  "source_type": "financial-news",
+  "split_periods": {
+    "blind": {
+      "end": "2024-12-31",
+      "start": "2023-01-01"
+    },
+    "development": {
+      "end": "2022-12-31",
+      "start": "2022-01-01"
+    },
+    "training": {
+      "end": "2021-12-31",
+      "start": "2000-01-01"
+    }
+  },
+  "staff_rules": {
+    "byline": "At least one /author/ byline link; no byline names Reuters, Associated Press, AP, AFP, or Agence France-Presse.",
+    "text_article": "Only /a/ pages with an h1.pg-title headline and direct paragraphs in the article-content .wsw body. Video, audio, and gallery pages have no such body.",
+    "third_party_notice": "Reject the article if article-content text has a copyright sign, 'copyright', 'all rights reserved', 'used with permission', 'originally published/appeared', 'republished with/under', 'Creative Commons', or 'licensed under'.",
+    "wire_credit": "Reject the article if any article-content text names Reuters, Associated Press, AP, AFP, or Agence France-Presse (case-sensitive)."
+  },
+  "widened_rule_decision": "https://github.com/neoyipeng2018/nlp-wayfinder/issues/78"
+}
