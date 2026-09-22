@@ -153,7 +153,12 @@ does not pass a check or has more than 1,024 tokens.
 Before labeling, make one candidate manifest for the financial-news source. The
 `annex` must use structured records for acquisition, rights, extraction,
 normalization, target-and-aspect expansion, event grouping, duplicate review,
-split rules, limits, and software versions. The split rules must give the start
+split rules, limits, and software versions. The target-and-aspect expansion
+record must state the full four-aspect rule: the annex expands each
+passage-and-company pair to all four Stage 1 aspects. An aspect that the
+passage does not support then gives `insufficient evidence` in its natural
+form. The 6,668 limit counts inspected candidates, not passages, so this
+expansion does not change the passage count gate. The split rules must give the start
 and end date of each training, development, and blind period. The limits record
 must set the Stage 1 silver-candidate limit to 6,668. Each candidate must have
 these fields:
@@ -161,6 +166,8 @@ these fields:
 - `candidate_id`
 - `event_group_id`
 - `company_id`, for the same publicly traded company in related records
+- `company`, with the `name` that the human labeler sees. Each voter, GPT, and
+  the specialist receive this name as the company target, not `company_id`.
 - `aspect`, from the Stage 1 aspect set
 - `published_at`
 - `normalized_passage`
@@ -372,7 +379,14 @@ The operation rejects a training candidate for one of these reasons:
 The operation seals the fit and the posterior artifacts in
 `silver-aggregation-log.jsonl`. A later change of the fit or the posteriors
 returns `frozen-aggregation-changed`. The result contains the accepted silver
-labels, the rejection counts, the artifact hashes, and its own SHA-256 hash.
+labels with their calibrated distributions, the rejection counts, the artifact hashes, and its own SHA-256 hash.
+
+The operation also gives a true out-of-fold development macro-F1. It fits
+Dawid-Skene again on four of the five calibration folds, with the gold anchor
+of those folds only, and predicts the fifth fold. The majority of each held-out
+posterior gives the label. The number goes in the result and in the sealed fit
+as `development_out_of_fold_macro_f1`. It is a report-only diagnostic. No stop
+rule reads it.
 
 Seal the GPT blind prediction file for the source:
 
@@ -457,15 +471,34 @@ decrease, `specialist-pilot-cost-exceeded` for a pilot above USD 5, or
 
 Each seed run uses the pinned ModernBERT revision, a new four-class head, and
 explicit `passage`, `target`, and `aspect` fields. The training rows carry the
-accepted silver labels. The development rows carry no label, because the human
-development labels stay in the selection code. The run stops with
+calibrated four-class distribution of each accepted silver label as
+`label_distribution`, and the run trains with soft cross-entropy. An accepted
+silver label without a valid distribution stops the run with
+`silver-labels-not-accepted`. The development rows carry no label, because the human
+development labels stay in the scoring code. The run stops with
 `specialist-training-invalid` when a checkpoint reports another initialization,
 another token limit, another head, or an incomplete development prediction set.
 
-The operation selects the checkpoint that has the highest development macro-F1.
-A tie takes the lowest seed. The final blind inference must run on the checked M3 device.
-Another device returns `local-inference-device-mismatch`. A missing blind label
-returns `missing-prediction`.
+Each seed run also uses the frozen training settings: learning rate 5e-5, 3
+epochs, batch size 32, AdamW, linear decay with 10% warmup, and weight decay
+0.01. These values are in `base_config`, so `training_config_sha256` covers
+them. The backend must report them back in `training_settings`. Another value
+stops the run with `specialist-training-settings-mismatch`. No development or
+silver number can select them.
+
+The specialist is the average of the softmax probabilities of the three seeds.
+Each of the three checkpoints predicts the full blind set on the checked M3
+device. The operation averages the three probability rows of each blind
+example. It then subtracts the logarithm of the class prior of that aspect,
+with a fixed `tau` of 1, and takes the argmax. The prior of an aspect is the
+mean accepted silver distribution of that aspect. An aspect with no accepted
+silver takes a flat prior. The development macro-F1 of each seed is a reported
+diagnostic. It selects nothing.
+
+The blind inference must run on the checked M3 device. Another device returns
+`local-inference-device-mismatch`. An incomplete or invalid probability row
+returns `missing-prediction`. A result with no probabilities returns
+`specialist-inference-invalid`.
 
 GPT output cannot enter this operation. The run stops with
 `gpt-artifact-present` when the silver aggregation, the allocation, the device
@@ -477,8 +510,9 @@ Record the specialist cost commitment with `record-cost` before the pilot and
 before the training runs. The operation does not record cost for you.
 
 The operation seals the run in `specialist-log.jsonl` and returns one prediction
-file with its own SHA-256 hash, the selected checkpoint, each seed result, the
-projection, and the sealed software versions. A later call returns the sealed
+file with its own SHA-256 hash, the three checkpoint identifiers, each seed
+result, the aspect priors, the `tau`, the projection, and the sealed software
+versions. A later call returns the sealed
 file and does not train again. A sealed file for a different candidate manifest
 returns `frozen-specialist-run-changed`.
 
@@ -523,6 +557,10 @@ source passes its guardrail only when the lower limit is `-0.03` or more. The
 report records superiority only when the lower limit is more than zero. The
 stage guardrail passes only when each source passes. The pooled score under
 `metrics.pooled` is diagnostic only. It cannot make a failed source pass.
+
+The report also gives
+`metrics.silver_development_out_of_fold_macro_f1` for each source, from the
+sealed silver fit. It is diagnostic only. No stop rule reads it.
 
 The report also gives the raw agreement and the Cohen kappa of the delayed
 60-example relabel. The first human label stays as the reference label. The

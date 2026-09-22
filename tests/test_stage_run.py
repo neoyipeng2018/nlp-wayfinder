@@ -28,6 +28,8 @@ from nlp_wayfinder.stage_run import (
     SOURCE_ALLOCATION_TARGETS,
     SOURCE_EVIDENCE_FRESHNESS_DAYS,
     SOURCE_SILVER_CANDIDATE_LIMITS,
+    SPECIALIST_SEEDS,
+    SPECIALIST_TRAINING_SETTINGS,
     STAGE_SOURCES,
     OmniRouteHttpTransport,
     RESULT_LABELS,
@@ -46,7 +48,10 @@ from nlp_wayfinder.stage_run import (
     project_gpt_blind_cost,
     project_specialist_training_cost,
     _calibration_fold,
+    _gpt_prompt,
     _silver_rejection,
+    _specialist_input,
+    _vote_prompt,
     candidate_order_sha256,
     cumulative_sources,
     seal_candidate_manifest,
@@ -473,6 +478,19 @@ def draft_manifest() -> dict[str, object]:
             "evidence": "fixture cost projection",
         },
     }
+
+
+def soft_label(label: str, probability: float) -> dict[str, float]:
+    """Give one calibrated silver distribution with the rest spread evenly."""
+    rest = (1.0 - probability) / (len(RESULT_LABELS) - 1)
+    return {
+        item: probability if item == label else rest for item in RESULT_LABELS
+    }
+
+
+def one_hot(label: str) -> dict[str, float]:
+    """Give one certain specialist probability row."""
+    return {item: 1.0 if item == label else 0.0 for item in RESULT_LABELS}
 
 
 def company_record(company_id: str) -> dict[str, object]:
@@ -1059,6 +1077,28 @@ class CandidateManifestTests(unittest.TestCase):
         self.assertEqual(
             "fixture-owner", sealed["seal"]["sealed_by"]  # type: ignore[index]
         )
+
+    def test_seal_rejects_a_candidate_without_a_company_name(self) -> None:
+        manifest = candidate_manifest()
+        del manifest["candidates"][0]["company"]  # type: ignore[index]
+
+        with self.assertRaisesRegex(ValueError, "candidate-company-name-missing"):
+            seal_candidate_manifest(manifest, "fixture-owner")
+
+    def test_every_model_receives_the_company_name_not_the_id(self) -> None:
+        candidate = {
+            "candidate_id": "c-1",
+            "normalized_passage": SILVER_PASSAGE,
+            "company_id": "harbor-grid",
+            "company": company_record("harbor-grid"),
+            "aspect": STAGE_1_ASPECTS[0],
+        }
+
+        for prompt in (_vote_prompt(candidate), _gpt_prompt(candidate)):
+            self.assertEqual(
+                "harbor-grid Ltd", json.loads(prompt[1]["content"])["company"]
+            )
+        self.assertEqual("harbor-grid Ltd", _specialist_input(candidate)["target"])
 
     def test_seal_rejects_an_incomplete_source_annex(self) -> None:
         manifest = candidate_manifest()
@@ -2495,6 +2535,11 @@ class SilverAggregationTests(unittest.TestCase):
         self.assertGreaterEqual(
             cast(float, accepted["probability"]), SILVER_MIN_PROBABILITY
         )
+        # The accepted record keeps the full calibrated soft label for training.
+        distribution = cast(Mapping[str, float], accepted["distribution"])
+        self.assertEqual(set(RESULT_LABELS), set(distribution))
+        self.assertAlmostEqual(1.0, sum(distribution.values()))
+        self.assertEqual(accepted["probability"], distribution["positive"])
         self.assertEqual(64, len(cast(str, result["aggregation_sha256"])))
 
     def test_the_confidence_band_is_not_an_aggregation_weight(self) -> None:
@@ -2518,6 +2563,27 @@ class SilverAggregationTests(unittest.TestCase):
         self.assertEqual(
             1, len({str(result["aggregation_sha256"]) for result in results})
         )
+
+    def test_the_out_of_fold_development_macro_f1_is_a_reported_diagnostic(
+        self,
+    ) -> None:
+        self.add_development_votes(noisy_routes=1)
+        self.add_votes("silver-1", dict.fromkeys(ROUTE_IDS, "positive"))
+
+        result = self.aggregate(["silver-1"])
+
+        macro_f1 = result["development_out_of_fold_macro_f1"]
+        self.assertIsInstance(macro_f1, float)
+        self.assertGreaterEqual(cast(float, macro_f1), 0.0)
+        self.assertLessEqual(cast(float, macro_f1), 1.0)
+        # The number is sealed with the fit, and no stop rule reads it.
+        fit = next(
+            item
+            for item in self.runner.silver_aggregation_records()
+            if item["event"] == "silver-fit-sealed"
+        )
+        self.assertEqual(macro_f1, fit["development_out_of_fold_macro_f1"])
+        self.assertEqual("complete", result["aggregation"])
 
     def test_the_sealed_fit_keeps_one_four_by_four_matrix_for_each_voter(self) -> None:
         self.add_development_votes(noisy_routes=1)
@@ -3203,9 +3269,11 @@ class FakeTrainingBackend:
         *,
         development_labels: Mapping[int, Mapping[str, str]] | None = None,
         blind_labels: Mapping[str, str] | None = None,
+        blind_probabilities: Mapping[str, Mapping[str, float]] | None = None,
         device_id: str = "m3-fixture",
         train_result: Mapping[str, object] | None = None,
     ) -> None:
+        self.blind_probabilities = blind_probabilities
         self.trainings: list[dict[str, object]] = []
         self.inferences: list[tuple[str, list[dict[str, object]]]] = []
         self.development_labels = development_labels
@@ -3230,6 +3298,7 @@ class FakeTrainingBackend:
             "max_sequence_tokens": MAX_EXAMPLE_TOKENS,
             "head_labels": list(RESULT_LABELS),
             "development_predictions": predictions,
+            "training_settings": dict(SPECIALIST_TRAINING_SETTINGS),
         }
         if self.train_result is not None:
             result.update(self.train_result)
@@ -3242,10 +3311,20 @@ class FakeTrainingBackend:
             (checkpoint_id, [copy.deepcopy(dict(item)) for item in examples])
         )
         labels = self.blind_labels
+        if self.blind_probabilities is not None:
+            return {
+                "device_id": self.device_id,
+                "probabilities": {
+                    str(item["candidate_id"]): dict(
+                        self.blind_probabilities[str(item["candidate_id"])]
+                    )
+                    for item in examples
+                },
+            }
         return {
             "device_id": self.device_id,
-            "predictions": {
-                str(item["candidate_id"]): (
+            "probabilities": {
+                str(item["candidate_id"]): one_hot(
                     labels[str(item["candidate_id"])]
                     if labels is not None
                     else "positive"
@@ -3301,7 +3380,13 @@ class SpecialistTrainingTests(unittest.TestCase):
     def specialist_inputs(
         self, **changes: object
     ) -> tuple[dict[str, object], dict[str, object], dict[str, object], dict[str, object]]:
-        stage_manifest = confirm_manifest(draft_manifest(), "fixture-owner")
+        # Pin the confirmation time. Two fixture builds in two different
+        # seconds would otherwise read as a changed confirmation.
+        stage_manifest = confirm_manifest(
+            draft_manifest(),
+            "fixture-owner",
+            confirmed_at="2026-09-10T00:00:00Z",
+        )
         candidates = candidate_manifest()
         rows: list[dict[str, object]] = []
         for index in range(2):
@@ -3372,11 +3457,13 @@ class SpecialistTrainingTests(unittest.TestCase):
                     "candidate_id": "training-0",
                     "label": "positive",
                     "probability": 0.91,
+                    "distribution": soft_label("positive", 0.91),
                 },
                 {
                     "candidate_id": "training-1",
                     "label": "negative",
                     "probability": 0.86,
+                    "distribution": soft_label("negative", 0.86),
                 },
             ],
         }
@@ -3427,7 +3514,12 @@ class SpecialistTrainingTests(unittest.TestCase):
         self.assertIsNone(result["stop_reason"])
         self.assertEqual(MODERNBERT_MODEL_ID, result["model_id"])
         self.assertEqual(MODERNBERT_REVISION, result["revision"])
-        self.assertEqual("checkpoint-seed-2", result["checkpoint_id"])
+        self.assertEqual("three-seed-probability-ensemble", result["specialist"])
+        self.assertEqual(
+            ["checkpoint-seed-1", "checkpoint-seed-2", "checkpoint-seed-3"],
+            result["checkpoint_ids"],
+        )
+        self.assertEqual(list(SPECIALIST_SEEDS), result["seeds"])
         self.assertEqual(2, result["prediction_count"])
         self.assertEqual(64, len(cast(str, result["prediction_file_sha256"])))
         self.assertEqual(
@@ -3446,10 +3538,18 @@ class SpecialistTrainingTests(unittest.TestCase):
             training = cast(list[Mapping[str, object]], config["training"])
             self.assertEqual(2, len(training))
             self.assertEqual(
-                {"candidate_id", "passage", "target", "aspect", "label"},
+                {"candidate_id", "passage", "target", "aspect", "label_distribution"},
                 set(training[0]),
             )
-            self.assertEqual("positive", training[0]["label"])
+            # Training uses the calibrated soft label, not only its top class.
+            self.assertEqual(
+                soft_label("positive", 0.91), training[0]["label_distribution"]
+            )
+            self.assertEqual("soft-cross-entropy", config["loss"])
+            # The frozen settings ride in the hashed config, not in the backend.
+            self.assertEqual(
+                dict(SPECIALIST_TRAINING_SETTINGS), config["training_settings"]
+            )
 
     def test_the_development_input_never_carries_a_human_label(self) -> None:
         backend = FakeTrainingBackend(development_labels=self.development_labels())
@@ -3470,12 +3570,55 @@ class SpecialistTrainingTests(unittest.TestCase):
         result = self.train(backend)
 
         self.assertEqual("m3-fixture", result["inference_device_id"])
-        checkpoint_id, examples = backend.inferences[0]
-        self.assertEqual("checkpoint-seed-2", checkpoint_id)
-        for item in examples:
-            self.assertEqual(
-                {"candidate_id", "passage", "target", "aspect"}, set(item)
-            )
+        # Every seed runs on the blind set. The ensemble averages them.
+        self.assertEqual(
+            ["checkpoint-seed-1", "checkpoint-seed-2", "checkpoint-seed-3"],
+            [checkpoint_id for checkpoint_id, _ in backend.inferences],
+        )
+        for _, examples in backend.inferences:
+            for item in examples:
+                self.assertEqual(
+                    {"candidate_id", "passage", "target", "aspect"}, set(item)
+                )
+
+    def test_other_reported_training_settings_stop_the_run(self) -> None:
+        settings = {**SPECIALIST_TRAINING_SETTINGS, "learning_rate": 3e-5}
+        backend = FakeTrainingBackend(
+            development_labels=self.development_labels(),
+            train_result={"training_settings": settings},
+        )
+
+        result = self.train(backend)
+
+        self.assertEqual("invalid", result["specialist_predictions"])
+        self.assertEqual(
+            "specialist-training-settings-mismatch", result["stop_reason"]
+        )
+
+    def test_the_aspect_prior_correction_moves_the_argmax(self) -> None:
+        # The accepted silver of this aspect is nearly all `positive`, so the
+        # correction lifts the rarer class over a near tie.
+        near_tie = {
+            "positive": 0.42,
+            "negative": 0.40,
+            **{
+                label: 0.09
+                for label in RESULT_LABELS
+                if label not in ("positive", "negative")
+            },
+        }
+        backend = FakeTrainingBackend(
+            development_labels=self.development_labels(),
+            blind_probabilities={"blind-0": near_tie, "blind-1": one_hot("negative")},
+        )
+
+        result = self.train(backend)
+
+        predictions = cast(list[Mapping[str, Any]], result["predictions"])
+        self.assertEqual("negative", predictions[0]["label"])
+        self.assertEqual(1.0, result["prior_tau"])
+        priors = cast(Mapping[str, Mapping[str, float]], result["aspect_priors"])
+        self.assertAlmostEqual(0.91, priors[STAGE_1_ASPECTS[0]]["positive"])
 
     def test_another_inference_device_stops_the_run(self) -> None:
         backend = FakeTrainingBackend(device_id="rented-gpu")
@@ -3645,6 +3788,17 @@ class SpecialistTrainingTests(unittest.TestCase):
 
     def test_unaccepted_silver_labels_stop_the_run(self) -> None:
         inputs = self.specialist_inputs(aggregation="stopped")
+
+        result = self.train(FakeTrainingBackend(), inputs=inputs)
+
+        self.assertEqual("silver-labels-not-accepted", result["stop_reason"])
+
+    def test_a_silver_label_without_a_distribution_stops_the_run(self) -> None:
+        inputs = self.specialist_inputs(
+            accepted_silver=[
+                {"candidate_id": "training-0", "label": "positive", "probability": 0.91}
+            ]
+        )
 
         result = self.train(FakeTrainingBackend(), inputs=inputs)
 
@@ -3836,8 +3990,18 @@ def report_source_fixture(
         "candidate_manifest_sha256": manifest_sha256,
         "accepted_silver_count": 2,
         "accepted_silver": [
-            {"candidate_id": f"{prefix}training-0", "label": "positive", "probability": 0.91},
-            {"candidate_id": f"{prefix}training-1", "label": "negative", "probability": 0.86},
+            {
+                "candidate_id": f"{prefix}training-0",
+                "label": "positive",
+                "probability": 0.91,
+                "distribution": soft_label("positive", 0.91),
+            },
+            {
+                "candidate_id": f"{prefix}training-1",
+                "label": "negative",
+                "probability": 0.86,
+                "distribution": soft_label("negative", 0.86),
+            },
         ],
     }
     return sealed, allocation, aggregation
@@ -4020,9 +4184,15 @@ class Stage1ReportTests(unittest.TestCase):
             {label: 1.0 for label in RESULT_LABELS},
             metrics["specialist"]["class_f1"],
         )
-        pooled = cast(Mapping[str, Any], result["metrics"])["pooled"]
+        report_metrics = cast(Mapping[str, Any], result["metrics"])
+        pooled = report_metrics["pooled"]
         self.assertTrue(pooled["diagnostic_only"])
         self.assertEqual(0.0, pooled["macro_f1_difference"])
+        # The silver diagnostic is reported for each source. It stops nothing.
+        self.assertEqual(
+            set(cast(list[str], result["sources"])),
+            set(report_metrics["silver_development_out_of_fold_macro_f1"]),
+        )
 
     def test_the_paired_bootstrap_uses_the_fixed_seed_and_interval(self) -> None:
         result = self.report()
